@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _winapi
 import multiprocessing
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +36,10 @@ class WindowsDriver:
                 if not self._process.is_alive():
                     raise DriverError("native worker stopped; restart the broker and rebind the application")
                 return
+            executable = Path(sys.executable).with_name("pythonw.exe")
+            if not executable.is_file():
+                raise DriverError("pythonw.exe is required to start the native worker without a console")
+            multiprocessing.set_executable(str(executable))
             context = multiprocessing.get_context("spawn")
             parent, child = context.Pipe()
             self._process = context.Process(
