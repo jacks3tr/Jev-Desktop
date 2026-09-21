@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / cached artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging and distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit*.xml
+.tox/
+.nox/
+
+# Type checkers and linters
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.pyright/
+
+# Runtime state produced by the plugin itself
+.artifacts/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+evidence/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local configuration and secrets
+.env
+.env.*
+!/.env.example
+*.local.json
+/config.json

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "jev-desktop": {
+      "command": "python",
+      "args": ["-m", "jev_desktop.transports.mcp_stdio"],
+      "env": {
+        "TYPESAFE_API_KEY": "your-key-here",
+        "PYTHONPATH": "src"
+      }
+    }
+  }
+}

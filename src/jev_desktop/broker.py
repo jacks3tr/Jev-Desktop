@@ -1,0 +1,541 @@
+"""Local host broker: one per interactive user/logon session, MCP and CLI are clients.
+
+The broker owns authorization, desktop ownership, the bounded runtime, the durable
+journal, and the single native driver instance. Clients cannot reach the driver directly:
+they send versioned envelopes over the local pipe and receive structured results with
+opaque handles. A disconnected client keeps its paused run state but loses the lease, so
+no input is issued unattended.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import sys
+import threading
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .contracts import (
+    SCHEMA_VERSION,
+    ActionRequest,
+    AuthorizationError,
+    ContractError,
+    DriverError,
+    EmergencyStop,
+    Envelope,
+    EvidenceRef,
+    InputMode,
+    Operation,
+    Pause,
+    RunResult,
+    RunSpec,
+    ScopeSpec,
+    new_id,
+)
+from .drivers.windows import WindowsDriver
+from .evidence import EvidenceStore, RetentionPolicy
+from .ipc import ConnectionInfo, PipeServer, pipe_name
+from .journal import DispatchJournal, JournalUnhealthy
+from .ownership import Ownership, emergency_clear, emergency_is_set, emergency_signal, session_description
+from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError
+from .runtime import ResumeInputs, Runtime, RuntimeConfig
+
+MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
+
+METHODS = {
+    "hello",
+    "bye",
+    "inspect",
+    "run",
+    "act",
+    "stop",
+    "status",
+    "evidence",
+    "health",
+    "shutdown",
+}
+
+
+def default_home() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
+    return Path(base) / "JevDesktop"
+
+
+@dataclass
+class BrokerConfig:
+    home: Path = field(default_factory=default_home)
+    evidence_dir: Path | None = None
+    journal_path: Path | None = None
+    approved_roots: tuple[str, ...] = ()
+    launch_configs: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
+    capture_scale: float = 0.6
+    retention: RetentionPolicy = field(default_factory=RetentionPolicy)
+    secrets: Mapping[str, str] = field(default_factory=dict)  # fixture secret name -> env var name
+
+    def resolved(self) -> BrokerConfig:
+        self.home = Path(self.home)
+        self.evidence_dir = Path(self.evidence_dir or self.home / "evidence")
+        self.journal_path = Path(self.journal_path or self.home / "journal.sqlite")
+        roots = {str(self.evidence_dir), *[str(item) for item in self.approved_roots]}
+        self.approved_roots = tuple(sorted(roots))
+        return self
+
+    @classmethod
+    def load(cls, path: str | Path | None = None) -> BrokerConfig:
+        config_path = Path(path) if path else default_home() / "config.json"
+        config = cls()
+        if config_path.is_file():
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            if "home" in payload:
+                config.home = Path(payload["home"])
+            if "evidence_dir" in payload:
+                config.evidence_dir = Path(payload["evidence_dir"])
+            if "journal_path" in payload:
+                config.journal_path = Path(payload["journal_path"])
+            config.approved_roots = tuple(payload.get("approved_roots", ()))
+            config.launch_configs = dict(payload.get("launch_configs", {}))
+            config.secrets = dict(payload.get("secrets", {}))
+            config.capture_scale = float(payload.get("capture_scale", config.capture_scale))
+            policy_payload = payload.get("policy", {})
+            config.policy = PolicyConfig(
+                model_id=str(policy_payload.get("model_id", config.policy.model_id)),
+                endpoint=str(policy_payload.get("endpoint", config.policy.endpoint)),
+                operation_floor=float(policy_payload.get("operation_floor", config.policy.operation_floor)),
+                target_floor=float(policy_payload.get("target_floor", config.policy.target_floor)),
+                timeout_s=float(policy_payload.get("timeout_s", config.policy.timeout_s)),
+                max_retries=int(policy_payload.get("max_retries", config.policy.max_retries)),
+                api_key_env=str(policy_payload.get("api_key_env", config.policy.api_key_env)),
+            )
+        return config.resolved()
+
+    def save(self, path: str | Path | None = None) -> Path:
+        config_path = Path(path) if path else self.home / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps(
+                {
+                    "home": str(self.home),
+                    "evidence_dir": str(self.evidence_dir),
+                    "journal_path": str(self.journal_path),
+                    "approved_roots": list(self.approved_roots),
+                    "launch_configs": dict(self.launch_configs),
+                    "secrets": dict(self.secrets),
+                    "capture_scale": self.capture_scale,
+                    "policy": {
+                        "model_id": self.policy.model_id,
+                        "endpoint": self.policy.endpoint,
+                        "operation_floor": self.policy.operation_floor,
+                        "target_floor": self.policy.target_floor,
+                        "timeout_s": self.policy.timeout_s,
+                        "max_retries": self.policy.max_retries,
+                        "api_key_env": self.policy.api_key_env,
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
+
+class Broker:
+    def __init__(self, config: BrokerConfig | None = None, *, driver: Any | None = None) -> None:
+        self.config = (config or BrokerConfig.load()).resolved()
+        self.home = self.config.home
+        self.evidence_dir = self.home / "evidence" if self.config.evidence_dir is None else self.config.evidence_dir
+        self.journal_path = (
+            self.home / "journal.sqlite" if self.config.journal_path is None else self.config.journal_path
+        )
+        self.home.mkdir(parents=True, exist_ok=True)
+        self.evidence_dir.mkdir(parents=True, exist_ok=True)
+        self.driver = driver or WindowsDriver(evidence_dir=self.evidence_dir)
+        self.journal = DispatchJournal(str(self.journal_path))
+        self.ownership = Ownership()
+        self.evidence = EvidenceStore(
+            root=self.evidence_dir,
+            approved_roots=list(self.config.approved_roots),
+            retention=self.config.retention,
+        )
+        self.policy: JevPolicy | None = None
+        self.runtime = Runtime(
+            driver=self.driver,
+            journal=self.journal,
+            ownership=self.ownership,
+            evidence=self.evidence,
+            config=RuntimeConfig(
+                evidence_dir=self.evidence_dir,
+                approved_roots=self.config.approved_roots,
+                secret_provider=lambda name: os.environ.get(self.config.secrets.get(name, name)),
+                launch_configs=self.config.launch_configs,
+                capture_scale=self.config.capture_scale,
+            ),
+        )
+        self._server: PipeServer | None = None
+        self._by_peer: dict[int, list[str]] = {}
+        self._lock = threading.RLock()
+        self._started_at = time.time()
+        self._recovered: list[str] = []
+
+    # ------------------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------------------
+
+    def start(self) -> None:
+        self.driver.start()
+        self._recovered = self.journal.recover_unfinished()  # never auto-replay unknown effects
+        if self._recovered:
+            self.journal.append_trace(None, "recovered_uncertain_actions", {"actions": self._recovered})
+        key = os.environ.get(self.config.policy.api_key_env)
+        if key:
+            self.policy = JevPolicy(transport=HttpTransport(), config=self.config.policy, api_key=key)
+            self.runtime.policy = self.policy
+
+    def close(self) -> None:
+        # Order matters: no handler may still be writing when the journal closes.
+        if self._server is not None:
+            self._server.stop(timeout=5.0)
+        try:
+            self.driver.close()
+        finally:
+            self.journal.close()
+
+    def serve_forever(self) -> None:
+        self.start()
+        self._server = PipeServer(
+            name=pipe_name("broker"),
+            handler=self.handle,
+            on_event=lambda kind, payload: self.journal.append_trace(None, f"pipe_{kind}", payload),
+            on_disconnect=self.on_disconnect,
+        )
+        try:
+            self._server.serve_forever()
+        finally:
+            self.close()
+
+    def on_disconnect(self, info: ConnectionInfo) -> None:
+        """A client that vanishes keeps its paused run, but must not keep the desktop."""
+        with self._lock:
+            session_ids = self._by_peer.pop(info.peer_pid, [])
+        for session_id in session_ids:
+            self.ownership.close_session(session_id)
+            self.journal.append_trace(None, "client_disconnected", {"session": session_id, "pid": info.peer_pid})
+
+    # ------------------------------------------------------------------------------
+    # Request handling
+    # ------------------------------------------------------------------------------
+
+    def handle(self, envelope: Envelope, info: ConnectionInfo) -> Envelope:
+        if envelope.kind != "request":
+            return Envelope.failure(envelope.request_id, "bad_request", "only request envelopes are accepted")
+        method = envelope.method
+        if method not in METHODS:
+            return Envelope.failure(envelope.request_id, "unknown_method", f"unknown method {method!r}")
+        params = dict(envelope.params or {})
+        try:
+            if method == "hello":
+                result = self._hello(params, info)
+            elif method == "bye":
+                result = self._bye(params)
+            else:
+                session = self.ownership.authorize(str(params.get("session_id") or "") or None)
+                result = getattr(self, f"_m_{method}")(session, params)
+            return Envelope.success(
+                envelope.request_id, result, session_id=params.get("session_id"), run_id=params.get("run_id")
+            )
+        except AuthorizationError as exc:
+            return Envelope.failure(envelope.request_id, "unauthorized", str(exc))
+        except JournalUnhealthy as exc:
+            return Envelope.failure(
+                envelope.request_id,
+                "journal_unhealthy",
+                str(exc),
+                {"hint": "the journal could not durably record state; restart the broker"},
+            )
+        except EmergencyStop as exc:
+            return Envelope.failure(envelope.request_id, "emergency_stop", str(exc))
+        except Pause as exc:
+            return Envelope.failure(envelope.request_id, "paused", str(exc), {"reason": exc.reason_value, **exc.detail})
+        except (ContractError, PolicyError) as exc:
+            return Envelope.failure(envelope.request_id, "invalid_request", str(exc))
+        except DriverError as exc:
+            return Envelope.failure(envelope.request_id, "driver_error", str(exc))
+        except Exception as exc:
+            self.journal.append_trace(
+                params.get("run_id"),
+                "broker_error",
+                {"method": method, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return Envelope.failure(envelope.request_id, type(exc).__name__, str(exc))
+
+    # -- methods -------------------------------------------------------------------
+
+    def _hello(self, params: Mapping[str, Any], info: ConnectionInfo) -> dict[str, Any]:
+        client = str(params.get("client") or "unknown")[:120]
+        session = self.ownership.create_session(client)
+        with self._lock:
+            self._by_peer.setdefault(info.peer_pid, []).append(session.session_id)
+        self.journal.append_trace(
+            None, "client_connected", {"session": session.session_id, "client": client, "pid": info.peer_pid}
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session.session_id,
+            "broker": self._health(),
+            "capabilities": {
+                "tools": ["desktop_inspect", "desktop_run", "desktop_act", "desktop_stop"],
+                "operations": [operation.value for operation in Operation],
+                "input_modes": [mode.value for mode in InputMode],
+                "transport": "named_pipe",
+                "pipe": pipe_name("broker"),
+            },
+        }
+
+    def _bye(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = str(params.get("session_id") or "")
+        if session_id:
+            self.ownership.close_session(session_id)
+        return {"closed": bool(session_id)}
+
+    def _m_health(self, session, params) -> dict[str, Any]:
+        return self._health()
+
+    def _m_status(self, session, params) -> dict[str, Any]:
+        run_id = str(params.get("run_id") or "")
+        if run_id:
+            return {"run": self.runtime.status(run_id), "broker": self._health()}
+        return {
+            "broker": self._health(),
+            "runs": self.journal.list_runs(limit=int(params.get("limit", 20))),
+            "lease": (self.ownership.active_lease().__dict__ if self.ownership.active_lease() else None),
+        }
+
+    def _m_inspect(self, session, params) -> dict[str, Any]:
+        query = str(params.get("query") or "")
+        apps = self.driver.list_apps()
+        if query:
+            lowered = query.lower()
+            apps = [
+                app
+                for app in apps
+                if lowered in app.executable_path.lower()
+                or any(lowered in self.driver.registry.windows[ref].__repr__().lower() for ref in app.window_refs)
+            ]
+        windows = [
+            window.to_json()
+            for window in self.driver.list_windows()
+            if not params.get("app_ref") or window.app_ref == params.get("app_ref")
+        ]
+        if not params.get("app_ref"):
+            return {
+                "applications": [app.to_json() for app in apps],
+                "windows": windows,
+                "note": "pass app_ref to observe a specific application (opaque reference, not permission)",
+            }
+        scope_payload = dict(params.get("scope") or {})
+        scope_payload.setdefault("app_ref", params["app_ref"])
+        scope = ScopeSpec.from_json(scope_payload)
+        snapshot = self.driver.observe(scope)
+        include_screenshot = bool(params.get("screenshot", True))
+        screenshot: dict[str, Any] | None = None
+        if include_screenshot:
+            run_id = str(params.get("run_id") or new_id("run"))
+            capture = self.driver.capture(
+                scope=scope,
+                snapshot_id=snapshot.snapshot_id,
+                run_id=run_id,
+                checkpoint="inspect",
+                description="inspection screenshot",
+                max_scale=self.config.capture_scale,
+            )
+            self.evidence.register(capture.evidence)
+            screenshot = self._evidence_payload(capture.evidence, include_base64=bool(params.get("inline_image")))
+        return {
+            "application": next((app.to_json() for app in apps if app.app_ref == params["app_ref"]), None),
+            "windows": [window.to_json() for window in snapshot.windows],
+            "elements": [element.to_json() for element in snapshot.elements],
+            "coverage": snapshot.coverage.value,
+            "truncation": list(snapshot.truncation),
+            "context": dict(snapshot.context),
+            "snapshot_id": snapshot.snapshot_id,
+            "geometry": snapshot.geometry.to_json(),
+            "interval_ms": snapshot.interval_ms,
+            "screenshot": screenshot,
+        }
+
+    def _m_run(self, session, params) -> dict[str, Any]:
+        if "run" in params or "spec" in params:
+            return self._run_new(session, params)
+        return self._run_resume(session, params)
+
+    def _run_new(self, session, params: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(params.get("run") or params.get("spec") or {})
+        spec = RunSpec.from_json(payload)
+        if spec.limits.to_json() != spec.limits.clamped().to_json():
+            raise ContractError("requested limits exceed local policy")
+        if self.policy is None and spec.steps:
+            raise PolicyError(
+                f"no decision policy is configured: set {self.config.policy.api_key_env} for the broker "
+                "process, or drive the run with desktop_act"
+            )
+        created = self.runtime.create_run(spec, session_id=session.session_id)
+        run_id = created["run_id"]
+        self.ownership.acquire(session.session_id, run_id)
+        self.journal.append_trace(run_id, "lease_acquired", {"session": session.session_id})
+        result = self.runtime.slice(
+            run_id=run_id,
+            session_id=session.session_id,
+            resume_token=created["resume_token"],
+            slice_seconds=float(params.get("slice_seconds") or spec.limits.slice_seconds),
+        )
+        return self._run_payload(result, inline_image=bool(params.get("inline_image")))
+
+    def _run_resume(self, session, params: Mapping[str, Any]) -> dict[str, Any]:
+        run_id = str(params.get("run_id") or "")
+        if not run_id:
+            raise ContractError("run requires either a specification or a run_id with resume_token")
+        state = self.runtime._load(run_id)
+        lease = self.ownership.active_lease()
+        if lease is None or lease.run_id != run_id:
+            self.ownership.acquire(session.session_id, run_id)
+        inputs_payload = dict(params.get("inputs") or {})
+        inputs = ResumeInputs(
+            fixtures=dict(inputs_payload.get("fixtures") or {}),
+            visual_results=dict(inputs_payload.get("visual_results") or {}),
+            verifier_results=dict(inputs_payload.get("verifier_results") or {}),
+        )
+        result = self.runtime.slice(
+            run_id=run_id,
+            session_id=session.session_id,
+            resume_token=str(params.get("resume_token") or ""),
+            inputs=inputs,
+            slice_seconds=float(params.get("slice_seconds") or state.spec.limits.slice_seconds),
+        )
+        return self._run_payload(result, inline_image=bool(params.get("inline_image")))
+
+    def _m_act(self, session, params) -> dict[str, Any]:
+        run_id = str(params.get("run_id") or "")
+        if not run_id:
+            raise ContractError("desktop_act requires a run_id and resume_token")
+        lease = self.ownership.active_lease()
+        if lease is None or lease.run_id != run_id:
+            self.ownership.acquire(session.session_id, run_id)
+        action_payload = dict(params.get("action") or {})
+        action_payload.setdefault("run_id", run_id)
+        active = self.ownership.active_lease()
+        if active is None:  # pragma: no cover - acquire above guarantees a lease
+            raise ContractError("no lease is held for this run")
+        action_payload.setdefault("lease_generation", active.generation)
+        action_payload.setdefault("action_id", new_id("act"))
+        request = ActionRequest.from_json(action_payload)
+        result = self.runtime.act(
+            run_id=run_id,
+            session_id=session.session_id,
+            resume_token=str(params.get("resume_token") or ""),
+            request=request,
+        )
+        return result
+
+    def _m_stop(self, session, params) -> dict[str, Any]:
+        if params.get("emergency"):
+            if params.get("clear"):
+                cleared = emergency_clear()
+                return {"emergency_stop": "cleared" if cleared else "not_set"}
+            emergency_signal()
+            lease = self.ownership.active_lease()
+            if lease is not None:
+                self.ownership.request_cancel(lease.run_id, "local emergency stop")
+                self.ownership.release(lease.lease_id)
+            self.journal.append_trace(None, "emergency_stop", {"session": session.session_id})
+            return {"emergency_stop": "set", "released_run": lease.run_id if lease else None}
+        run_id = str(params.get("run_id") or "")
+        if not run_id:
+            lease = self.ownership.active_lease()
+            if lease is None:
+                return {"cancelled": False, "detail": "no active run"}
+            run_id = lease.run_id
+        return self.runtime.stop(
+            run_id=run_id, session_id=session.session_id, reason=str(params.get("reason") or "caller cancelled")
+        )
+
+    def _m_evidence(self, session, params) -> dict[str, Any]:
+        evidence_id = str(params.get("evidence_id") or "")
+        reference = self.evidence.get(evidence_id)
+        return self._evidence_payload(reference, include_base64=bool(params.get("inline_image", True)))
+
+    def _m_shutdown(self, session, params) -> dict[str, Any]:
+        self.journal.append_trace(None, "shutdown_requested", {"session": session.session_id})
+        if self._server is not None:
+            self._server.stop()
+        return {"stopping": True}
+
+    # -- helpers -------------------------------------------------------------------
+
+    def _health(self) -> dict[str, Any]:
+        driver_health = self.driver.health()
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "pid": os.getpid(),
+            "started_at": self._started_at,
+            "session": session_description(),
+            "driver": driver_health,
+            "policy": {
+                "configured": self.policy is not None,
+                "key_present": bool(os.environ.get(self.config.policy.api_key_env)),
+                "model": self.config.policy.model_id,
+                "key_env": self.config.policy.api_key_env,
+                "resolved_models": list(self.policy.resolved_models[-5:]) if self.policy else [],
+            },
+            "journal": {
+                "path": str(self.config.journal_path),
+                "healthy": self.journal.healthy,
+                "recovered_uncertain": self._recovered,
+            },
+            "evidence": {"root": str(self.evidence_dir), **self.evidence.usage()},
+            "approved_roots": list(self.config.approved_roots),
+            "emergency_stop": emergency_is_set(),
+            "lease": (self.ownership.active_lease().__dict__ if self.ownership.active_lease() else None),
+            "paused_runs": [row["run_id"] for row in self.journal.list_runs(50) if row["status"] == "paused"],
+        }
+
+    def _evidence_payload(self, reference: EvidenceRef, *, include_base64: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = reference.to_json()
+        payload["fetchable"] = True
+        if include_base64 and reference.size_bytes <= MAX_INLINE_IMAGE_BYTES and os.path.isfile(reference.path):
+            payload["base64"] = base64.b64encode(self.evidence.read(reference.evidence_id)).decode("ascii")
+        return payload
+
+    def _run_payload(self, result: RunResult, *, inline_image: bool) -> dict[str, Any]:
+        payload = result.to_json()
+        payload["status"] = self.runtime.status(result.run_id)
+        images = []
+        for reference in result.evidence[-3:] if inline_image else []:
+            images.append(self._evidence_payload(reference, include_base64=True))
+        payload["images"] = images
+        return payload
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the broker in the foreground (normally started on demand by a client)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="jev-desktop-broker", description="Jev host-desktop broker")
+    parser.add_argument("--config", help="path to config.json")
+    parser.add_argument("--print-config", action="store_true")
+    args = parser.parse_args(argv)
+    config = BrokerConfig.load(args.config)
+    if args.print_config:
+        print(json.dumps(json.loads(json.dumps(config.__dict__, default=str)), indent=2))
+        return 0
+    broker = Broker(config)
+    broker.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

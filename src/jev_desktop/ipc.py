@@ -1,0 +1,354 @@
+"""Local named-pipe transport: explicit DACL, byte-mode newline-framed JSON.
+
+The pipe is created with a security descriptor that grants access only to SYSTEM, the
+object owner, and the current user SID, because Windows named-pipe defaults can otherwise include
+read access for Everyone and anonymous users. Client and server both verify that the peer
+runs in the same logon session; the pipe name itself embeds the logon session id.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import threading
+import time
+from collections.abc import Callable
+from ctypes import wintypes
+from dataclasses import dataclass
+from typing import Any
+
+from .contracts import ContractError, Envelope
+from .security import SecurityAttributes, current_user_sid, logon_session_id, session_id
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+PIPE_ACCESS_DUPLEX = 0x00000003
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+PIPE_TYPE_BYTE = 0x00000000
+PIPE_READMODE_BYTE = 0x00000000
+PIPE_WAIT = 0x00000000
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+PIPE_UNLIMITED_INSTANCES = 255
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+ERROR_PIPE_CONNECTED = 535
+ERROR_BROKEN_PIPE = 109
+ERROR_NO_DATA = 232
+ERROR_MORE_DATA = 234
+ERROR_PIPE_BUSY = 231
+
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+SECURITY_SQOS_PRESENT = 0x00100000
+SECURITY_IMPERSONATION = 0x00020000
+
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+
+kernel32.CreateNamedPipeW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+]
+kernel32.CreateNamedPipeW.restype = wintypes.HANDLE
+kernel32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+kernel32.ConnectNamedPipe.restype = wintypes.BOOL
+kernel32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
+kernel32.DisconnectNamedPipe.restype = wintypes.BOOL
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+kernel32.CreateFileW.restype = wintypes.HANDLE
+kernel32.ReadFile.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.c_void_p,
+]
+kernel32.ReadFile.restype = wintypes.BOOL
+kernel32.WriteFile.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.c_void_p,
+]
+kernel32.WriteFile.restype = wintypes.BOOL
+kernel32.PeekNamedPipe.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.PeekNamedPipe.restype = wintypes.BOOL
+kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+kernel32.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
+kernel32.GetNamedPipeServerProcessId.restype = wintypes.BOOL
+kernel32.GetNamedPipeClientProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
+kernel32.GetNamedPipeClientProcessId.restype = wintypes.BOOL
+kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+
+
+def pipe_name(suffix: str = "broker") -> str:
+    """Per-user, per-logon-session pipe name in the local namespace."""
+    sid = current_user_sid().split("-")[-1]
+    return f"\\\\.\\pipe\\jev-desktop-{suffix}-{sid}-{logon_session_id()}"
+
+
+def client_process_id(handle: int) -> int:
+    pid = wintypes.ULONG(0)
+    if not kernel32.GetNamedPipeClientProcessId(handle, ctypes.byref(pid)):
+        return 0
+    return int(pid.value)
+
+
+def peer_session_matches(handle: int) -> bool:
+    """Verify the connected client runs in this Terminal Services session."""
+    pid = client_process_id(handle)
+    if not pid:
+        return False
+    peer_session = wintypes.DWORD(0)
+    if not kernel32.ProcessIdToSessionId(pid, ctypes.byref(peer_session)):
+        return False
+    return int(peer_session.value) == session_id()
+
+
+class ConnectionClosed(RuntimeError):
+    pass
+
+
+@dataclass
+class ConnectionInfo:
+    peer_pid: int
+    session: int
+
+
+class _FramedHandle:
+    """Newline-framed message reader/writer over a pipe handle."""
+
+    def __init__(self, handle: int, *, timeout_s: float | None = None) -> None:
+        self.handle = handle
+        self.timeout_s = timeout_s
+        self._buffer = bytearray()
+
+    def write_line(self, payload: bytes) -> None:
+        view = ctypes.create_string_buffer(payload)
+        written = wintypes.DWORD(0)
+        offset = 0
+        while offset < len(payload):
+            chunk = ctypes.cast(ctypes.addressof(view) + offset, ctypes.c_void_p)
+            if not kernel32.WriteFile(self.handle, chunk, len(payload) - offset, ctypes.byref(written), None):
+                raise ConnectionClosed(f"WriteFile failed ({ctypes.get_last_error()})")
+            if written.value == 0:
+                raise ConnectionClosed("write returned zero bytes")
+            offset += written.value
+
+    def read_line(self, *, deadline: float | None = None) -> bytes | None:
+        """Return one newline-terminated frame, or None when the deadline expires."""
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                return line
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            available = wintypes.DWORD(0)
+            if not kernel32.PeekNamedPipe(self.handle, None, 0, None, ctypes.byref(available), None):
+                error = ctypes.get_last_error()
+                if error in {ERROR_BROKEN_PIPE, ERROR_NO_DATA}:
+                    raise ConnectionClosed("peer closed the pipe")
+                raise ConnectionClosed(f"PeekNamedPipe failed ({error})")
+            if available.value == 0:
+                time.sleep(0.01)
+                continue
+            chunk = ctypes.create_string_buffer(min(available.value, 65536))
+            read = wintypes.DWORD(0)
+            if not kernel32.ReadFile(self.handle, chunk, len(chunk), ctypes.byref(read), None):
+                error = ctypes.get_last_error()
+                if error in {ERROR_BROKEN_PIPE, ERROR_NO_DATA}:
+                    raise ConnectionClosed("peer closed the pipe")
+                raise ConnectionClosed(f"ReadFile failed ({error})")
+            self._buffer += chunk.raw[: read.value]
+            if len(self._buffer) > MAX_MESSAGE_BYTES:
+                raise ConnectionClosed("message exceeds the maximum frame size")
+
+
+class PipeServer:
+    """One pipe instance per connection; the handler is called per request frame."""
+
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        handler: Callable[[Envelope, ConnectionInfo], Envelope | None],
+        max_instances: int = 8,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        on_disconnect: Callable[[ConnectionInfo], None] | None = None,
+    ) -> None:
+        self.name = name or pipe_name()
+        self.handler = handler
+        self.max_instances = max_instances
+        self._stop = threading.Event()
+        self._first = True
+        self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        self._on_event = on_event
+        self._on_disconnect = on_disconnect
+
+    def _log(self, kind: str, payload: dict[str, Any]) -> None:
+        if self._on_event is not None:
+            self._on_event(kind, payload)
+
+    def serve_forever(self) -> None:
+        while not self._stop.is_set():
+            handle = self._create_instance()
+            if not handle:
+                self._log("pipe_create_failed", {"error": ctypes.get_last_error()})
+                break
+            connected = kernel32.ConnectNamedPipe(handle, None)
+            error = ctypes.get_last_error()
+            if not connected and error != ERROR_PIPE_CONNECTED:
+                kernel32.CloseHandle(handle)
+                continue
+            if self._stop.is_set():
+                kernel32.CloseHandle(handle)
+                break
+            thread = threading.Thread(target=self._serve, args=(handle,), daemon=True, name="pipe-conn")
+            thread.start()
+            self._threads.append(thread)
+        self._join_connections()
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        """Stop accepting connections and wait for the in-flight ones to finish."""
+        self._stop.set()
+        self._join_connections(timeout=timeout)
+
+    def _join_connections(self, *, timeout: float = 0.0) -> None:
+        for thread in list(self._threads):
+            thread.join(timeout=timeout)
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
+
+    def _create_instance(self) -> int:
+        with self._lock:
+            open_mode = PIPE_ACCESS_DUPLEX
+            if self._first:
+                open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE
+            pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS
+            with SecurityAttributes() as attributes:
+                handle = kernel32.CreateNamedPipeW(
+                    self.name,
+                    open_mode,
+                    pipe_mode,
+                    self.max_instances,
+                    MAX_MESSAGE_BYTES,
+                    MAX_MESSAGE_BYTES,
+                    0,
+                    ctypes.byref(attributes),
+                )
+            self._first = False
+            return int(handle) if handle and handle != INVALID_HANDLE_VALUE else 0
+
+    def _serve(self, handle: int) -> None:
+        stream = _FramedHandle(handle)
+        info = ConnectionInfo(peer_pid=client_process_id(handle), session=session_id())
+        try:
+            if not peer_session_matches(handle):
+                self._log("rejected_peer", {"pid": info.peer_pid})
+                return
+            while not self._stop.is_set():
+                line = stream.read_line()
+                if line is None:
+                    break
+                if not line.strip():
+                    continue
+                response: Envelope | None
+                try:
+                    envelope = Envelope.from_json(json.loads(line.decode("utf-8")))
+                except (ContractError, ValueError) as exc:
+                    response = Envelope.failure("req:000000000000", "bad_request", f"invalid envelope: {exc}")
+                else:
+                    try:
+                        response = self.handler(envelope, info)
+                    except Exception as exc:
+                        response = Envelope.failure(
+                            envelope.request_id,
+                            type(exc).__name__,
+                            str(exc),
+                            {"method": envelope.method},
+                        )
+                if response is None:
+                    break
+                stream.write_line(json.dumps(response.to_json(), ensure_ascii=False).encode("utf-8") + b"\n")
+        except ConnectionClosed as exc:
+            self._log("connection_closed", {"error": str(exc)})
+        finally:
+            if self._on_disconnect is not None:
+                try:
+                    self._on_disconnect(info)
+                except Exception as exc:
+                    self._log("disconnect_handler_failed", {"error": str(exc)})
+            kernel32.DisconnectNamedPipe(handle)
+            kernel32.CloseHandle(handle)
+
+
+class PipeClient:
+    def __init__(self, *, name: str | None = None, timeout_s: float = 30.0) -> None:
+        self.name = name or pipe_name()
+        self.timeout_s = timeout_s
+        self._handle: int | None = None
+        self._stream: _FramedHandle | None = None
+
+    def connect(self, *, timeout_s: float | None = None) -> None:
+        if self._handle is not None:
+            return
+        deadline = time.monotonic() + (timeout_s if timeout_s is not None else self.timeout_s)
+        while True:
+            if kernel32.WaitNamedPipeW(self.name, 250):
+                handle = kernel32.CreateFileW(
+                    self.name,
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    None,
+                    OPEN_EXISTING,
+                    SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
+                    None,
+                )
+                if handle and handle != INVALID_HANDLE_VALUE:
+                    self._handle = int(handle)
+                    self._stream = _FramedHandle(self._handle)
+                    return
+            if time.monotonic() >= deadline:
+                raise ConnectionClosed(f"could not connect to {self.name}")
+            time.sleep(0.05)
+
+    def request(self, envelope: Envelope, *, timeout_s: float | None = None) -> Envelope:
+        self.connect()
+        assert self._stream is not None
+        self._stream.write_line(json.dumps(envelope.to_json(), ensure_ascii=False).encode("utf-8") + b"\n")
+        deadline = time.monotonic() + (timeout_s if timeout_s is not None else self.timeout_s)
+        line = self._stream.read_line(deadline=deadline)
+        if line is None:
+            raise TimeoutError(f"no response from broker within {timeout_s or self.timeout_s}s")
+        return Envelope.from_json(json.loads(line.decode("utf-8")))
+
+    def close(self) -> None:
+        if self._handle is not None:
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            self._stream = None

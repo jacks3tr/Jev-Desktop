@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a capability or a change in behaviour
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Engine (runtime, journal, verification, evidence)
+        - Windows driver (observation, input, capture, identity)
+        - Policy (Jev questions, thresholds, model handling)
+        - Transports (MCP, CLI)
+        - Documentation or skill
+        - New platform driver
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can you not establish about your software today, and why does that matter.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+      description: If it changes a specification or a result shape, sketch the JSON.
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: How it stays safe
+      description: Explain how the change keeps input inside the approved scope and how it behaves when a guard refuses.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

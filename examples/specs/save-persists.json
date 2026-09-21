@@ -1,0 +1,56 @@
+{
+  "goal": "regression: the Save button persists the document and the file is bound to this run",
+  "purpose": "regression",
+  "interaction_mode": "user_path",
+  "app_ref": "app:000000000000000000000000",
+  "expected_identity": {
+    "mode": "file_marker",
+    "marker_path": "C:/temp/jev-fixture/build_marker.json",
+    "expect_marker": "fixture-1"
+  },
+  "launch_config_id": "fixture",
+  "steps": [
+    {
+      "step_id": "type-name",
+      "operation": "TYPE_TEXT",
+      "target_description": "the Name field",
+      "fixture_reference": "name_value"
+    },
+    {
+      "step_id": "save",
+      "operation": "CLICK",
+      "target_description": "the Save button",
+      "checkpoint": true
+    }
+  ],
+  "assertions": [
+    {
+      "assertion_id": "status-text",
+      "evaluator": "uia_property",
+      "target": {"role": "text", "name_regex": "^Status:"},
+      "property": "text",
+      "expected": {"contains": "saved"},
+      "checkpoint": "save"
+    },
+    {
+      "assertion_id": "state-written-for-this-run",
+      "evaluator": "artifact",
+      "target": {"path": "C:/temp/jev-fixture/state.json", "run_id_field": "run_id"},
+      "expected": {},
+      "property": "run_scoped",
+      "checkpoint": "save"
+    }
+  ],
+  "fixtures": {"name_value": "Ada Lovelace"},
+  "secret_refs": {},
+  "limits": {
+    "max_actions": 25,
+    "max_model_decisions": 30,
+    "deadline_seconds": 600,
+    "slice_seconds": 45,
+    "stale_retries": 2,
+    "no_progress_retries": 2
+  },
+  "scope": {"app_ref": "app:000000000000000000000000", "max_elements": 240},
+  "allow_restart": false
+}

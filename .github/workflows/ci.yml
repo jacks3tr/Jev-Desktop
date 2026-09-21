@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: Offline suite (Python ${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: |
+          python -m ruff format --check .
+          python -m ruff check .
+
+      - name: Type check
+        run: python -m mypy
+
+      - name: Tests
+        run: python -m pytest tests/unit -q --cov=jev_desktop --cov-report=term-missing:skip-covered
+
+  desktop-gate:
+    name: Live suites stay gated
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: No window may be created without the opt-in
+        shell: pwsh
+        run: |
+          $collected = python -m pytest tests/windows -q --collect-only 2>&1 | Out-String
+          Write-Host $collected
+          if ($collected -match "collected [1-9]") {
+            throw "live tests were collected without JEV_DESKTOP_LIVE=1"
+          }
+
+      - name: The fixture refuses to start without the opt-in
+        shell: pwsh
+        run: |
+          python tests/fixtures/jev_fixture_app.py --scenario basic --state-dir "$env:TEMP\jev-gate" 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 3) {
+            throw "expected exit code 3 from the fixture gate, got $LASTEXITCODE"
+          }
+
+  packaging:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build backend
+        run: python -m pip install build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check metadata
+        run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error

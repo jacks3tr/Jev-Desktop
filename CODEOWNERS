@@ -1,0 +1,7 @@
+# Repository ownership. Reviewers listed here are notified on pull requests.
+* @jacks3tr
+
+# Native driver and its guards: changes here need a live-test plan in the PR description.
+/src/jev_desktop/drivers/ @jacks3tr
+/src/jev_desktop/ownership.py @jacks3tr
+/src/jev_desktop/journal.py @jacks3tr
