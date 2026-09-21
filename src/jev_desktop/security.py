@@ -2,8 +2,8 @@
 
 The broker owns a named pipe and a named emergency-stop event. Both are created with an
 explicit security descriptor rather than default permissions, because Windows named-pipe
-defaults can grant read access to Everyone and anonymous users (see NOTICE/README for the
-Microsoft reference). Only SYSTEM and the current user token get access.
+defaults can grant read access to Everyone and anonymous users. The explicit descriptor
+limits access to SYSTEM, the object owner, and the current user SID.
 """
 
 from __future__ import annotations

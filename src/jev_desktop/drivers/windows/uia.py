@@ -194,14 +194,10 @@ CLICKABLE_ROLES = {
     "dataitem",
 }
 TEXT_ROLES = {"edit", "document", "text", "statusbar", "tooltip"}
-# Roles that genuinely accept typed text. Trusting the Value pattern alone is wrong: shell
-# navigation trees, file lists, and column headers all expose Value, which turned 151 tree
-# items into "text fields" in a real Notepad Save As dialog and buried the file name field.
+# Value patterns also appear on navigation trees and lists. Require a text-entry role.
 TEXT_ENTRY_ROLES = {"edit", "document", "combobox", "spinner"}
 
-# Controls a test can act on, as opposed to content rows. Measured on a real Notepad Save As
-# dialog: the file list holds hundreds of rows, and a depth-first walk spent the entire element
-# budget on them, so the dialog's own Save button never appeared in the observation at all.
+# Collect interactive controls before content rows consume the observation budget.
 CHROME_ROLES = {
     "button",
     "splitbutton",
@@ -283,6 +279,7 @@ class UiaWorker:
         self._cache: Any = None
         self._walker: Any = None
         self._true_condition: Any = None
+        self._poisoned = False
         self._error: BaseException | None = None
         self._hi_epoch = 0
         self._com_threading = False
@@ -304,6 +301,9 @@ class UiaWorker:
             return
         self._queue.put((None, Future()))
         self._thread.join(timeout)
+        if self._thread.is_alive():
+            self._poisoned = True
+            raise DriverError("UI Automation worker is still running; ownership must be retained")
         self._thread = None
 
     @property
@@ -313,11 +313,15 @@ class UiaWorker:
     def submit(self, fn: Callable[[Any], Any], timeout: float = 30.0) -> Any:
         if self._thread is None:
             raise DriverError("UI Automation worker is not running")
+        if self._poisoned:
+            raise DriverError("UI Automation worker timed out; restart the broker before further input")
         future: Future = Future()
         self._queue.put((fn, future))
         try:
             return future.result(timeout)
         except TimeoutError as exc:
+            self._poisoned = True
+            future.cancel()
             raise DriverError("UI Automation call timed out; worker state unknown") from exc
 
     # -- worker thread ------------------------------------------------------------
@@ -355,7 +359,7 @@ class UiaWorker:
             fn, future = self._queue.get()
             if fn is None:
                 break
-            if future.cancelled():
+            if not future.set_running_or_notify_cancel():
                 continue
             try:
                 future.set_result(fn(self))
@@ -485,7 +489,7 @@ def _value_of(element: Any, password: bool) -> str | None:
 
 
 def _operations_for(role: str, available: Mapping[str, bool], editable: bool) -> tuple[str, ...]:
-    """Only operations the element genuinely supports and the driver implements."""
+    """Return operations supported by both the element and the driver."""
     ops: list[str] = []
     clickable = bool(available.get("invoke")) or role in CLICKABLE_ROLES
     if clickable:
@@ -568,6 +572,7 @@ def discover_windows(registry: Registry, *, app_ref: str, process_ids: Iterable[
                     visible=True,
                     enabled=bool(win32.user32.IsWindowEnabled(hwnd)),
                     rect=win32.window_rect(hwnd),
+                    dpi=win32.dpi_for_window(hwnd),
                     scope="dialog" if owner else "scoped",
                 ),
             )
@@ -590,6 +595,7 @@ def _with_owner(window: WindowInfo, owner_ref: str) -> WindowInfo:
         enabled=window.enabled,
         rect=window.rect,
         scope=window.scope,
+        dpi=window.dpi,
     )
 
 
@@ -610,6 +616,9 @@ def observe(
 
     def _build(_worker: UiaWorker) -> Snapshot:
         started = time.perf_counter()
+        previous = registry.current_snapshot.pop(app_ref, None)
+        for element_id in registry.snapshots.pop(previous or "", set()):
+            registry.elements.pop(element_id, None)
         snapshot_id = new_id("snap")
         registry.next_index = 1  # element indexes are per-observation, never cumulative
         window_infos: list[WindowInfo] = []
@@ -645,6 +654,7 @@ def observe(
                     visible=bool(win32.user32.IsWindowVisible(hwnd)),
                     enabled=bool(win32.user32.IsWindowEnabled(hwnd)),
                     rect=win32.window_rect(hwnd),
+                    dpi=win32.dpi_for_window(hwnd),
                     scope="dialog" if owner_hwnd else "scoped",
                 )
             )
@@ -880,8 +890,8 @@ def _walk(
             rect=rect,
             index=registry.next_index,
             path=path[-4:],
-            state=state,
-            text=element_text,
+            state={**state, "password": password},
+            text=None if password else element_text,
             truncation=None if element_text is None or text is None or len(text) < text_limit else "length",
         )
     )
@@ -949,8 +959,18 @@ def run_on_worker(worker: UiaWorker, fn: Callable[[UiaWorker], Any], timeout: fl
     return worker.submit(fn, timeout=timeout)
 
 
-def is_descendant_or_self(hit: tuple[int, ...], target: tuple[int, ...]) -> bool:
-    """Runtime ids are hierarchical paths: a prefix match means descendant-or-self."""
-    if not hit or not target:
+def hit_is_descendant_or_self(worker: UiaWorker, target: ElementHandle, x: int, y: int) -> bool:
+    """Runtime IDs are opaque. Walk actual UIA parents to prove hit ancestry."""
+
+    def check(_worker: UiaWorker) -> bool:
+        hit = worker.element_at_point(x, y)
+        walker = worker.automation.RawViewWalker
+        for _ in range(64):
+            if not hit:
+                return False
+            if worker.automation.CompareElements(hit, target.element):
+                return True
+            hit = walker.GetParentElement(hit)
         return False
-    return tuple(hit[: len(target)]) == tuple(target)
+
+    return worker.submit(check, timeout=10.0)

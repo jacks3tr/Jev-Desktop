@@ -48,6 +48,9 @@ def _fixtures(pairs: list[str] | None) -> dict[str, str]:
 
 def _result_envelope(payload: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
     execution = str(payload.get("execution") or "")
+    if "completion" in payload:
+        ok = execution == "completed"
+        return {"ok": ok, **payload}, 0 if ok else NON_PASS_EXIT
     verdict = str(payload.get("verdict") or "")
     ok = execution == "completed" and verdict == "passed"
     envelope = {"ok": ok, "execution": execution or None, "verdict": verdict or None, **payload}
@@ -63,12 +66,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {
         "screenshot": not args.no_screenshot,
         "inline_image": args.inline_image,
-        "scope": {"max_elements": args.max_elements},
+        "scope": {"max_elements": args.max_elements, "window_refs": args.window},
     }
     if args.app_ref:
         params["app_ref"] = args.app_ref
     if args.query:
         params["query"] = args.query
+    if args.run_id:
+        params.update(run_id=args.run_id, resume_token=args.resume_token)
     with _ClientContext(args, "cli-inspect") as client:
         payload = client.call("inspect", params, timeout_s=args.timeout)
     _emit(payload, pretty=args.pretty)
@@ -76,7 +81,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"inline_image": args.inline_image}
+    params: dict[str, Any] = {"inline_image": args.inline_image, "start_only": args.start_only}
+    if args.task:
+        params["task"] = load_json_argument(args.task)
     if args.spec:
         params["run"] = load_json_argument(args.spec)
     if args.run_id:
@@ -90,8 +97,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     verifier = load_json_argument(args.verifier) if args.verifier else {}
     if fixtures or visual or verifier:
         params["inputs"] = {"fixtures": fixtures, "visual_results": visual, "verifier_results": verifier}
-    if "run" not in params and "run_id" not in params:
-        print("run requires --spec or --run-id", file=sys.stderr)
+    if "task" not in params and "run" not in params and "run_id" not in params:
+        print("run requires --task, --spec, or --run-id", file=sys.stderr)
         return 1
     with _ClientContext(args, "cli-run") as client:
         payload = client.call("run", params, timeout_s=args.timeout)
@@ -104,6 +111,8 @@ def cmd_act(args: argparse.Namespace) -> int:
     action = load_json_argument(args.action) if args.action else {}
     for field, value in (
         ("operation", args.operation),
+        ("snapshot_id", args.snapshot),
+        ("step_id", args.step),
         ("mode", args.mode),
         ("element_id", args.element),
         ("text", args.text),
@@ -118,6 +127,8 @@ def cmd_act(args: argparse.Namespace) -> int:
         "run_id": args.run_id,
         "resume_token": args.resume_token,
         "action": action,
+        "access_token": args.access_token,
+        "target_description": args.target,
         "inline_image": args.inline_image,
     }
     with _ClientContext(args, "cli-act") as client:
@@ -127,7 +138,14 @@ def cmd_act(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    if args.emergency:
+        from ..ownership import emergency_clear, emergency_signal
+
+        ok = emergency_clear() if args.clear else emergency_signal()
+        _emit({"emergency_stop": "cleared" if args.clear else "set", "ok": ok}, pretty=args.pretty)
+        return 0 if ok else 1
     params: dict[str, Any] = {"emergency": args.emergency, "clear": args.clear}
+    params["resume_token"] = args.resume_token
     if args.run_id:
         params["run_id"] = args.run_id
     if args.reason:
@@ -140,6 +158,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     params = {"run_id": args.run_id} if args.run_id else {}
+    params["resume_token"] = args.resume_token
     with _ClientContext(args, "cli-status") as client:
         payload = client.call("status", params, timeout_s=args.timeout)
     _emit(payload, pretty=args.pretty)
@@ -147,7 +166,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_evidence(args: argparse.Namespace) -> int:
-    params = {"evidence_id": args.evidence_id, "inline_image": True}
+    params = {"evidence_id": args.evidence_id, "inline_image": True, "resume_token": args.resume_token}
     with _ClientContext(args, "cli-evidence") as client:
         payload = client.call("evidence", params, timeout_s=args.timeout)
     if args.out:
@@ -233,7 +252,7 @@ class _ClientContext:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jev-desktop", description="Jev host-desktop testing plugin")
+    parser = argparse.ArgumentParser(prog="jev-desktop", description="Use Windows applications with Jev Desktop")
     parser.add_argument("--pipe", help="broker pipe name (default: per-user, per-logon session)")
     parser.add_argument("--timeout", type=float, default=3600.0, help="client timeout in seconds")
     parser.add_argument("--no-autostart", action="store_true", help="fail instead of starting a broker")
@@ -243,13 +262,20 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect", help="discover applications or observe one application")
     inspect.add_argument("--app-ref")
     inspect.add_argument("--query")
+    inspect.add_argument("--window", action="append", default=[])
+    inspect.add_argument("--run-id")
+    inspect.add_argument("--resume-token")
     inspect.add_argument("--max-elements", type=int, default=240)
     inspect.add_argument("--no-screenshot", action="store_true")
     inspect.add_argument("--inline-image", action="store_true")
     inspect.set_defaults(func=cmd_inspect)
 
-    run = sub.add_parser("run", help="start or resume a bounded desktop test")
+    run = sub.add_parser("run", help="hand off a desktop task or execute a predefined workflow")
+    run.add_argument("--task", help="task JSON: goal, app_ref, window_refs, texts, hotkeys, and limits")
     run.add_argument("--spec", help="specification file, '-' for stdin, or inline JSON")
+    run.add_argument(
+        "--start-only", action="store_true", help="create a run for caller-directed actions without invoking Jev"
+    )
     run.add_argument("--run-id")
     run.add_argument("--resume-token")
     run.add_argument("--slice-seconds", type=float)
@@ -260,8 +286,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.set_defaults(func=cmd_run)
 
     act = sub.add_parser("act", help="execute one caller-directed interaction")
-    act.add_argument("--run-id", required=True)
-    act.add_argument("--resume-token", required=True)
+    act.add_argument("--run-id")
+    act.add_argument("--resume-token")
+    act.add_argument("--access-token")
+    act.add_argument("--target", help="ask Jev to select a control by description")
+    act.add_argument("--snapshot")
+    act.add_argument("--step")
     act.add_argument("--action", help="action JSON (file, '-' or inline)")
     act.add_argument("--operation")
     act.add_argument("--mode")
@@ -275,6 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop = sub.add_parser("stop", help="cancel a run or operate the emergency stop")
     stop.add_argument("--run-id")
+    stop.add_argument("--resume-token")
     stop.add_argument("--reason")
     stop.add_argument("--emergency", action="store_true")
     stop.add_argument("--clear", action="store_true")
@@ -282,10 +313,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="broker and run status")
     status.add_argument("--run-id")
+    status.add_argument("--resume-token")
     status.set_defaults(func=cmd_status)
 
     evidence = sub.add_parser("evidence", help="fetch an evidence reference")
     evidence.add_argument("--evidence-id", required=True)
+    evidence.add_argument("--resume-token", help="run resume token or inspection access token")
     evidence.add_argument("--out")
     evidence.set_defaults(func=cmd_evidence)
 

@@ -1,13 +1,13 @@
 [project]
 name = "jev-desktop"
 version = "0.1.0"
-description = "Test software through the real Windows desktop: Jev selects routine interactions, native execution and independent assertions produce evidence."
+description = "Use Windows applications through MCP and the command line with Jev Desktop."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [{ name = "jacks3tr", email = "54018717+jacks3tr@users.noreply.github.com" }]
-keywords = ["testing", "ui-automation", "desktop", "windows", "mcp", "typesafe", "jev", "computer-use"]
+keywords = ["automation", "ui-automation", "desktop", "windows", "mcp", "typesafe", "jev", "computer-use"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Win32 (MS Windows)",
@@ -18,8 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Topic :: Software Development :: Quality Assurance",
-    "Topic :: Software Development :: Testing",
+    "Topic :: Desktop Environment",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -46,7 +45,7 @@ Homepage = "https://github.com/jacks3tr/jev-desktop"
 Repository = "https://github.com/jacks3tr/jev-desktop"
 Documentation = "https://github.com/jacks3tr/jev-desktop/tree/main/docs"
 Issues = "https://github.com/jacks3tr/jev-desktop/issues"
-Changelog = "https://github.com/jacks3tr/jev-desktop/blob/main/CHANGELOG.md"
+Releases = "https://github.com/jacks3tr/jev-desktop/releases"
 Security = "https://github.com/jacks3tr/jev-desktop/security/policy"
 
 [build-system]
@@ -65,12 +64,7 @@ include = [
     "/docs",
     "/examples",
     "/README.md",
-    "/CHANGELOG.md",
-    "/CONTRIBUTING.md",
-    "/CODE_OF_CONDUCT.md",
-    "/SECURITY.md",
     "/LICENSE",
-    "/NOTICE",
     "/pyproject.toml",
 ]
 

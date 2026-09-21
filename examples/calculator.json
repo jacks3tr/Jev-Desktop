@@ -1,0 +1,9 @@
+{
+  "goal": "Calculate 7 + 8 using Calculator buttons and stop when the display shows 15.",
+  "app_ref": "<from inspection>",
+  "window_refs": [
+    "<from inspection>"
+  ],
+  "max_actions": 8,
+  "timeout_seconds": 60
+}

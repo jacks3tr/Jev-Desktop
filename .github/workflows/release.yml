@@ -44,6 +44,13 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          draft: true
+          prerelease: true
 
-# Publishing to PyPI is deliberately not automated here. It needs credentials and a human
-# decision, so run `twine upload dist/*` from a machine you control when the release is ready.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+# PyPI publication requires a separate maintainer action.

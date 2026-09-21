@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +32,13 @@ from .contracts import (
     InputMode,
     Operation,
     Pause,
+    Purpose,
+    Reason,
     RunResult,
     RunSpec,
     ScopeSpec,
+    canonical_json,
+    keyed_fingerprint,
     new_id,
 )
 from .drivers.windows import WindowsDriver
@@ -42,7 +46,7 @@ from .evidence import EvidenceStore, RetentionPolicy
 from .ipc import ConnectionInfo, PipeServer, pipe_name
 from .journal import DispatchJournal, JournalUnhealthy
 from .ownership import Ownership, emergency_clear, emergency_is_set, emergency_signal, session_description
-from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError
+from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError, build_contexts, fit_state_to_budget
 from .runtime import ResumeInputs, Runtime, RuntimeConfig
 
 MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
@@ -156,7 +160,7 @@ class Broker:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.driver = driver or WindowsDriver(evidence_dir=self.evidence_dir)
         self.journal = DispatchJournal(str(self.journal_path))
-        self.ownership = Ownership()
+        self.ownership = Ownership(quiesce=getattr(self.driver, "quiesce", None))
         self.evidence = EvidenceStore(
             root=self.evidence_dir,
             approved_roots=list(self.config.approved_roots),
@@ -177,10 +181,14 @@ class Broker:
             ),
         )
         self._server: PipeServer | None = None
-        self._by_peer: dict[int, list[str]] = {}
+        self._by_peer: dict[str, list[str]] = {}
         self._lock = threading.RLock()
+        self._driver_lock = threading.RLock()
         self._started_at = time.time()
         self._recovered: list[str] = []
+        self._inspection_tokens: dict[str, str] = {}
+        self._observations: dict[str, tuple[ScopeSpec, str, str]] = {}
+        self._standalone_run: str | None = None
 
     # ------------------------------------------------------------------------------
     # Lifecycle
@@ -203,6 +211,7 @@ class Broker:
         try:
             self.driver.close()
         finally:
+            self.ownership.force_release()
             self.journal.close()
 
     def serve_forever(self) -> None:
@@ -221,7 +230,7 @@ class Broker:
     def on_disconnect(self, info: ConnectionInfo) -> None:
         """A client that vanishes keeps its paused run, but must not keep the desktop."""
         with self._lock:
-            session_ids = self._by_peer.pop(info.peer_pid, [])
+            session_ids = self._by_peer.pop(info.connection_id, [])
         for session_id in session_ids:
             self.ownership.close_session(session_id)
             self.journal.append_trace(None, "client_disconnected", {"session": session_id, "pid": info.peer_pid})
@@ -241,9 +250,33 @@ class Broker:
             if method == "hello":
                 result = self._hello(params, info)
             elif method == "bye":
+                if params.get("session_id") not in self._by_peer.get(info.connection_id, []):
+                    raise AuthorizationError("session is bound to another connection")
                 result = self._bye(params)
             else:
                 session = self.ownership.authorize(str(params.get("session_id") or "") or None)
+                if session.session_id not in self._by_peer.get(info.connection_id, []):
+                    raise AuthorizationError("session is bound to another connection")
+                if method in {"run", "act", "inspect"}:
+                    with self._driver_lock:
+                        if method in {"run", "act"}:
+                            request_hash = keyed_fingerprint(
+                                self.runtime.config.fingerprint_secret,
+                                canonical_json({"method": method, "params": params}),
+                            )
+                            cached = self.journal.begin_request(envelope.request_id, request_hash)
+                            if cached is not None:
+                                return Envelope.from_json(cached)
+                        result = getattr(self, f"_m_{method}")(session, params)
+                        response = Envelope.success(
+                            envelope.request_id,
+                            result,
+                            session_id=params.get("session_id"),
+                            run_id=params.get("run_id"),
+                        )
+                        if method in {"run", "act"}:
+                            self.journal.finish_request(envelope.request_id, response.to_json())
+                        return response
                 result = getattr(self, f"_m_{method}")(session, params)
             return Envelope.success(
                 envelope.request_id, result, session_id=params.get("session_id"), run_id=params.get("run_id")
@@ -279,7 +312,7 @@ class Broker:
         client = str(params.get("client") or "unknown")[:120]
         session = self.ownership.create_session(client)
         with self._lock:
-            self._by_peer.setdefault(info.peer_pid, []).append(session.session_id)
+            self._by_peer.setdefault(info.connection_id, []).append(session.session_id)
         self.journal.append_trace(
             None, "client_connected", {"session": session.session_id, "client": client, "pid": info.peer_pid}
         )
@@ -308,28 +341,43 @@ class Broker:
     def _m_status(self, session, params) -> dict[str, Any]:
         run_id = str(params.get("run_id") or "")
         if run_id:
+            self._authorize_run(session, params, run_id)
             return {"run": self.runtime.status(run_id), "broker": self._health()}
         return {
             "broker": self._health(),
-            "runs": self.journal.list_runs(limit=int(params.get("limit", 20))),
+            "runs": [
+                row
+                for row in self.journal.list_runs(limit=int(params.get("limit", 20)))
+                if self.runtime._load(str(row["run_id"])).summary.get("owner_session") == session.session_id
+            ],
             "lease": (self.ownership.active_lease().__dict__ if self.ownership.active_lease() else None),
         }
 
     def _m_inspect(self, session, params) -> dict[str, Any]:
+        params = dict(params)
+        if params.get("run_id"):
+            state = self.runtime._load(str(params["run_id"]))
+            self._authorize_run(session, params, state.run_id)
+            self.runtime._restore_binding(state)
+            params.setdefault("app_ref", self.runtime._scope(state).app_ref)
         query = str(params.get("query") or "")
         apps = self.driver.list_apps()
+        discovered_windows = self.driver.list_windows()
         if query:
             lowered = query.lower()
             apps = [
                 app
                 for app in apps
                 if lowered in app.executable_path.lower()
-                or any(lowered in self.driver.registry.windows[ref].__repr__().lower() for ref in app.window_refs)
+                or any(
+                    lowered in window.title.lower() for window in discovered_windows if window.app_ref == app.app_ref
+                )
             ]
         windows = [
             window.to_json()
-            for window in self.driver.list_windows()
-            if not params.get("app_ref") or window.app_ref == params.get("app_ref")
+            for window in discovered_windows
+            if window.app_ref in {app.app_ref for app in apps}
+            and (not params.get("app_ref") or window.app_ref == params.get("app_ref"))
         ]
         if not params.get("app_ref"):
             return {
@@ -340,11 +388,23 @@ class Broker:
         scope_payload = dict(params.get("scope") or {})
         scope_payload.setdefault("app_ref", params["app_ref"])
         scope = ScopeSpec.from_json(scope_payload)
+        if params.get("run_id"):
+            state = self.runtime._load(str(params["run_id"]))
+            self._authorize_run(session, params, state.run_id)
+            self.runtime._restore_binding(state)
+            if scope.app_ref != self.runtime._scope(state).app_ref:
+                raise AuthorizationError("inspection application differs from the run binding")
+            scope = self.runtime._scope(state)
         snapshot = self.driver.observe(scope)
         include_screenshot = bool(params.get("screenshot", True))
+        secrets = self.runtime._secret_values(state) if params.get("run_id") else []
+        if secrets:
+            include_screenshot = False
         screenshot: dict[str, Any] | None = None
+        inspection_run_id = new_id("run")
+        access_token = new_id("resume")
         if include_screenshot:
-            run_id = str(params.get("run_id") or new_id("run"))
+            run_id = str(params.get("run_id") or inspection_run_id)
             capture = self.driver.capture(
                 scope=scope,
                 snapshot_id=snapshot.snapshot_id,
@@ -354,8 +414,19 @@ class Broker:
                 max_scale=self.config.capture_scale,
             )
             self.evidence.register(capture.evidence)
+            self.journal.add_evidence(capture.evidence.evidence_id, run_id, capture.evidence.to_json())
             screenshot = self._evidence_payload(capture.evidence, include_base64=bool(params.get("inline_image")))
-        return {
+            if not params.get("run_id"):
+                token = new_id("resume")
+                self._inspection_tokens[capture.evidence.evidence_id] = token
+                screenshot["access_token"] = token
+            self.evidence.prune()
+            for evidence_id in list(self._inspection_tokens):
+                try:
+                    self.evidence.get(evidence_id)
+                except ContractError:
+                    self._inspection_tokens.pop(evidence_id, None)
+        payload = {
             "application": next((app.to_json() for app in apps if app.app_ref == params["app_ref"]), None),
             "windows": [window.to_json() for window in snapshot.windows],
             "elements": [element.to_json() for element in snapshot.elements],
@@ -368,22 +439,100 @@ class Broker:
             "screenshot": screenshot,
         }
 
+        if not params.get("run_id"):
+            self._observations[snapshot.snapshot_id] = (scope, access_token, inspection_run_id)
+            while len(self._observations) > 256:
+                self._observations.pop(next(iter(self._observations)))
+            payload["access_token"] = access_token
+
+        def redact(value):
+            if isinstance(value, str):
+                return self.runtime._redact(value, secrets)
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        return redact(payload)
+
     def _m_run(self, session, params) -> dict[str, Any]:
+        if "task" in params:
+            if any(key in params for key in ("run", "spec", "run_id")):
+                raise ContractError("supply a task, a workflow, or a resume request, not several")
+            return self._run_task(session, params)
         if "run" in params or "spec" in params:
             return self._run_new(session, params)
         return self._run_resume(session, params)
+
+    def _run_task(self, session, params) -> dict[str, Any]:
+        task = params["task"]
+        if not isinstance(task, dict):
+            raise ContractError("task must be an object")
+        texts = task.get("texts", {})
+        hotkeys = task.get("hotkeys", [])
+        if (
+            not isinstance(texts, dict)
+            or len(texts) > 16
+            or any(not isinstance(name, str) or not isinstance(value, str) for name, value in texts.items())
+        ):
+            raise ContractError("texts must contain at most 16 named strings")
+        if not isinstance(hotkeys, list) or len(hotkeys) > 8 or any(not isinstance(key, str) for key in hotkeys):
+            raise ContractError("hotkeys must contain at most 8 chords")
+        from .drivers.windows.input import parse_chord
+
+        for chord in hotkeys:
+            parse_chord(chord.split("+"))
+        windows = task.get("window_refs")
+        if not isinstance(windows, list) or not windows:
+            raise ContractError("task requires explicit window_refs from inspection")
+        timeout = task.get("timeout_seconds", 60)
+        if type(timeout) not in (int, float) or not 0 < timeout <= 120:
+            raise ContractError("timeout_seconds must be between 0 and 120")
+        spec = {
+            "goal": task.get("goal"),
+            "purpose": "task",
+            "interaction_mode": "user_path",
+            "app_ref": task.get("app_ref"),
+            "expected_identity": {"mode": "any"},
+            "scope": {"app_ref": task.get("app_ref"), "window_refs": windows, "max_elements": 180},
+            "fixtures": {
+                **{f"text:{name}": value for name, value in texts.items()},
+                **{f"key:{index}": value for index, value in enumerate(hotkeys)},
+            },
+            "limits": {
+                "max_actions": task.get("max_actions", 20),
+                "max_model_decisions": 40,
+                "deadline_seconds": timeout,
+                "slice_seconds": min(timeout, 120),
+                "stale_retries": 2,
+                "no_progress_retries": 2,
+            },
+        }
+        return self._run_new(session, {"run": spec, "inline_image": False})
 
     def _run_new(self, session, params: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(params.get("run") or params.get("spec") or {})
         spec = RunSpec.from_json(payload)
         if spec.limits.to_json() != spec.limits.clamped().to_json():
             raise ContractError("requested limits exceed local policy")
-        if self.policy is None and spec.steps:
+        if self.policy is None and (spec.steps or spec.purpose is Purpose.TASK) and not params.get("start_only"):
             raise PolicyError(
                 f"no decision policy is configured: set {self.config.policy.api_key_env} for the broker "
                 "process, or drive the run with desktop_act"
             )
         created = self.runtime.create_run(spec, session_id=session.session_id)
+        inputs_payload = dict(params.get("inputs") or {})
+        inputs = ResumeInputs(
+            fixtures=dict(inputs_payload.get("fixtures") or {}),
+            visual_results=dict(inputs_payload.get("visual_results") or {}),
+            verifier_results=dict(inputs_payload.get("verifier_results") or {}),
+        )
+        if params.get("start_only"):
+            state = self.runtime._load(created["run_id"])
+            self.runtime._apply_inputs(state, inputs)
+            self.runtime._persist(state)
+            return created
         run_id = created["run_id"]
         self.ownership.acquire(session.session_id, run_id)
         self.journal.append_trace(run_id, "lease_acquired", {"session": session.session_id})
@@ -391,6 +540,7 @@ class Broker:
             run_id=run_id,
             session_id=session.session_id,
             resume_token=created["resume_token"],
+            inputs=inputs,
             slice_seconds=float(params.get("slice_seconds") or spec.limits.slice_seconds),
         )
         return self._run_payload(result, inline_image=bool(params.get("inline_image")))
@@ -400,6 +550,10 @@ class Broker:
         if not run_id:
             raise ContractError("run requires either a specification or a run_id with resume_token")
         state = self.runtime._load(run_id)
+        if params.get("resume_token") != state.resume_token:
+            raise ContractError("resume token does not match the current run checkpoint")
+        if state.status in {"completed", "cancelled"}:
+            raise ContractError("run is terminal; create a new run")
         lease = self.ownership.active_lease()
         if lease is None or lease.run_id != run_id:
             self.ownership.acquire(session.session_id, run_id)
@@ -421,7 +575,10 @@ class Broker:
     def _m_act(self, session, params) -> dict[str, Any]:
         run_id = str(params.get("run_id") or "")
         if not run_id:
-            raise ContractError("desktop_act requires a run_id and resume_token")
+            return self._act_observation(session, params)
+        state = self.runtime._load(run_id)
+        if params.get("resume_token") != state.resume_token:
+            raise ContractError("resume token does not match the current run checkpoint")
         lease = self.ownership.active_lease()
         if lease is None or lease.run_id != run_id:
             self.ownership.acquire(session.session_id, run_id)
@@ -431,7 +588,7 @@ class Broker:
         if active is None:  # pragma: no cover - acquire above guarantees a lease
             raise ContractError("no lease is held for this run")
         action_payload.setdefault("lease_generation", active.generation)
-        action_payload.setdefault("action_id", new_id("act"))
+        action_payload["action_id"] = new_id("act")
         request = ActionRequest.from_json(action_payload)
         result = self.runtime.act(
             run_id=run_id,
@@ -440,6 +597,115 @@ class Broker:
             request=request,
         )
         return result
+
+    def _act_observation(self, session, params) -> dict[str, Any]:
+        payload = dict(params.get("action") or {})
+        snapshot_id = str(payload.get("snapshot_id") or "")
+        observation = self._observations.get(snapshot_id)
+        if observation is None:
+            raise ContractError("inspect the application before each action")
+        scope, token, action_run_id = observation
+        if params.get("access_token") != token:
+            raise AuthorizationError("action requires the inspection access_token")
+        payload.update(action_id=new_id("act"), run_id=action_run_id, lease_generation=0)
+        payload.setdefault("mode", "user_path")
+        request = ActionRequest.from_json(payload)
+        if request.operation not in {
+            Operation.CLICK,
+            Operation.TYPE_TEXT,
+            Operation.SELECT,
+            Operation.TOGGLE,
+            Operation.SCROLL,
+            Operation.FOCUS_WINDOW,
+            Operation.HOTKEY,
+        }:
+            raise ContractError("unsupported standalone operation")
+        snapshot = self.driver.snapshot(snapshot_id, scope)
+        if request.window_ref not in {window.window_ref for window in snapshot.windows}:
+            raise ContractError("action window is outside the observation scope")
+        if request.element_id and snapshot.element(request.element_id).window_ref != request.window_ref:
+            raise ContractError("action element and window do not match")
+        if request.point is not None:
+            request.point.resolve(self.evidence.get(request.point.evidence_id), action_run_id, snapshot_id)
+        if request.operation is Operation.TYPE_TEXT and request.text is None:
+            raise ContractError("TYPE_TEXT requires text")
+        if request.operation is Operation.SELECT and request.option_label is None:
+            raise ContractError("SELECT requires option_label")
+        if request.operation is Operation.HOTKEY and not request.hotkey:
+            raise ContractError("HOTKEY requires a chord")
+        lease = self.ownership.acquire(session.session_id, action_run_id)
+        self._standalone_run = action_run_id
+        deadline = time.monotonic() + 45.0
+
+        def guard() -> None:
+            if time.monotonic() >= deadline:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "action_deadline"})
+            self.ownership.checkpoint(
+                run_id=action_run_id,
+                lease_id=lease.lease_id,
+                generation=lease.generation,
+                session_id=session.session_id,
+            )
+
+        try:
+            guard()
+            target_description = params.get("target_description")
+            if target_description:
+                if request.element_id or request.point:
+                    raise ContractError("supply target_description or an explicit target, not both")
+                if self.policy is None:
+                    raise PolicyError("target_description requires a TypeSafe API key")
+                if not isinstance(target_description, str) or len(target_description) > 4000:
+                    raise ContractError("target_description must be text of at most 4000 characters")
+                policy_observation = {
+                    "elements": [
+                        element.to_json() for element in snapshot.elements if element.window_ref == request.window_ref
+                    ]
+                }
+                contexts = build_contexts(observation=policy_observation, operations=[request.operation])
+                if not contexts:
+                    raise ContractError("no compatible observed controls; use an explicit window for focus or hotkeys")
+                model_state = fit_state_to_budget(
+                    policy_observation,
+                    keep_element_ids=[candidate.element_id for context in contexts for candidate in context.candidates],
+                    budget_bytes=self.runtime.config.state_budget_bytes,
+                )
+                decision = self.policy.decide(
+                    goal=target_description,
+                    state=model_state,
+                    contexts=contexts,
+                    allow_done=False,
+                    current_step={"operation": request.operation.value, "target_description": target_description},
+                    deadline=min(deadline, time.monotonic() + 30.0),
+                )
+                if decision.operation is not request.operation or decision.target is None:
+                    raise Pause(Reason.STEP_UNRESOLVED, {"operation": decision.operation.value})
+                request = replace(request, element_id=decision.target.element_id)
+            guard()
+            if request.element_id and snapshot.element(request.element_id).window_ref != request.window_ref:
+                raise ContractError("action element and window do not match")
+            if hasattr(self.driver, "set_boundary"):
+                self.driver.set_boundary(guard, min(15.0, deadline - time.monotonic()))
+            request = replace(request, lease_generation=lease.generation, deadline_s=15.0)
+            request = replace(
+                request,
+                request_hash=keyed_fingerprint(self.journal.fingerprint_key(), canonical_json(request.to_json())),
+            )
+            # Consume before dispatch, including uncertain outcomes. A new request must inspect again.
+            self._observations.pop(snapshot_id)
+            receipt = self.journal.dispatch_once(
+                action_id=request.action_id,
+                request_hash=request.request_hash,
+                run_id=action_run_id,
+                guard=guard,
+                send=lambda: self.driver.execute(request, guard, snapshot),
+            )
+            return {"receipt": receipt.to_json(), "app_ref": scope.app_ref, "needs_inspection": True}
+        finally:
+            if hasattr(self.driver, "set_boundary"):
+                self.driver.set_boundary(None)
+            self.ownership.release(lease.lease_id)
+            self._standalone_run = None
 
     def _m_stop(self, session, params) -> dict[str, Any]:
         if params.get("emergency"):
@@ -459,13 +725,28 @@ class Broker:
             if lease is None:
                 return {"cancelled": False, "detail": "no active run"}
             run_id = lease.run_id
+        if run_id == self._standalone_run:
+            lease = self.ownership.active_lease()
+            if lease is None or lease.session_id != session.session_id:
+                raise AuthorizationError("only the action owner can cancel it; use emergency stop locally")
+            self.ownership.request_cancel(run_id, str(params.get("reason") or "caller cancelled"))
+            return {"cancelled": True}
         return self.runtime.stop(
-            run_id=run_id, session_id=session.session_id, reason=str(params.get("reason") or "caller cancelled")
+            run_id=run_id,
+            session_id=session.session_id,
+            reason=str(params.get("reason") or "caller cancelled"),
+            resume_token=params.get("resume_token"),
         )
 
     def _m_evidence(self, session, params) -> dict[str, Any]:
         evidence_id = str(params.get("evidence_id") or "")
         reference = self.evidence.get(evidence_id)
+        token = self._inspection_tokens.get(evidence_id)
+        if token is not None:
+            if params.get("resume_token") != token:
+                raise AuthorizationError("inspection evidence requires its access token")
+        else:
+            self._authorize_run(session, params, reference.run_id)
         return self._evidence_payload(reference, include_base64=bool(params.get("inline_image", True)))
 
     def _m_shutdown(self, session, params) -> dict[str, Any]:
@@ -475,6 +756,14 @@ class Broker:
         return {"stopping": True}
 
     # -- helpers -------------------------------------------------------------------
+
+    def _authorize_run(self, session, params, run_id: str) -> None:
+        state = self.runtime._load(run_id)
+        if (
+            state.summary.get("owner_session") != session.session_id
+            and params.get("resume_token") != state.resume_token
+        ):
+            raise AuthorizationError("run access requires its current resume token")
 
     def _health(self) -> dict[str, Any]:
         driver_health = self.driver.health()
@@ -511,6 +800,28 @@ class Broker:
         return payload
 
     def _run_payload(self, result: RunResult, *, inline_image: bool) -> dict[str, Any]:
+        state = self.runtime._load(result.run_id)
+        if state.spec.purpose is Purpose.TASK:
+            return {
+                "run_id": result.run_id,
+                "resume_token": result.resume_token,
+                "execution": result.execution.value,
+                "reason": result.reason,
+                "completion": result.detail.get("completion"),
+                "detail": dict(result.detail),
+                "observation": result.observation
+                if result.execution.value == "completed"
+                else state.summary.get("task_observation"),
+                "actions": [
+                    {
+                        "operation": step.operation.value,
+                        "target": step.target_description,
+                        "changed": step.observation_changed,
+                    }
+                    for step in result.steps
+                ],
+                "metrics": {**dict(result.budgets), **state.summary.get("task_metrics", {})},
+            }
         payload = result.to_json()
         payload["status"] = self.runtime.status(result.run_id)
         images = []

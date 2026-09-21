@@ -14,8 +14,9 @@ import threading
 import time
 from collections.abc import Callable
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from .contracts import ContractError, Envelope
 from .security import SecurityAttributes, current_user_sid, logon_session_id, session_id
@@ -106,7 +107,7 @@ kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
 
 def pipe_name(suffix: str = "broker") -> str:
     """Per-user, per-logon-session pipe name in the local namespace."""
-    sid = current_user_sid().split("-")[-1]
+    sid = current_user_sid()
     return f"\\\\.\\pipe\\jev-desktop-{suffix}-{sid}-{logon_session_id()}"
 
 
@@ -136,6 +137,7 @@ class ConnectionClosed(RuntimeError):
 class ConnectionInfo:
     peer_pid: int
     session: int
+    connection_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 class _FramedHandle:
@@ -267,6 +269,19 @@ class PipeServer:
     def _serve(self, handle: int) -> None:
         stream = _FramedHandle(handle)
         info = ConnectionInfo(peer_pid=client_process_id(handle), session=session_id())
+        monitor_done = threading.Event()
+
+        def monitor_disconnect() -> None:
+            # The request thread may be inside a model call. Detect a vanished client
+            # independently, so its lease is invalid before the next dispatch guard.
+            while not monitor_done.wait(0.05):
+                if not kernel32.PeekNamedPipe(handle, None, 0, None, None, None):
+                    if self._on_disconnect is not None:
+                        self._on_disconnect(info)
+                    return
+
+        monitor = threading.Thread(target=monitor_disconnect, daemon=True, name="pipe-disconnect")
+        monitor.start()
         try:
             if not peer_session_matches(handle):
                 self._log("rejected_peer", {"pid": info.peer_pid})
@@ -298,6 +313,8 @@ class PipeServer:
         except ConnectionClosed as exc:
             self._log("connection_closed", {"error": str(exc)})
         finally:
+            monitor_done.set()
+            monitor.join(timeout=1.0)
             if self._on_disconnect is not None:
                 try:
                     self._on_disconnect(info)

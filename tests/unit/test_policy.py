@@ -39,11 +39,19 @@ def context(operation: Operation, count: int, *, prefix: str = "el") -> OpContex
 def test_target_questions_describe_their_operation_and_reserve_none():
     questions = build_questions(
         goal="save the document",
-        contexts=[context(Operation.CLICK, 2)],
+        contexts=[
+            context(Operation.CLICK, 2),
+            OpContext(
+                operation=Operation.HOTKEY,
+                candidates=(TargetCandidate("cfg:" + "1" * 24, "Enter in the focused window", Operation.HOTKEY),),
+                note="Allowed chord: enter",
+            ),
+        ],
         allow_done=False,
         allow_escalate=True,
     )
-    assert set(questions) == {"operation", "CLICK_target"}
+    assert set(questions) == {"operation", "CLICK_target", "HOTKEY_target"}
+    assert "Allowed chord: enter" in questions["operation"]["criteria"]["HOTKEY"]
     criteria = questions["CLICK_target"]["criteria"]
     assert NONE in criteria and len(criteria) == 3
     assert questions["CLICK_target"]["instructions"]["operation"] == "CLICK"

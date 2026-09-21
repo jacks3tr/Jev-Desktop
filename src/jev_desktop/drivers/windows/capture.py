@@ -14,7 +14,7 @@ import struct
 import zlib
 from dataclasses import dataclass
 
-from ...contracts import Capture, DriverError, EvidenceRef, Geometry, Rect, now
+from ...contracts import Capture, DriverError, EvidenceRef, Geometry, Rect, new_id, now
 from . import win32
 
 
@@ -35,6 +35,7 @@ def encode_png(width: int, height: int, bgra: bytes) -> bytes:
     for y in range(height):
         row = bytearray(bgra[y * stride : (y + 1) * stride])
         row[0::4], row[2::4] = row[2::4], row[0::4]  # BGRA -> RGBA
+        row[3::4] = b"\xff" * width  # GDI's unused alpha byte is not image transparency.
         rows += b"\x00" + row
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
@@ -160,7 +161,7 @@ class ScreenCapture:
         with open(path, "wb") as handle:
             handle.write(raw.png)
         evidence = EvidenceRef(
-            evidence_id=f"ev:{hashlib.sha256(raw.png).hexdigest()[:24]}",
+            evidence_id=new_id("ev"),
             run_id=run_id,
             kind="screenshot",
             path=path,
@@ -174,6 +175,8 @@ class ScreenCapture:
             source_rect=raw.source_rect,
             scale=raw.scale,
             description=description,
+            image_width=struct.unpack(">I", raw.png[16:20])[0],
+            image_height=struct.unpack(">I", raw.png[20:24])[0],
         )
         return Capture(evidence=evidence, geometry=raw.geometry, source_rect=raw.source_rect, scale=raw.scale)
 

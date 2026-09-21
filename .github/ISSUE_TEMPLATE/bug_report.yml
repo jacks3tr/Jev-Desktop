@@ -1,14 +1,12 @@
 name: Bug report
 description: Something behaved differently from what the documentation says
 title: "[bug] "
-labels: ["bug", "needs triage"]
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Do not use this form for anything security-relevant. Input escaping its scope, a
-        guard bypass, journal replay, or a path escape belongs in the private process
-        described in SECURITY.md.
+        Report security issues through [private vulnerability reporting](https://github.com/jacks3tr/jev-desktop/security/advisories/new).
 
   - type: input
     id: version
@@ -21,11 +19,11 @@ body:
   - type: dropdown
     id: tier
     attributes:
-      label: Which test tier does this involve
+      label: Affected area
       options:
         - Offline engine (tests/unit, no desktop)
-        - Live desktop (tests/windows, driver, fixture)
-        - Real application, not the fixture
+        - Live desktop (tests/windows, native driver)
+        - Application compatibility
         - Transport (MCP stdio or the JSON CLI)
     validations:
       required: true
@@ -34,7 +32,7 @@ body:
     id: doctor
     attributes:
       label: Output of `jev-desktop doctor`
-      description: Paste it as-is. It contains the pipe name, driver health, policy state, and evidence usage.
+      description: Remove credentials, access tokens, and private paths before posting.
       render: json
     validations:
       required: true

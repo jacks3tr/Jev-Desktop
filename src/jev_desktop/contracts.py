@@ -1,12 +1,9 @@
-"""Frozen cross-boundary contracts: identifiers, statuses, schemas, driver surface.
+"""Frozen contracts for identifiers, statuses, schemas, and the driver interface.
 
 Everything that crosses a module, process, or transport boundary is defined here and
 nothing else in this package may widen it. Serialization is explicit: every wire type
 has `to_json`/`from_json` with validation, so a malformed payload fails at the edge
 instead of corrupting engine state.
-
-Adapted question/answer material from browser-use/jev-ultrafast lives in `policy.py`;
-this module is original. See NOTICE.
 """
 
 from __future__ import annotations
@@ -115,6 +112,7 @@ class InputMode(_StrEnum):
 
 
 class Purpose(_StrEnum):
+    TASK = "task"
     EXPLORATORY = "exploratory"
     REGRESSION = "regression"
 
@@ -464,6 +462,7 @@ class WindowInfo:
     enabled: bool
     rect: Rect
     scope: str  # "scoped" | "dialog" | "unrelated"
+    dpi: int = 96
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -479,6 +478,7 @@ class WindowInfo:
             "enabled": self.enabled,
             "rect": self.rect.to_json(),
             "scope": self.scope,
+            "dpi": self.dpi,
         }
 
     @classmethod
@@ -499,6 +499,7 @@ class WindowInfo:
             enabled=_require_bool(data.get("enabled"), "window.enabled"),
             rect=Rect.from_json(data.get("rect")),
             scope=_require_str(data.get("scope"), "window.scope"),
+            dpi=_require_int(data.get("dpi", 96), "window.dpi", minimum=48),
         )
 
 
@@ -629,10 +630,7 @@ class ScopeSpec:
     app_ref: str
     window_refs: tuple[str, ...] = ()
     include_dialogs: bool = True
-    # Measured on a content-rich Chromium page: 240 elements produced a 61 kB state (about 15k
-    # tokens) that the provider refused, while 120 elements produced 29 kB and still contained
-    # every visible control. Chrome and dialogs are collected before content rows, so a smaller
-    # cap costs coverage of list rows, not of anything a test can act on.
+    # Bound observation size; callers can increase this when relevant controls are truncated.
     max_elements: int = 120
     max_depth: int = 12
     text_limit: int = 4000
@@ -767,6 +765,8 @@ class EvidenceRef:
     source_rect: Rect | None = None
     scale: float | None = None
     description: str = ""
+    image_width: int | None = None
+    image_height: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -784,6 +784,8 @@ class EvidenceRef:
             "source_rect": None if self.source_rect is None else self.source_rect.to_json(),
             "scale": self.scale,
             "description": self.description,
+            "image_width": self.image_width,
+            "image_height": self.image_height,
         }
 
     @classmethod
@@ -805,12 +807,79 @@ class EvidenceRef:
             source_rect=None if data.get("source_rect") is None else Rect.from_json(data.get("source_rect")),
             scale=None if data.get("scale") is None else _require_number(data.get("scale"), "evidence.scale"),
             description=_require_str(data.get("description", ""), "evidence.description"),
+            image_width=None
+            if data.get("image_width") is None
+            else _require_int(data["image_width"], "image_width", minimum=1),
+            image_height=None
+            if data.get("image_height") is None
+            else _require_int(data["image_height"], "image_height", minimum=1),
         )
 
 
 # --------------------------------------------------------------------------------------
 # Actions and execution
 # --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScreenshotPoint:
+    evidence_id: str
+    x: int
+    y: int
+    source_rect: Rect
+    scale: float
+    image_width: int
+    image_height: int
+    geometry_epoch: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "x": self.x,
+            "y": self.y,
+            "source_rect": self.source_rect.to_json(),
+            "scale": self.scale,
+            "image_width": self.image_width,
+            "image_height": self.image_height,
+            "geometry_epoch": self.geometry_epoch,
+        }
+
+    @classmethod
+    def from_json(cls, data: Any) -> ScreenshotPoint:
+        data = _require_mapping(data, "point")
+        return cls(
+            validate_id("ev", data.get("evidence_id")),
+            _require_int(data.get("x"), "point.x", minimum=0),
+            _require_int(data.get("y"), "point.y", minimum=0),
+            Rect.from_json(data.get("source_rect")),
+            _require_number(data.get("scale"), "point.scale"),
+            _require_int(data.get("image_width"), "point.image_width", minimum=1),
+            _require_int(data.get("image_height"), "point.image_height", minimum=1),
+            _require_int(data.get("geometry_epoch"), "point.geometry_epoch", minimum=0),
+        )
+
+    def resolve(self, evidence: EvidenceRef, run_id: str, snapshot_id: str | None) -> tuple[int, int]:
+        if (
+            evidence.evidence_id != self.evidence_id
+            or evidence.run_id != run_id
+            or evidence.snapshot_id != snapshot_id
+            or snapshot_id is None
+            or evidence.source_rect != self.source_rect
+            or evidence.scale != self.scale
+            or evidence.image_width != self.image_width
+            or evidence.image_height != self.image_height
+            or evidence.geometry is None
+            or evidence.geometry.epoch != self.geometry_epoch
+        ):
+            raise ContractError("coordinate action does not match its screenshot and snapshot")
+        if not (0 <= self.x < self.image_width and 0 <= self.y < self.image_height) or self.source_rect.is_empty:
+            raise ContractError("coordinate is outside the screenshot")
+        # Map pixel centres using both actual dimensions; rounding a downscaled image
+        # gives slightly different horizontal and vertical ratios.
+        return (
+            self.source_rect.left + int((self.x + 0.5) * self.source_rect.width / self.image_width),
+            self.source_rect.top + int((self.y + 0.5) * self.source_rect.height / self.image_height),
+        )
 
 
 @dataclass(frozen=True)
@@ -832,6 +901,7 @@ class ActionRequest:
     launch_config_id: str | None = None
     deadline_s: float = 10.0
     request_hash: str = ""
+    point: ScreenshotPoint | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -852,6 +922,7 @@ class ActionRequest:
             "launch_config_id": self.launch_config_id,
             "deadline_s": self.deadline_s,
             "request_hash": self.request_hash,
+            "point": None if self.point is None else self.point.to_json(),
         }
 
     @classmethod
@@ -878,6 +949,7 @@ class ActionRequest:
             launch_config_id=_opt_str(data.get("launch_config_id"), "action.launch_config_id"),
             deadline_s=_require_number(data.get("deadline_s", 10.0), "action.deadline_s"),
             request_hash=_require_str(data.get("request_hash", ""), "action.request_hash"),
+            point=None if data.get("point") is None else ScreenshotPoint.from_json(data["point"]),
         )
 
     def dispatch_binding(self) -> dict[str, Any]:
@@ -892,9 +964,11 @@ class ActionRequest:
             "window_ref": self.window_ref,
             "step_id": self.step_id,
             "option_label": self.option_label,
+            "replace_existing": self.replace_existing,
             "hotkey": list(self.hotkey),
             "scroll": dict(self.scroll),
             "launch_config_id": self.launch_config_id,
+            "point": None if self.point is None else self.point.to_json(),
         }
 
 
@@ -945,7 +1019,7 @@ class Capture:
 
 
 # --------------------------------------------------------------------------------------
-# Driver surface (implemented by drivers/windows, faked in engine tests)
+# Driver interface, implemented by drivers/windows and substituted in engine tests.
 # --------------------------------------------------------------------------------------
 
 
@@ -988,9 +1062,7 @@ class Driver(Protocol):
 # --------------------------------------------------------------------------------------
 
 
-# Defaults chosen from measurement rather than taste, see docs/calibration.md:
-# a live run consumed 1.0 model decisions and 1.09 s of wall time per dispatched action, so a
-# full 25-action budget needs about 40 decisions and 27 s of slice time.
+# Conservative defaults; callers may narrow the local policy ceilings.
 DEFAULT_LIMITS: dict[str, Any] = {
     "max_actions": 25,
     "max_model_decisions": 40,

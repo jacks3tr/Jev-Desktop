@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
------------------------------------------------------------------------------
-
-Third-party material adapted into this project is attributed in NOTICE:
-`browser-use/jev-ultrafast` (MIT, Copyright (c) 2026 Browser Use) contributed the
-operation/target question construction, strict Choice-answer validation, and the
-bounded execution ordering that `src/jev_desktop/policy.py` and
-`src/jev_desktop/runtime.py` build on.

@@ -48,7 +48,9 @@ PLACEHOLDERS = ("example", "placeholder", "your-", "changeme", "redacted", "dumm
 
 
 def tracked_files() -> list[str]:
-    return subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=str(ROOT), check=True).stdout.split()
+    return subprocess.run(
+        ["git", "ls-files"], capture_output=True, text=True, cwd=str(ROOT), check=True
+    ).stdout.splitlines()
 
 
 def test_detector_catches_known_shapes():
@@ -92,7 +94,7 @@ def test_no_secret_shaped_strings_in_tracked_files():
     findings: list[str] = []
     for name in tracked_files():
         path = ROOT / name
-        if path.suffix.lower() in BINARY_SUFFIXES:
+        if not path.is_file() or path.suffix.lower() in BINARY_SUFFIXES:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for label, pattern in SECRET_SHAPES.items():
@@ -110,7 +112,7 @@ def test_no_local_machine_paths_in_tracked_files():
     findings: list[str] = []
     for name in tracked_files():
         path = ROOT / name
-        if path.suffix.lower() in BINARY_SUFFIXES:
+        if not path.is_file() or path.suffix.lower() in BINARY_SUFFIXES:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for label, pattern in LOCAL_SHAPES.items():

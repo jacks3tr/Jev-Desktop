@@ -8,8 +8,11 @@ sits in front of `SendInput`, GDI capture, or window/process queries.
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
+from collections.abc import Callable
 from ctypes import wintypes
+from typing import Any
 
 from ...contracts import DriverError, Rect
 
@@ -378,14 +381,92 @@ def normalize_absolute(x: int, y: int) -> tuple[int, int]:
     return max(0, min(65535, nx)), max(0, min(65535, ny))
 
 
+_pending_inputs: Any = None
+_pending_count: Any = None
+_dispatch_guard: Callable[[], None] | None = None
+_input_lock = threading.Lock()
+_stopping = False
+
+
+def stop_input_and_release(buffer, count) -> None:
+    global _stopping
+    with _input_lock:
+        _stopping = True
+        release_pending(buffer, count)
+
+
+def release_pending(buffer, count) -> None:
+    """Release only events recorded by this worker, after it has stopped."""
+    size = int(count.value)
+    if not size:
+        return
+    array = (INPUT * size).from_buffer_copy(bytes(buffer[: size * ctypes.sizeof(INPUT)]))
+    if user32.SendInput(size, array, ctypes.sizeof(INPUT)) != size:
+        raise DriverError("could not release worker-owned input; retain the desktop lease")
+    count.value = 0
+
+
 def _send(inputs: list[INPUT]) -> int:
+    if _dispatch_guard is not None:
+        _dispatch_guard()
+    with _input_lock:
+        if _stopping:
+            raise DriverError("native input worker is stopping")
+        return _send_batch(inputs)
+
+
+def _send_batch(inputs: list[INPUT]) -> int:
     if not inputs:
         return 0
+    if any(event.type == INPUT_KEYBOARD for event in inputs) and any(
+        key_down(vk) for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C)
+    ):
+        from ...contracts import Pause, Reason
+
+        raise Pause(Reason.USER_TAKEOVER, {"reason": "a modifier key is already held"})
+    for event in inputs:
+        vk = event.ki.wVk if event.type == INPUT_KEYBOARD and not event.ki.dwFlags & KEYEVENTF_KEYUP else 0
+        if event.type == INPUT_MOUSE:
+            vk = next(
+                (
+                    key
+                    for flag, key in (
+                        (MOUSEEVENTF_LEFTDOWN, 1),
+                        (MOUSEEVENTF_RIGHTDOWN, 2),
+                        (MOUSEEVENTF_MIDDLEDOWN, 4),
+                    )
+                    if event.mi.dwFlags & flag
+                ),
+                0,
+            )
+        if vk and key_down(vk):
+            from ...contracts import Pause, Reason
+
+            raise Pause(Reason.USER_TAKEOVER, {"reason": "a requested key or button is already held"})
+    releases = [
+        event
+        for event in inputs
+        if (event.type == INPUT_KEYBOARD and event.ki.dwFlags & KEYEVENTF_KEYUP)
+        or (
+            event.type == INPUT_MOUSE
+            and event.mi.dwFlags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP)
+        )
+    ]
+    if _pending_inputs is not None and _pending_count is not None:
+        payload = bytes((INPUT * len(releases))(*releases))
+        if len(payload) > len(_pending_inputs):
+            raise DriverError("input batch exceeds the bounded cleanup buffer")
+        _pending_inputs[: len(payload)] = payload
+        _pending_count.value = len(releases)
     array = (INPUT * len(inputs))(*inputs)
     ctypes.set_last_error(0)
     inserted = user32.SendInput(len(inputs), array, ctypes.sizeof(INPUT))
     if inserted != len(inputs):
-        raise DriverError(f"SendInput inserted {inserted}/{len(inputs)} events ({ctypes.get_last_error()})")
+        from ...contracts import UncertainEffect
+
+        raise UncertainEffect(f"SendInput inserted {inserted}/{len(inputs)} events ({ctypes.get_last_error()})")
+    if _pending_count is not None:
+        _pending_count.value = 0
     return int(inserted)
 
 
@@ -405,56 +486,28 @@ def move_mouse(x: int, y: int) -> int:
     return _send([_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x, y)])
 
 
-# Measured: on a standard Win32 control both a single-batch press and a split press register
-# every trial, so this hold is a hedge for applications that sample the physical button state
-# rather than a requirement. Ten milliseconds costs about one percent of an action.
-CLICK_PRESS_SECONDS = 0.01
-CLICK_BATCHED = False
-
-
-def click_at(
-    x: int,
-    y: int,
-    *,
-    double: bool = False,
-    button: str = "left",
-    press_seconds: float | None = None,
-    batched: bool = False,
-) -> int:
-    """Move, press, hold briefly, release.
-
-    Press and release go in separate SendInput batches with a short hold between them.
-    Measured with `scripts/calibrate_thresholds.py`: the split batching is what makes a
-    control register the click, and the hold keeps the physical button state observable to
-    applications that inspect it. `batched=True` reproduces the single-batch behaviour so the
-    difference stays measurable.
-    """
+def click_at(x: int, y: int, *, double: bool = False, button: str = "left") -> int:
+    """Submit balanced mouse events together, with no held button between batches."""
     down, up = {
         "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
         "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
         "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
     }[button]
-    hold = CLICK_PRESS_SECONDS if press_seconds is None else max(0.0, press_seconds)
-    batched = batched or CLICK_BATCHED
-    count = move_mouse(x, y)
+    events = [_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x, y)]
     for _ in range(2 if double else 1):
-        if batched:
-            count += _send([_mouse_input(down, x, y), _mouse_input(up, x, y)])
-        else:
-            count += _send([_mouse_input(down, x, y)])
-            if hold:
-                time.sleep(hold)
-            count += _send([_mouse_input(up, x, y)])
-        if double and hold:
-            time.sleep(hold)
-    return count
+        events.extend([_mouse_input(down, x, y), _mouse_input(up, x, y)])
+    return _send(events)
 
 
 def scroll_wheel(x: int, y: int, *, notches: int, horizontal: bool = False) -> int:
-    count = move_mouse(x, y)
-    data = (int(notches) * 120) & 0xFFFFFFFF
-    count += _send([_mouse_input(MOUSEEVENTF_HWHEEL if horizontal else MOUSEEVENTF_WHEEL, x, y, data)])
-    return count
+    return _send(
+        [
+            _mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x, y),
+            _mouse_input(
+                MOUSEEVENTF_HWHEEL if horizontal else MOUSEEVENTF_WHEEL, x, y, (int(notches) * 120) & 0xFFFFFFFF
+            ),
+        ]
+    )
 
 
 def type_unicode(text: str) -> int:
@@ -470,7 +523,7 @@ def type_unicode(text: str) -> int:
         for code in units:
             events.append(_key_input(0, KEYEVENTF_UNICODE, code))
             events.append(_key_input(0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, code))
-    return _send(events)
+    return sum(_send(events[index : index + 64]) for index in range(0, len(events), 64))
 
 
 _EXTENDED_VKS = {

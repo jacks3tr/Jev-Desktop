@@ -240,12 +240,13 @@ def evaluate(spec: AssertionSpec, context: EvalContext) -> AssertionResult:
     if spec.evaluator is Evaluator.UIA_PROPERTY:
         matches = matching_elements(observation, target)
         if not matches:
+            complete, why = _coverage_supports_absence(observation)
             return _result(
                 spec,
-                AssertionStatus.FAILED,
+                AssertionStatus.FAILED if complete else AssertionStatus.INCONCLUSIVE,
                 observed={"count": 0},
-                origin=ORIGIN_APPLICATION,
-                notes=["no observed element matched the target"],
+                origin=ORIGIN_APPLICATION if complete else ORIGIN_RUNNER,
+                notes=["no observed element matched the target" if complete else why],
                 checkpoint=context.checkpoint,
                 at=at,
             )
@@ -432,10 +433,22 @@ def _caller_result(
             at=at,
         )
     refs = [str(ref) for ref in supplied.get("evidence_refs", [])]
+    if not refs or context.evidence is None:
+        return _result(
+            spec,
+            AssertionStatus.INCONCLUSIVE,
+            observed={},
+            origin=ORIGIN_RUNNER,
+            notes=["caller results require evidence from this run and checkpoint"],
+            checkpoint=context.checkpoint,
+            at=at,
+        )
     if context.evidence is not None:
         for ref in refs:
             try:
-                context.evidence.get(ref)
+                evidence = context.evidence.get(ref)
+                if evidence.run_id != context.run_id or evidence.checkpoint != context.checkpoint:
+                    raise ContractError("evidence belongs to another run or checkpoint")
             except ContractError:
                 return _result(
                     spec,

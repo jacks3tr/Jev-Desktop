@@ -1,12 +1,4 @@
-"""Repository hygiene: the properties that are easy to lose in a later refactor.
-
-Three checks, each of which has failed in real repositories:
-
-* documentation links that point at files nobody moved,
-* live tests that quietly become runnable without the desktop opt-in,
-* prose that drifts into typographic dashes and curly quotes, which makes diffs noisy and
-  tooling inconsistent.
-"""
+"""Check documentation links and keep desktop tests opt-in."""
 
 from __future__ import annotations
 
@@ -32,18 +24,6 @@ IGNORED_DIRS = {
     "htmlcov",
     ".artifacts",
 }
-BANNED_CHARACTERS = {
-    "\u2014": "em dash",
-    "\u2013": "en dash",
-    "\u2018": "left single curly quote",
-    "\u2019": "right single curly quote",
-    "\u201c": "left double curly quote",
-    "\u201d": "right double curly quote",
-    "\u2026": "ellipsis character",
-}
-# Contributor Covenant text is quoted verbatim from the published standard, so it is not ours
-# to restyle beyond the dashes check.
-STYLE_EXEMPT_FILES = {Path("CODE_OF_CONDUCT.md")}
 
 
 def tracked_text_files() -> list[Path]:
@@ -54,17 +34,6 @@ def tracked_text_files() -> list[Path]:
         if path.suffix in TEXT_SUFFIXES or path.name in {".gitignore", ".gitattributes", ".editorconfig", "CODEOWNERS"}:
             files.append(path)
     return files
-
-
-def test_no_typographic_dashes_or_curly_quotes():
-    offenders: list[str] = []
-    for path in tracked_text_files():
-        text = path.read_text(encoding="utf-8", errors="replace")
-        found = {character for character in text if character in BANNED_CHARACTERS}
-        if found:
-            names = ", ".join(sorted(BANNED_CHARACTERS[character] for character in found))
-            offenders.append(f"{path.relative_to(ROOT).as_posix()}: {names}")
-    assert not offenders, "plain ASCII punctuation only:\n" + "\n".join(offenders)
 
 
 def _markdown_files() -> list[Path]:

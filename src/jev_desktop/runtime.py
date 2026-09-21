@@ -10,6 +10,7 @@ fixture values, scoped visual assistance, or an explicitly requested verifier re
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -32,13 +33,14 @@ from .contracts import (
     Evaluator,
     EvidenceRef,
     Execution,
-    InputMode,
+    IdentityReport,
     Limits,
     Operation,
     Pause,
     Purpose,
     Reason,
     Receipt,
+    RequiredStep,
     RunResult,
     RunSpec,
     RunStatus,
@@ -75,7 +77,7 @@ from .verification import (
 )
 
 RESERVED_DISPATCH_STATES = {DispatchState.DISPATCHING, DispatchState.UNCERTAIN}
-CONTROL_OPERATIONS = {Operation.HOTKEY, Operation.LAUNCH_APP}
+CONTROL_OPERATIONS = {Operation.HOTKEY}
 
 
 @dataclass
@@ -87,8 +89,7 @@ class RuntimeConfig:
     capture_checkpoints: bool = True
     capture_failures: bool = True
     capture_scale: float = 0.6
-    # Measured time from dispatch to an observable change: 179 ms to 365 ms across click,
-    # typing, toggle, and dialog actions, with no misses. 0.8 s is roughly twice the p99.
+    # Bounded settling allowance; a receipt is not proof the application processed input.
     settle_seconds: float = 0.8
     # Provider input ceilings are tokenizer dependent, so start conservative and adapt on a
     # refusal instead of trusting one machine's measurement.
@@ -147,6 +148,7 @@ class _RunState:
     summary: dict[str, Any] = field(default_factory=dict)
     pending_assertion: str | None = None
     uncertain: bool = False
+    slice_deadline: float = float("inf")
 
     # -- persistence ---------------------------------------------------------------
 
@@ -175,7 +177,8 @@ class _RunState:
             "pause_reason": self.pause_reason,
             "pause_detail": dict(self.pause_detail),
             "model_versions": list(self.model_versions),
-            "supplied_fixtures": dict(self.supplied_fixtures),
+            # Resumed fixture values may be credentials; retain them only in memory.
+            "supplied_fixtures": {},
             "state_budget_bytes": self.state_budget_bytes,
             "supplied_visual": {key: dict(value) for key, value in self.supplied_visual.items()},
             "summary": dict(self.summary),
@@ -239,7 +242,11 @@ class Runtime:
         self.ownership = ownership
         self.evidence = evidence
         self.config = config
+        self.config.fingerprint_secret = journal.fingerprint_key()
         self.policy = policy
+        if hasattr(driver, "quiesce"):
+            self.ownership._quiesce = driver.quiesce
+            self.ownership._on_acquire = driver.retain_lease
         self._state: dict[str, _RunState] = {}
 
     # ------------------------------------------------------------------------------
@@ -248,7 +255,7 @@ class Runtime:
 
     def create_run(self, spec: RunSpec, *, session_id: str) -> dict[str, Any]:
         self.ownership.authorize(session_id)
-        if not spec.steps and not spec.assertions:
+        if not spec.steps and not spec.assertions and spec.purpose is not Purpose.TASK:
             raise ContractError("a run needs at least one required step or assertion")
         self._validate_spec(spec)
         run_id = new_id("run")
@@ -259,6 +266,7 @@ class Runtime:
             status=RunStatus.CREATED.value,
             resume_token=new_id("resume"),
             started_at=self.config.clock(),
+            summary={"owner_session": session_id},
         )
         self.journal.put_run(
             run_id=run_id,
@@ -287,6 +295,8 @@ class Runtime:
         state = self._load(run_id)
         if resume_token != state.resume_token:
             raise ContractError("resume token does not match the current run checkpoint")
+        if state.status in {RunStatus.CANCELLED.value, RunStatus.COMPLETED.value}:
+            raise ContractError("run is terminal; create a new run")
         lease = self.ownership.active_lease()
         if lease is None or lease.run_id != run_id or lease.session_id != session_id:
             raise ContractError("this run does not hold the desktop lease")
@@ -297,15 +307,30 @@ class Runtime:
         state.slices += 1
         state.status = RunStatus.RUNNING.value
         requested = state.spec.limits.slice_seconds if slice_seconds is None else slice_seconds
+        if not math.isfinite(requested) or requested <= 0:
+            raise ContractError("slice_seconds must be finite and positive")
+        requested = min(requested, state.spec.limits.slice_seconds)
         deadline = self.config.clock() + requested
         run_deadline = state.started_at + state.spec.limits.deadline_seconds
         deadline = min(deadline, run_deadline)
+        state.slice_deadline = deadline
+        if hasattr(self.driver, "set_boundary"):
+            self.driver.set_boundary(
+                lambda: self.ownership.checkpoint(
+                    run_id=run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=session_id
+                ),
+                deadline - self.config.clock(),
+            )
         self.journal.append_trace(
             run_id, "slice_start", {"slice": state.slices, "deadline_s": deadline - self.config.clock()}
         )
         try:
             self._reconcile_unfinished(state)
-            result = self._loop(state, lease, deadline)
+            result = (
+                self._task_loop(state, lease, deadline)
+                if state.spec.purpose is Purpose.TASK
+                else self._loop(state, lease, deadline)
+            )
         except Pause as pause:
             result = self._pause(state, pause.reason_value, pause.detail)
         except EmergencyStop as stop:
@@ -321,13 +346,22 @@ class Runtime:
             raise
         except BaseException as exc:  # unexpected: never leave the run silently unrecorded
             result = self._error(state, exc)
+        finally:
+            if hasattr(self.driver, "set_boundary"):
+                self.driver.set_boundary(None)
         self._finish_slice(state, result)
         # The token is rotated at the end of every slice, so the result carries the live one.
         return replace(result, resume_token=state.resume_token)
 
-    def stop(self, *, run_id: str, session_id: str, reason: str = "caller cancelled") -> dict[str, Any]:
+    def stop(
+        self, *, run_id: str, session_id: str, reason: str = "caller cancelled", resume_token: str | None = None
+    ) -> dict[str, Any]:
         self.ownership.authorize(session_id)
         state = self._load(run_id)
+        if state.summary.get("owner_session") != session_id and resume_token != state.resume_token:
+            raise ContractError("stopping another session's run requires its current resume token")
+        if state.status == RunStatus.COMPLETED.value:
+            return {"run_id": run_id, "status": state.status, "reason": "run already completed"}
         self.ownership.request_cancel(run_id, reason)
         state.status = RunStatus.CANCELLED.value
         lease = self.ownership.active_lease()
@@ -343,6 +377,7 @@ class Runtime:
         return {
             "run_id": run_id,
             "status": state.status,
+            "app_ref": self._scope(state).app_ref,
             "spec_digest": state.spec_digest,
             "steps": len(state.steps),
             "completed_steps": list(state.completed_steps),
@@ -367,6 +402,43 @@ class Runtime:
         resume_token: str,
         request: ActionRequest,
     ) -> dict[str, Any]:
+        state = self._load(run_id)
+        state.slice_deadline = min(
+            self.config.clock() + state.spec.limits.slice_seconds, state.started_at + state.spec.limits.deadline_seconds
+        )
+        lease = self.ownership.active_lease()
+        if lease is None:
+            raise ContractError("this run does not hold the desktop lease")
+        if hasattr(self.driver, "set_boundary"):
+            self.driver.set_boundary(
+                lambda: self.ownership.checkpoint(
+                    run_id=run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=session_id
+                ),
+                state.slice_deadline - self.config.clock(),
+            )
+        try:
+            result = self._act(run_id=run_id, session_id=session_id, resume_token=resume_token, request=request)
+            state.resume_token = new_id("resume")
+            self._persist(state)
+            result["resume_token"] = state.resume_token
+            return result
+        except UncertainEffect:
+            state.uncertain = True
+            self._persist(state)
+            raise
+        finally:
+            self._persist(state)
+            if hasattr(self.driver, "set_boundary"):
+                self.driver.set_boundary(None)
+
+    def _act(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        resume_token: str,
+        request: ActionRequest,
+    ) -> dict[str, Any]:
         """Caller-directed single action through the same authorization/journal path."""
         self.ownership.authorize(session_id)
         state = self._load(run_id)
@@ -375,16 +447,47 @@ class Runtime:
         lease = self.ownership.active_lease()
         if lease is None or lease.run_id != run_id or lease.session_id != session_id:
             raise ContractError("this run does not hold the desktop lease")
-        if state.spec.interaction_mode is InputMode.USER_PATH and request.mode is InputMode.SEMANTIC:
-            raise ContractError("this specification is bound to the user_path interaction mode")
-        snapshot = None
+        self._reconcile_unfinished(state)
+        if state.status in {RunStatus.CANCELLED.value, RunStatus.COMPLETED.value}:
+            raise ContractError("run is terminal; create a new run")
+        if request.mode is not state.spec.interaction_mode:
+            raise ContractError("action mode must match the immutable specification")
+        step = self._current_step(state)
+        if step is None or request.operation is not step.operation or request.step_id != step.step_id:
+            raise ContractError("action must match the current required step")
+        if state.actions >= state.spec.limits.max_actions:
+            raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_actions"})
+        if self.config.clock() >= state.started_at + state.spec.limits.deadline_seconds:
+            raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "run_deadline"})
+        if request.operation in {Operation.TYPE_TEXT, Operation.SELECT}:
+            value = self._fixture_value(state, step.fixture_reference) if step.fixture_reference else None
+            supplied = request.text if request.operation is Operation.TYPE_TEXT else request.option_label
+            if value is None or supplied != value or request.replace_existing != step.replace_existing:
+                raise ContractError("action text and replacement mode must match the step fixture")
+        if request.operation is Operation.HOTKEY and tuple(self._hotkey_for(state, step)) != request.hotkey:
+            raise ContractError("action hotkey must match the step fixture")
+        if request.operation is Operation.LAUNCH_APP:
+            raise ContractError("launch must use desktop_run with an approved launch configuration")
+        self._restore_binding(state)
+        snapshot = self.driver.snapshot(request.snapshot_id, self._scope(state))
+        self._check_identity(state, snapshot)
+        if not state.identity_verified:
+            raise Pause(Reason.INCORRECT_BUILD)
+        if request.window_ref not in {window.window_ref for window in snapshot.windows}:
+            raise ContractError("action window is outside the run scope")
         if request.element_id:
-            snapshot = self._observe(state)
-        guarded = replace(
-            request, run_id=run_id, lease_generation=lease.generation, request_hash=self._request_hash(state, request)
-        )
+            element = snapshot.element(request.element_id)
+            if element.window_ref != request.window_ref:
+                raise ContractError("action element and window do not match")
+        if request.point is not None:
+            reference = self.evidence.get(request.point.evidence_id)
+            request.point.resolve(reference, run_id, request.snapshot_id)
+        guarded = replace(request, run_id=run_id, lease_generation=lease.generation)
+        guarded = replace(guarded, request_hash=self._request_hash(state, guarded))
 
         def guard() -> None:
+            if self.config.clock() >= state.slice_deadline:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
             self.ownership.checkpoint(
                 run_id=run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=session_id
             )
@@ -397,7 +500,15 @@ class Runtime:
             send=lambda: self.driver.execute(guarded, guard, snapshot),
         )
         self.journal.append_trace(run_id, "desktop_act", {"action_id": guarded.action_id, "receipt": receipt.to_json()})
-        observation = self._observe(state)
+        state.actions += 1
+        self._record_step(state, guarded, receipt, step, step.target_description, DispatchState.DISPATCHED)
+        self._advance_step(state, step, receipt)
+        state.summary["pending_checkpoint"] = step.step_id
+        self._persist(state)
+        observation = (
+            snapshot if self._launch_follows(state, step) else self._observe_settled(state, before=snapshot.fingerprint)
+        )
+        self._evaluate_due(state, observation, checkpoint=step.step_id)
         state.last_fingerprint = observation.fingerprint
         self._persist(state)
         return {
@@ -411,6 +522,214 @@ class Runtime:
     # Main loop
     # ------------------------------------------------------------------------------
 
+    def _task_loop(self, state: _RunState, lease: Lease, deadline: float) -> RunResult:
+        """Keep routine decisions inside the broker until completion or escalation."""
+        if self.policy is None:
+            raise PolicyError("desktop tasks require a TypeSafe API key")
+        if state.summary.get("restore_binding"):
+            raise ContractError("inspect again and start a new task after restarting the broker")
+        snapshot = self._observe(state)
+        completion_probe = False
+        completion_probe_used = False
+        while True:
+            self.ownership.checkpoint(
+                run_id=state.run_id,
+                lease_id=lease.lease_id,
+                generation=lease.generation,
+                session_id=lease.session_id,
+            )
+            state.summary["task_observation"] = self._observation_summary(snapshot)
+            if self.config.clock() >= deadline:
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "slice_deadline"})
+            if state.decisions >= state.spec.limits.max_model_decisions:
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
+            observation = self._observation_for_policy(state, snapshot)
+            contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
+            bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
+            for operation in (Operation.TYPE_TEXT, Operation.SELECT, Operation.SCROLL):
+                base = build_contexts(observation=observation, operations=[operation])
+                choices = []
+                for context in base:
+                    for target in context.candidates:
+                        values = (
+                            [("up", 3), ("down", -3)]
+                            if operation is Operation.SCROLL
+                            else [
+                                (name, value) for name, value in state.spec.fixtures.items() if name.startswith("text:")
+                            ]
+                        )
+                        for name, value in values:
+                            if operation is Operation.TYPE_TEXT and snapshot.element(target.element_id).value == value:
+                                continue
+                            candidate = replace(
+                                target, element_id=new_id("cfg"), description=f"{target.description}; {name}={value!r}"
+                            )
+                            choices.append(candidate)
+                            bindings[candidate.element_id] = (
+                                target,
+                                name if operation is not Operation.SCROLL else None,
+                                {"notches": value} if operation is Operation.SCROLL else {},
+                            )
+                if choices:
+                    contexts.append(OpContext(operation=operation, candidates=tuple(choices)))
+            focused = next((window for window in snapshot.windows if window.focused), None)
+            unfocused = [window for window in snapshot.windows if not window.focused]
+            if unfocused:
+                contexts.append(
+                    OpContext(
+                        operation=Operation.FOCUS_WINDOW,
+                        candidates=tuple(
+                            TargetCandidate(window.window_ref, f"Focus window {window.title!r}", Operation.FOCUS_WINDOW)
+                            for window in unfocused
+                        ),
+                    )
+                )
+            if focused:
+                keys = []
+                for name, value in state.spec.fixtures.items():
+                    if not name.startswith("key:"):
+                        continue
+                    candidate = TargetCandidate(new_id("cfg"), f"Send {value!r} to {focused.title!r}", Operation.HOTKEY)
+                    keys.append(candidate)
+                    bindings[candidate.element_id] = (candidate, name, {})
+                if keys:
+                    chords = [value for name, value in state.spec.fixtures.items() if name.startswith("key:")]
+                    contexts.append(
+                        OpContext(
+                            operation=Operation.HOTKEY,
+                            candidates=tuple(keys),
+                            note=f"Send one of {chords!r} to the focused window.",
+                        )
+                    )
+            if focused is None:
+                contexts = [context for context in contexts if context.operation is Operation.FOCUS_WINDOW]
+            # At the action limit, a final decision may report completion but cannot dispatch.
+            if completion_probe or state.actions >= state.spec.limits.max_actions:
+                contexts = []
+            model_state = summarize_state_for_policy(
+                goal=state.spec.goal,
+                current_step=None,
+                snapshot_elements=observation["elements"],
+                context=observation["context"],
+                mode=state.spec.interaction_mode.value,
+                recent_actions=[
+                    {
+                        "operation": step.operation.value,
+                        "target": step.target_description,
+                        "changed": step.observation_changed,
+                    }
+                    for step in state.steps[-6:]
+                ],
+            )
+            model_state["supplied_text"] = {
+                name.removeprefix("text:"): value
+                for name, value in state.spec.fixtures.items()
+                if name.startswith("text:")
+            }
+            model_state["allowed_hotkeys"] = [
+                value for name, value in state.spec.fixtures.items() if name.startswith("key:")
+            ]
+            model_state["focused_window"] = focused.title if focused else None
+            model_state = with_permitted_operations(model_state, [context.operation for context in contexts])
+            model_state["task_rules"] = (
+                "Work toward the goal. DONE means the requested result is visible in the current observation. "
+                "Do not assume a click succeeded. Use only supplied text and chords. "
+                "Text entry changes the field; a supplied hotkey may be needed to submit or activate it. "
+                "ESCALATE for missing input, judgment, or controls. Do not repeat successful actions."
+            )
+            state.decisions += 1
+            self._persist(state)
+            try:
+                decision = self.policy.decide(
+                    goal=state.spec.goal,
+                    state=fit_state_to_budget(model_state, budget_bytes=self.config.state_budget_bytes),
+                    contexts=contexts,
+                    allow_done=True,
+                    allow_escalate=True,
+                    current_step=None,
+                    **(
+                        {"deadline": time.monotonic() + max(0.0, deadline - self.config.clock())}
+                        if isinstance(self.policy, JevPolicy)
+                        else {}
+                    ),
+                )
+            except Pause as pause:
+                if pause.reason is not Reason.LOW_CONFIDENCE or completion_probe_used or not state.actions:
+                    raise
+                # A transition can hide the result. Recheck once without offering more input.
+                completion_probe = completion_probe_used = True
+                self.config.sleeper(min(1.0, max(0.0, deadline - self.config.clock())))
+                snapshot = self._observe(state, completion=True)
+                continue
+            self.ownership.checkpoint(
+                run_id=state.run_id,
+                lease_id=lease.lease_id,
+                generation=lease.generation,
+                session_id=lease.session_id,
+            )
+            state.model_versions.append(decision.model)
+            metrics = state.summary.setdefault(
+                "task_metrics", {"model_latency_ms": 0, "input_tokens": 0, "output_tokens": 0, "usage_complete": True}
+            )
+            metrics["model_latency_ms"] += decision.latency_ms
+            for key in ("input_tokens", "output_tokens"):
+                value = decision.usage.get(key)
+                if isinstance(value, int) and value >= 0:
+                    metrics[key] += value
+                else:
+                    metrics["usage_complete"] = False
+            self.journal.append_trace(state.run_id, "decision", decision.to_json())
+            self._persist(state)
+            if decision.operation is Operation.DONE:
+                # Refresh independently of the model's observation; a changed screen needs another decision.
+                fresh = self._observe(state, completion=completion_probe)
+                if fresh.fingerprint != snapshot.fingerprint:
+                    snapshot = fresh
+                    continue
+                state.status = RunStatus.COMPLETED.value
+                return self._result(
+                    state,
+                    Execution.COMPLETED,
+                    Verdict.INCONCLUSIVE.value,
+                    None,
+                    snapshot=fresh,
+                    detail={"completion": "model_reported"},
+                )
+            if completion_probe:
+                return self._pause(
+                    state,
+                    Reason.NEEDS_VISUAL_ASSISTANCE.value,
+                    {"detail": "completion could not be established; inspect the final window"},
+                )
+            if state.actions >= state.spec.limits.max_actions:
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_actions"})
+            if decision.operation is Operation.ESCALATE:
+                return self._pause(
+                    state,
+                    Reason.NEEDS_VISUAL_ASSISTANCE.value,
+                    {"detail": "task needs caller judgment or an input not supplied"},
+                )
+            if decision.operation is Operation.WAIT:
+                self.config.sleeper(min(0.2, max(0.0, deadline - self.config.clock())))
+                snapshot = self._observe(state)
+                continue
+            if decision.target is None:
+                return self._pause(state, Reason.NO_APPROPRIATE_TARGET.value, {})
+            target, fixture, scroll = bindings.get(decision.target.element_id, (decision.target, None, {}))
+            step = RequiredStep(
+                step_id=f"action-{state.actions + 1}",
+                operation=decision.operation,
+                target_description=decision.target.description,
+                fixture_reference=fixture,
+            )
+            state.current_step_id = step.step_id
+            dispatched = self._dispatch(
+                state, lease, replace(decision, target=target), snapshot, step, task_scroll=scroll
+            )
+            if isinstance(dispatched, RunResult):
+                return dispatched
+            snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
+
     def _loop(self, state: _RunState, lease: Lease, deadline: float) -> RunResult:
         spec = state.spec
         if self.ownership.emergency_active():
@@ -421,10 +740,16 @@ class Runtime:
                 return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
             if self.config.clock() >= deadline:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "slice_deadline"})
-            if state.actions >= spec.limits.max_actions:
-                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_actions"})
-            if state.decisions >= spec.limits.max_model_decisions:
-                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
+
+            step = self._current_step(state)
+            if (
+                step is not None
+                and step.operation is Operation.LAUNCH_APP
+                and not state.summary.get("pending_checkpoint")
+            ):
+                self._launch_step(state, lease, step)
+            self._rebind_launched(state)
+            self._restore_binding(state)
 
             snapshot = self._observe(state)
             self._check_identity(state, snapshot)
@@ -433,10 +758,26 @@ class Runtime:
                     state, Reason.INCORRECT_BUILD.value, "the running build is not the expected build", snapshot
                 )
             self._evaluate_due(state, snapshot, checkpoint="run_start" if not state.steps else None)
+            checkpoint = state.summary.get("pending_checkpoint")
+            if checkpoint:
+                self._evaluate_due(state, snapshot, checkpoint=str(checkpoint))
+                checkpoint_step = next((item for item in spec.steps if item.step_id == checkpoint), None)
+                if checkpoint_step and checkpoint_step.checkpoint and self.config.capture_checkpoints:
+                    self._capture(
+                        state, snapshot, checkpoint=str(checkpoint), description=f"checkpoint after {checkpoint}"
+                    )
+                state.summary.pop("pending_checkpoint", None)
 
             step = self._current_step(state)
             if step is None:
                 return self._complete(state, snapshot)
+            if step.operation is Operation.LAUNCH_APP:
+                continue
+
+            if state.actions >= spec.limits.max_actions:
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_actions"})
+            if state.decisions >= spec.limits.max_model_decisions:
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
 
             pending = self._pending_assertion_spec(state)
             if pending is not None:
@@ -469,7 +810,6 @@ class Runtime:
                 return self._unsupported(state, snapshot, step)
 
             decision = self._decide(state, snapshot, step, contexts)
-            state.decisions += 1
 
             if decision.operation is Operation.WAIT:
                 self.journal.append_trace(state.run_id, "decision", decision.to_json())
@@ -487,6 +827,8 @@ class Runtime:
             outcome = self._dispatch(state, lease, decision, snapshot, step)
             if isinstance(outcome, RunResult):
                 return outcome
+            if step.step_id not in state.completed_steps:
+                continue
             self._evaluate_due(state, outcome, checkpoint=step.step_id)
             if step.checkpoint and self.config.capture_checkpoints:
                 self._capture(state, outcome, checkpoint=step.step_id, description=f"checkpoint after {step.step_id}")
@@ -512,37 +854,24 @@ class Runtime:
     def _reconcile_unfinished(self, state: _RunState) -> None:
         """Recover an interrupted action by observation, never by replaying it."""
         unfinished = [
-            record for record in self.journal.actions_for_run(state.run_id) if record.state in RESERVED_DISPATCH_STATES
+            record
+            for record in self.journal.actions_for_run(state.run_id)
+            if record.state in RESERVED_DISPATCH_STATES
+            or (
+                record.state is DispatchState.DISPATCHED
+                and record.action_id not in {step.receipt_action_id for step in state.steps}
+            )
         ]
         if not unfinished:
             return
-        snapshot = self._observe(state)
         for record in unfinished:
-            before = self._fingerprint_before(state, record.action_id)
-            changed = bool(before) and snapshot.fingerprint != before
-            if changed:
-                self.journal.reconcile(
-                    record.action_id,
-                    DispatchState.DISPATCHED,
-                    "observable state changed since the dispatch intent; effect assumed landed",
-                )
-            else:
-                self.journal.reconcile(
-                    record.action_id,
-                    DispatchState.NOT_DISPATCHED,
-                    "observable state is identical to the pre-dispatch observation",
-                )
-            state.uncertain = True  # outcome without a native receipt is never a pass
-            self.journal.append_trace(
-                state.run_id,
-                "reconciled",
-                {
-                    "action_id": record.action_id,
-                    "fingerprint_before": before,
-                    "fingerprint_now": snapshot.fingerprint,
-                    "observed_change": changed,
-                },
+            self.journal.reconcile(
+                record.action_id,
+                DispatchState.UNCERTAIN,
+                "no dispatch receipt; observation alone cannot establish whether input occurred",
             )
+        state.uncertain = True
+        raise Pause(Reason.UNCERTAIN_EFFECT, {"actions": [record.action_id for record in unfinished]})
 
     def _fingerprint_before(self, state: _RunState, action_id: str) -> str | None:
         for trace in reversed(self.journal.traces(state.run_id)):
@@ -553,11 +882,16 @@ class Runtime:
                 return str(payload.get("fingerprint_before") or "")
         return None
 
-    def _observe(self, state: _RunState) -> Snapshot:
+    def _observe(self, state: _RunState, *, completion: bool = False) -> Snapshot:
         attempts = 0
         while True:
+            if self.config.clock() >= state.slice_deadline:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
             try:
-                return self.driver.observe(state.spec.scope)
+                scope = self._scope(state)
+                if completion:
+                    scope = replace(scope, max_depth=max(scope.max_depth, 24))
+                return self.driver.observe(scope)
             except (DriverError, ContractError) as exc:
                 attempts += 1
                 if attempts > state.spec.limits.stale_retries:
@@ -565,9 +899,7 @@ class Runtime:
                 self.config.sleeper(0.3 * attempts)
 
     def _check_identity(self, state: _RunState, snapshot: Snapshot) -> None:
-        if state.identity_checked:
-            return
-        report = self.driver.identity(state.spec.app_ref, state.spec.expected_identity)
+        report = self.driver.identity(self._scope(state).app_ref, state.spec.expected_identity)
         state.identity_checked = True
         state.identity_status = report.status.value
         state.identity_verified = report.status.value == "verified"
@@ -575,45 +907,41 @@ class Runtime:
         state.summary["identity"] = report.to_json()
 
     def _build_contexts(self, state: _RunState, step: Any, snapshot: Snapshot) -> list[OpContext]:
-        # Operations that act on something other than an observed control get their own
-        # candidate groups: an approved launch configuration, or a chord from a fixture.
-        if step.operation is Operation.LAUNCH_APP:
-            candidates = tuple(
-                TargetCandidate(
-                    element_id=new_id("cfg"),
-                    description=f"approved launch configuration {name!r} runs {config.get('executable')}",
-                    operation=Operation.LAUNCH_APP,
-                    value=name,
+        if step.operation is Operation.FOCUS_WINDOW:
+            return [
+                OpContext(
+                    operation=Operation.FOCUS_WINDOW,
+                    candidates=tuple(
+                        TargetCandidate(
+                            element_id=window.window_ref,
+                            description=self._redact(window.title, self._secret_values(state)) or "application window",
+                            operation=Operation.FOCUS_WINDOW,
+                        )
+                        for window in snapshot.windows
+                        if window.visible and window.enabled
+                    ),
                 )
-                for name, config in sorted(self.config.launch_configs.items())
-            )
-            return (
-                [
-                    OpContext(
-                        operation=Operation.LAUNCH_APP,
-                        candidates=candidates,
-                        note="approved launch configurations only",
-                    )
-                ]
-                if candidates
-                else []
-            )
+            ]
         if step.operation is Operation.HOTKEY:
             chord = self._fixture_value(state, step.fixture_reference) if step.fixture_reference else None
             if not chord:
                 return []
+            focused = next((window for window in snapshot.windows if window.focused), None)
+            if focused is None:
+                return []
+            title = self._redact(focused.title, self._secret_values(state)) or "application window"
             return [
                 OpContext(
                     operation=Operation.HOTKEY,
                     candidates=(
                         TargetCandidate(
                             element_id=new_id("cfg"),
-                            description=f"keyboard chord {chord!r}",
+                            description=f"Send caller-specified keyboard chord {chord!r} to focused window {title!r}",
                             operation=Operation.HOTKEY,
                             value=chord,
                         ),
                     ),
-                    note="supported chords only",
+                    note="The caller explicitly requires this chord in the currently focused application window.",
                 )
             ]
         observation = self._observation_for_policy(state, snapshot)
@@ -623,7 +951,7 @@ class Runtime:
             value = self._fixture_value(state, step.fixture_reference)
             labels[step.operation] = f"step={step.step_id} fixture={step.fixture_reference}"
             if value is not None and step.operation is Operation.TYPE_TEXT:
-                labels[step.operation] += f" text_to_enter={json.dumps(value, ensure_ascii=False)}"
+                labels[step.operation] += f" text_length={len(value)}"
         return build_contexts(
             observation=observation,
             operations=operations,
@@ -667,6 +995,13 @@ class Runtime:
         budget = state.state_budget_bytes or self.config.state_budget_bytes
         while True:
             fitted = fit_state_to_budget(summarised, keep_element_ids=keep, budget_bytes=budget)
+            remaining = state.slice_deadline - self.config.clock()
+            if remaining <= 0:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+            if state.decisions >= state.spec.limits.max_model_decisions:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_model_decisions"})
+            state.decisions += 1
+            self._persist(state)
             try:
                 decision = self.policy.decide(
                     goal=state.spec.goal,
@@ -679,6 +1014,7 @@ class Runtime:
                         "operation": step.operation.value,
                         "target_description": step.target_description,
                     },
+                    **({"deadline": time.monotonic() + remaining} if isinstance(self.policy, JevPolicy) else {}),
                 )
                 break
             except Pause as pause:
@@ -740,7 +1076,7 @@ class Runtime:
         observation = {
             "elements": elements,
             "context": {
-                "window_titles": [window.title for window in snapshot.windows],
+                "window_titles": [self._redact(window.title, secrets) for window in snapshot.windows],
                 "modal_windows": list(snapshot.context.get("modal_windows") or []),
                 "texts": texts,
                 "coverage": snapshot.coverage.value,
@@ -768,6 +1104,8 @@ class Runtime:
         decision: Decision,
         snapshot: Snapshot,
         step: Any,
+        *,
+        task_scroll: Mapping[str, Any] | None = None,
     ) -> Snapshot | RunResult:
         spec = state.spec
         mode = spec.interaction_mode
@@ -776,28 +1114,15 @@ class Runtime:
         text: str | None = None
         option_label: str | None = None
         hotkey: tuple[str, ...] = ()
-        launch_config_id: str | None = None
         scroll: dict[str, Any] = {}
         window_ref: str | None = None
 
-        if operation in CONTROL_OPERATIONS:
-            if operation is Operation.LAUNCH_APP:
-                launch_config_id = (target.value if target else None) or spec.launch_config_id
-                if launch_config_id is None and len(self.config.launch_configs) == 1:
-                    # A single registered configuration is unambiguous, so the specification
-                    # does not have to repeat it.
-                    launch_config_id = next(iter(self.config.launch_configs))
-                if not launch_config_id or launch_config_id not in self.config.launch_configs:
-                    return self._pause(
-                        state,
-                        Reason.PERMISSION_BOUNDARY.value,
-                        {
-                            "detail": "LAUNCH_APP requires an approved launch configuration",
-                            "configured": sorted(self.config.launch_configs),
-                        },
-                    )
-            else:
-                hotkey = tuple(self._hotkey_for(state, step))
+        if operation is Operation.HOTKEY:
+            hotkey = tuple(self._hotkey_for(state, step))
+            focused = next((window for window in snapshot.windows if window.focused), None)
+            if focused is None:
+                return self._pause(state, Reason.NO_APPROPRIATE_TARGET.value, {"step": step.step_id})
+            window_ref = focused.window_ref
         else:
             if target is None and operation is Operation.FOCUS_WINDOW:
                 if not snapshot.windows:
@@ -832,9 +1157,11 @@ class Runtime:
                         {"step": step.step_id, "fixture": step.fixture_reference},
                     )
             if operation is Operation.SCROLL:
-                scroll = {"notches": 3}
+                scroll = dict(task_scroll or {"notches": 3})
 
-        if target is not None:
+        if target is not None and operation is Operation.FOCUS_WINDOW:
+            window_ref = target.element_id
+        elif target is not None and operation not in CONTROL_OPERATIONS:
             window_ref = snapshot.element(target.element_id).window_ref
         elif window_ref is None and snapshot.windows:
             window_ref = snapshot.windows[0].window_ref
@@ -845,8 +1172,10 @@ class Runtime:
             run_id=state.run_id,
             operation=operation,
             mode=mode,
-            element_id=target.element_id if target else None,
-            snapshot_id=snapshot.snapshot_id if target else None,
+            element_id=target.element_id
+            if target and operation not in CONTROL_OPERATIONS | {Operation.FOCUS_WINDOW}
+            else None,
+            snapshot_id=snapshot.snapshot_id,
             window_ref=window_ref,
             lease_generation=lease.generation,
             step_id=step.step_id,
@@ -855,12 +1184,13 @@ class Runtime:
             option_label=option_label,
             hotkey=hotkey,
             scroll=scroll,
-            launch_config_id=launch_config_id,
             deadline_s=min(15.0, max(3.0, state.spec.limits.slice_seconds)),
         )
         request = replace(request, request_hash=self._request_hash(state, request))
 
         def guard() -> None:
+            if self.config.clock() >= state.slice_deadline:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
             self.ownership.checkpoint(
                 run_id=state.run_id,
                 lease_id=lease.lease_id,
@@ -884,12 +1214,16 @@ class Runtime:
                 request_hash=request.request_hash,
                 run_id=state.run_id,
                 guard=guard,
-                send=lambda: self._send(state, request, guard, snapshot),
+                send=lambda: self.driver.execute(request, guard, snapshot),
             )
         except Pause as pause:
             if pause.reason_value in {Reason.STALE_OBSERVATION.value, Reason.LOW_CONFIDENCE.value}:
                 state.stale_retries += 1
                 if state.stale_retries > spec.limits.stale_retries:
+                    if self.config.capture_failures:
+                        self._capture(
+                            state, snapshot, checkpoint=step.step_id, description=pause.reason_value, keep=True
+                        )
                     return self._pause(state, pause.reason_value, {**pause.detail, "retries": state.stale_retries})
                 self.journal.append_trace(state.run_id, "stale_retry", {"detail": pause.detail})
                 return snapshot
@@ -902,8 +1236,6 @@ class Runtime:
 
         state.actions += 1
         state.supplied_visual.pop(step.step_id, None)
-        fresh = self._observe_settled(state, before=snapshot.fingerprint)
-        changed = fresh.fingerprint != snapshot.fingerprint
         self._record_step(
             state,
             request,
@@ -911,9 +1243,16 @@ class Runtime:
             step,
             target.description if target else operation.value,
             DispatchState.DISPATCHED,
-            changed=changed,
         )
         self._advance_step(state, step, receipt)
+        state.summary["pending_checkpoint"] = step.step_id
+        # Persist acknowledged input before any fallible observation or evidence work.
+        self._persist(state)
+        if self._launch_follows(state, step):
+            return snapshot
+        fresh = self._observe_settled(state, before=snapshot.fingerprint)
+        changed = fresh.fingerprint != snapshot.fingerprint
+        state.steps[-1] = replace(state.steps[-1], observation_changed=changed)
         if changed:
             state.no_progress = 0
         else:
@@ -932,12 +1271,9 @@ class Runtime:
         state.last_fingerprint = fresh.fingerprint
         return fresh
 
-    def _send(self, state: _RunState, request: ActionRequest, guard: Callable[[], None], snapshot: Snapshot) -> Receipt:
-        if request.operation is Operation.LAUNCH_APP:
-            return self._launch(state, request)
-        return self.driver.execute(request, guard, snapshot)
-
     def _launch(self, state: _RunState, request: ActionRequest) -> Receipt:
+        from .drivers.windows.win32 import process_creation_time
+
         config = self.config.launch_configs.get(request.launch_config_id or "")
         if not config:
             raise ContractError("unknown launch configuration")
@@ -954,8 +1290,13 @@ class Runtime:
                 cwd=cwd,
                 env=env,
                 close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
-        except OSError as exc:
+            creation_time = process_creation_time(process.pid)
+        except (OSError, DriverError) as exc:
             raise UncertainEffect(f"launch failed: {exc}", mechanism=DispatchMechanism.NONE) from exc
         self.journal.append_trace(state.run_id, "launch", {"pid": process.pid, "config": request.launch_config_id})
         return Receipt(
@@ -965,9 +1306,100 @@ class Runtime:
             inserted_events=1,
             started_at=started,
             finished_at=self.config.clock(),
-            target={"launch_config_id": request.launch_config_id, "pid": process.pid},
+            target={"launch_config_id": request.launch_config_id, "pid": process.pid, "creation_time": creation_time},
             notes=("process launched; identity must be re-verified before accepting results",),
         )
+
+    def _scope(self, state: _RunState):
+        app_ref = state.summary.get("bound_app_ref")
+        return replace(state.spec.scope, app_ref=app_ref, window_refs=()) if app_ref else state.spec.scope
+
+    def _launch_follows(self, state: _RunState, step: Any) -> bool:
+        following = self._current_step(state)
+        return (
+            following is not None
+            and following.operation is Operation.LAUNCH_APP
+            and not any(item.checkpoint in {step.step_id, "any"} for item in state.spec.assertions)
+        )
+
+    def _launch_step(self, state: _RunState, lease: Lease, step: Any) -> None:
+        if state.completed_steps and not state.spec.allow_restart:
+            raise ContractError("relaunch requires allow_restart in the frozen specification")
+        if state.actions >= state.spec.limits.max_actions:
+            raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_actions"})
+        config_id = state.spec.launch_config_id
+        if config_id not in self.config.launch_configs:
+            raise ContractError("LAUNCH_APP requires the specification's approved launch_config_id")
+        request = ActionRequest(
+            action_id=new_id("act"),
+            run_id=state.run_id,
+            operation=Operation.LAUNCH_APP,
+            mode=state.spec.interaction_mode,
+            element_id=None,
+            snapshot_id=None,
+            window_ref=None,
+            lease_generation=lease.generation,
+            step_id=step.step_id,
+            launch_config_id=config_id,
+        )
+        request = replace(request, request_hash=self._request_hash(state, request))
+
+        def guard() -> None:
+            if self.config.clock() >= state.slice_deadline:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+            self.ownership.checkpoint(
+                run_id=state.run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=lease.session_id
+            )
+
+        receipt = self.journal.dispatch_once(
+            action_id=request.action_id,
+            request_hash=request.request_hash,
+            run_id=state.run_id,
+            guard=guard,
+            send=lambda: self._launch(state, request),
+        )
+        state.actions += 1
+        self._record_step(state, request, receipt, step, step.target_description, DispatchState.DISPATCHED)
+        self._advance_step(state, step, receipt)
+        state.summary["launched_process"] = {
+            "pid": receipt.target["pid"],
+            "creation_time": receipt.target["creation_time"],
+        }
+        state.summary["pending_checkpoint"] = step.step_id
+        state.identity_checked = state.identity_verified = False
+        self._persist(state)
+
+    def _rebind_launched(self, state: _RunState) -> None:
+        launched = state.summary.get("launched_process")
+        if not launched:
+            return
+        app_ref = self.driver.bind_process(int(launched["pid"]), float(launched["creation_time"]))
+        state.summary["bound_app_ref"] = app_ref
+        state.summary.pop("launched_process")
+        state.summary.pop("requires_rebind", None)
+        state.summary.pop("restore_binding", None)
+        self._persist(state)
+
+    def _restore_binding(self, state: _RunState) -> None:
+        if not state.summary.get("restore_binding"):
+            return
+        previous = state.summary.get("identity", {}).get("observed", {})
+        if not previous:
+            raise Pause(
+                Reason.INCORRECT_BUILD, {"detail": "broker restarted before identity was recorded; create a new run"}
+            )
+        matches = [
+            app
+            for app in self.driver.list_apps()
+            if app.process_id == previous.get("process_id")
+            and app.process_creation_time == previous.get("process_creation_time")
+        ]
+        if len(matches) != 1:
+            raise Pause(
+                Reason.INCORRECT_BUILD, {"detail": "the previously verified process instance is no longer available"}
+            )
+        state.summary["bound_app_ref"] = matches[0].app_ref
+        state.summary.pop("restore_binding")
 
     # ------------------------------------------------------------------------------
     # Steps, assertions, verdicts
@@ -1027,6 +1459,7 @@ class Runtime:
     def _evaluate_due(self, state: _RunState, snapshot: Snapshot, checkpoint: str | None) -> None:
         if checkpoint is None:
             return
+        state.summary["pending_checkpoint"] = checkpoint
         for spec in state.spec.assertions:
             if spec.checkpoint == "run_end":
                 continue
@@ -1037,6 +1470,7 @@ class Runtime:
             if spec.checkpoint == checkpoint and self._has_result(state, spec.assertion_id, terminal=True):
                 continue
             self._evaluate_one(state, spec, snapshot, checkpoint)
+        state.summary.pop("pending_checkpoint", None)
 
     def _evaluate_one(self, state: _RunState, spec: AssertionSpec, snapshot: Snapshot, checkpoint: str) -> None:
         """Evaluate an assertion, honouring its deadline.
@@ -1046,14 +1480,27 @@ class Runtime:
         deadline lets the assertion wait for the state rather than testing the state at the
         instant the input landed.
         """
+        if (
+            spec.evaluator in {Evaluator.MODEL_VISUAL, Evaluator.CALLER_RESULT}
+            and spec.assertion_id not in state.supplied_visual
+        ):
+            boundary = self._visual_boundary(state, snapshot, spec, checkpoint=checkpoint)
+            raise Pause(Reason.NEEDS_VISUAL_ASSISTANCE, boundary.detail)
+        if spec.assertion_id in state.supplied_visual and self._has_result(state, spec.assertion_id, terminal=True):
+            return
         result = self._evaluate_once(state, spec, snapshot, checkpoint)
-        deadline = self.config.clock() + max(0.0, spec.deadline_s)
+        deadlines = state.summary.setdefault("assertion_deadlines", {})
+        deadline = deadlines.setdefault(
+            f"{checkpoint}:{spec.assertion_id}", self.config.clock() + max(0.0, spec.deadline_s)
+        )
         while result.status is not AssertionStatus.PASSED and self.config.clock() < deadline:
-            self.config.sleeper(0.25)
+            if self.config.clock() >= state.slice_deadline:
+                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+            self.config.sleeper(min(0.25, deadline - self.config.clock(), state.slice_deadline - self.config.clock()))
             try:
                 snapshot = self._observe(state)
             except Pause:
-                break
+                raise
             result = self._evaluate_once(state, spec, snapshot, checkpoint)
         self._merge_assertion(state, result)
         self.journal.append_trace(state.run_id, "assertion", result.to_json())
@@ -1063,7 +1510,7 @@ class Runtime:
     ) -> AssertionResult:
         context = EvalContext(
             observation=snapshot,
-            identity=None,
+            identity=IdentityReport.from_json(state.summary["identity"]) if state.summary.get("identity") else None,
             evidence=self.evidence,
             approved_roots=list(self.config.approved_roots),
             caller_results={
@@ -1101,9 +1548,7 @@ class Runtime:
 
     def _pending_assertion_spec(self, state: _RunState) -> AssertionSpec | None:
         for spec in state.spec.assertions:
-            if spec.evaluator is not Evaluator.MODEL_VISUAL or spec.oracle != "caller":
-                continue
-            if spec.checkpoint == "run_end":
+            if spec.assertion_id != state.pending_assertion:
                 continue
             if spec.assertion_id in state.supplied_visual:
                 continue
@@ -1159,6 +1604,8 @@ class Runtime:
         return self._complete(state, snapshot)
 
     def _pause(self, state: _RunState, reason: str, detail: Mapping[str, Any]) -> RunResult:
+        if self.ownership.flags(state.run_id).cancelled:
+            return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
         state.status = RunStatus.PAUSED.value
         state.pause_reason = reason
         state.pause_detail = dict(detail)
@@ -1183,21 +1630,25 @@ class Runtime:
         state.pause_reason = reason
         if snapshot is not None:
             self._capture(state, snapshot, checkpoint="blocked", description=message, keep=True)
+        verdict, _ = self._verdict(state, Execution.BLOCKED.value)
         return self._result(
             state,
             Execution.BLOCKED,
-            Verdict.INCONCLUSIVE,
+            verdict,
             reason,
             detail={"message": message, **(dict(detail) if detail else {})},
         )
 
     def _error(self, state: _RunState, exc: BaseException) -> RunResult:
+        if self.ownership.flags(state.run_id).cancelled:
+            return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
         state.status = RunStatus.ERROR.value
         state.pause_reason = "runner_error"
+        verdict, _ = self._verdict(state, Execution.ERROR.value)
         return self._result(
             state,
             Execution.ERROR,
-            Verdict.INCONCLUSIVE,
+            verdict,
             "runner_error",
             detail={"error": f"{type(exc).__name__}: {exc}"},
         )
@@ -1236,11 +1687,14 @@ class Runtime:
             },
         )
 
-    def _visual_boundary(self, state: _RunState, snapshot: Snapshot, spec: AssertionSpec | None) -> RunResult:
+    def _visual_boundary(
+        self, state: _RunState, snapshot: Snapshot, spec: AssertionSpec | None, *, checkpoint: str | None = None
+    ) -> RunResult:
+        checkpoint = checkpoint or (spec.checkpoint if spec else state.current_step_id)
         capture = self._capture(
             state,
             snapshot,
-            checkpoint=(spec.checkpoint if spec else state.current_step_id),
+            checkpoint=checkpoint,
             description="visual assistance requested",
             keep=True,
         )
@@ -1253,6 +1707,7 @@ class Runtime:
             snapshot=snapshot,
             detail={
                 "assertion_id": spec.assertion_id if spec else None,
+                "checkpoint": checkpoint,
                 "snapshot_id": snapshot.snapshot_id,
                 "evidence_ref": capture.evidence.evidence_id if capture else None,
                 "coordinate_transform": {
@@ -1270,9 +1725,12 @@ class Runtime:
     def _capture(
         self, state: _RunState, snapshot: Snapshot, *, checkpoint: str | None, description: str, keep: bool = False
     ) -> Any:
+        if self._secret_values(state):
+            self.journal.append_trace(state.run_id, "capture_withheld", {"reason": "run contains secret fixtures"})
+            return None
         try:
             capture = self.driver.capture(
-                scope=state.spec.scope,
+                scope=self._scope(state),
                 snapshot_id=snapshot.snapshot_id,
                 region=None,
                 max_scale=self.config.capture_scale,
@@ -1287,7 +1745,7 @@ class Runtime:
         self.journal.add_evidence(capture.evidence.evidence_id, state.run_id, capture.evidence.to_json())
         state.evidence_ids.append(capture.evidence.evidence_id)
         if keep:
-            self.evidence._keep.add(capture.evidence.evidence_id)
+            self.evidence.retain(capture.evidence.evidence_id)
         return capture
 
     def _result(
@@ -1377,6 +1835,13 @@ class Runtime:
         if spec.frozen_digest() != row["spec_digest"]:
             raise ContractError("stored specification no longer matches its digest")
         state = _RunState.from_json(json.loads(str(row["state_json"])))
+        if state.spec.frozen_digest() != spec.frozen_digest():
+            raise ContractError("stored runtime specification differs from its frozen specification")
+        for reference in self.journal.evidence_for_run(run_id):
+            if Path(str(reference.get("path", ""))).is_file():
+                self.evidence.register(EvidenceRef.from_json(reference))
+        if hasattr(self.driver, "bind_process"):
+            state.summary["restore_binding"] = True
         self._state[run_id] = state
         return state
 
@@ -1399,6 +1864,10 @@ class Runtime:
             {"execution": result.execution.value, "verdict": result.verdict.value, "reason": result.reason},
         )
         self.evidence.prune()
+        if state.spec.purpose is Purpose.TASK or result.execution in {Execution.COMPLETED, Execution.CANCELLED}:
+            lease = self.ownership.active_lease()
+            if lease is not None and lease.run_id == state.run_id:
+                self.ownership.release(lease.lease_id)
 
     # ------------------------------------------------------------------------------
     # Inputs, fixtures, helpers
@@ -1406,12 +1875,22 @@ class Runtime:
 
     def _apply_inputs(self, state: _RunState, inputs: ResumeInputs) -> None:
         allowed_fixtures = set(state.spec.fixtures) | set(state.spec.secret_refs)
+        fingerprints = state.summary.setdefault("fixture_fingerprints", {})
         for name in inputs.fixtures:
             if name not in allowed_fixtures:
                 raise ContractError(f"resume may not introduce fixture {name!r}")
+            current = self._fixture_value(state, name)
+            if current is not None and current != inputs.fixtures[name]:
+                raise ContractError(f"resume may not rewrite fixture {name!r}")
+            fingerprint = keyed_fingerprint(self.config.fingerprint_secret, str(inputs.fixtures[name]))
+            if name in fingerprints and fingerprints[name] != fingerprint:
+                raise ContractError(f"resume may not rewrite fixture {name!r} after restart")
+            fingerprints[name] = fingerprint
         state.supplied_fixtures.update({str(key): str(value) for key, value in inputs.fixtures.items()})
 
-        assertion_ids = {spec.assertion_id for spec in state.spec.assertions}
+        assertion_ids = {
+            spec.assertion_id for spec in state.spec.assertions if spec.evaluator is Evaluator.CALLER_RESULT
+        }
         visual_ids = {
             spec.assertion_id
             for spec in state.spec.assertions
@@ -1424,6 +1903,8 @@ class Runtime:
             if assertion_id not in assertion_ids:
                 raise ContractError(f"unknown assertion {assertion_id!r}")
         for assertion_id, payload in {**inputs.visual_results, **inputs.verifier_results}.items():
+            if assertion_id != state.pending_assertion:
+                raise ContractError("evaluator result was not requested at this checkpoint")
             entry = dict(payload)
             entry.setdefault("origin", ORIGIN_APPLICATION)
             state.supplied_visual[assertion_id] = entry
@@ -1441,7 +1922,7 @@ class Runtime:
                     approved_roots=list(self.config.approved_roots),
                     caller_results=state.supplied_visual,
                     run_id=state.run_id,
-                    checkpoint=spec.checkpoint,
+                    checkpoint=str(state.pause_detail.get("checkpoint") or spec.checkpoint),
                     clock=self.config.clock,
                 ),
             )
@@ -1502,6 +1983,20 @@ class Runtime:
         raise Pause(Reason.UNSUPPORTED_CONTROL, {"step": step.step_id, "detail": "hotkey chord not supplied"})
 
     def _validate_spec(self, spec: RunSpec) -> None:
+        if spec.limits.deadline_seconds <= 0 or spec.limits.slice_seconds <= 0:
+            raise ContractError("run and slice deadlines must be positive")
+        if spec.purpose is Purpose.TASK:
+            if spec.steps or spec.assertions or spec.secret_refs:
+                raise ContractError("tasks use a goal and literal inputs, not test steps or assertions")
+            if not spec.scope.window_refs:
+                raise ContractError("tasks require explicit window references")
+            if len(spec.fixtures) > 24 or any(
+                not isinstance(name, str) or not name.startswith(("text:", "key:")) or not isinstance(value, str)
+                for name, value in spec.fixtures.items()
+            ):
+                raise ContractError("invalid task inputs")
+        if spec.scope.app_ref != spec.app_ref:
+            raise ContractError("observation scope must match the application whose build is verified")
         limits: Limits = spec.limits.clamped()
         if limits.to_json() != spec.limits.to_json():
             raise ContractError("caller limits exceed local policy; narrow them before creating the run")

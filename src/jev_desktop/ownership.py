@@ -5,17 +5,19 @@ re-checked against the live lease, the cancellation state, and the emergency-sto
 An identifier is never permission: every request carries a session and run id that must
 match an active, authorized session and the current lease generation.
 
-Emergency stop is deliberately independent: it is a named kernel event created with an
-explicit DACL, so any local process running as the same user can set it without talking to
-the broker, waiting for a queue, or running any model or capture work.
+The emergency stop uses a named kernel event with an explicit DACL. A local process running
+as the same user can set it independently of the broker, model, or capture work.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 from collections.abc import Callable
+from ctypes import wintypes
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .contracts import (
     AuthorizationError,
@@ -33,49 +35,57 @@ EVENT_MODIFY_STATE = 0x0002
 SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0
 
+kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+kernel32.CreateFileW.restype = wintypes.HANDLE
+_event_handle: int | None = None
+_event_lock = threading.Lock()
+
+
+def _retained_event() -> int:
+    # A named event disappears when its last handle closes. Every controlling process
+    # retains one so a short-lived emergency-stop client can actually stop the broker.
+    global _event_handle
+    with _event_lock:
+        if _event_handle is None:
+            with SecurityAttributes() as attributes:
+                handle = kernel32.CreateEventW(ctypes.byref(attributes), True, False, _event_name())
+            if not handle:
+                raise ContractError("could not create the emergency-stop event")
+            _event_handle = int(handle)
+        return _event_handle
+
 
 def _event_name() -> str:
     """Per-user, per-logon-session event name (local namespace only)."""
-    sid = current_user_sid().split("-")[-1]
+    sid = current_user_sid()
     return f"Local\\JevDesktop.EmergencyStop.{sid}.{logon_session_id()}"
 
 
 def emergency_signal() -> bool:
     """Set the local emergency-stop event. Safe to call from any local process."""
-    name = _event_name()
-    handle = kernel32.OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, False, name)
-    if not handle:
-        with SecurityAttributes() as attributes:
-            handle = kernel32.CreateEventW(ctypes.byref(attributes), True, True, name)
-        if not handle:
-            return False
-        kernel32.CloseHandle(handle)
-        return True
-    try:
-        return bool(kernel32.SetEvent(handle))
-    finally:
-        kernel32.CloseHandle(handle)
+    return bool(kernel32.SetEvent(_retained_event()))
 
 
 def emergency_clear() -> bool:
-    name = _event_name()
-    handle = kernel32.OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, False, name)
-    if not handle:
-        return False
-    try:
-        return bool(kernel32.ResetEvent(handle))
-    finally:
-        kernel32.CloseHandle(handle)
+    return bool(kernel32.ResetEvent(_retained_event()))
 
 
 def emergency_is_set() -> bool:
-    handle = kernel32.OpenEventW(SYNCHRONIZE, False, _event_name())
-    if not handle:
-        return False
-    try:
-        return kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
-    finally:
-        kernel32.CloseHandle(handle)
+    return kernel32.WaitForSingleObject(_retained_event(), 0) == WAIT_OBJECT_0
 
 
 @dataclass
@@ -109,7 +119,8 @@ class RunFlags:
 class Ownership:
     """Cross-process desktop ownership for one interactive user/logon session."""
 
-    def __init__(self, *, clock: Callable[[], float] = now) -> None:
+    def __init__(self, *, clock: Callable[[], float] = now, quiesce: Callable[[], None] | None = None) -> None:
+        _retained_event()
         self._lock = threading.RLock()
         self._clock = clock
         self._sessions: dict[str, Session] = {}
@@ -117,6 +128,9 @@ class Ownership:
         self._active_lease: str | None = None
         self._generation = 0
         self._runs: dict[str, RunFlags] = {}
+        self._desktop_handle: int | None = None
+        self._quiesce = quiesce
+        self._on_acquire: Callable[[int], None] | None = None
 
     # -- sessions ------------------------------------------------------------------
 
@@ -175,6 +189,25 @@ class Ownership:
                         f"desktop is owned by another run ({holder.run_id} by {holder.session_id})"
                     )
                 return holder
+            # Share mode zero excludes every other broker/direct engine, independent
+            # of thread identity. Windows closes the handle on process termination.
+            directory = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "JevDesktop"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"desktop-{current_user_sid()}-{logon_session_id()}.lock"
+            with SecurityAttributes() as attributes:
+                handle = kernel32.CreateFileW(
+                    str(path), 0x80000000 | 0x40000000, 0, ctypes.byref(attributes), 4, 0x80, None
+                )
+            if handle == ctypes.c_void_p(-1).value:
+                raise AuthorizationError("desktop lease is held by another engine or unavailable")
+            self._desktop_handle = int(handle)
+            try:
+                if self._on_acquire is not None:
+                    self._on_acquire(self._desktop_handle)
+            except BaseException:
+                kernel32.CloseHandle(self._desktop_handle)
+                self._desktop_handle = None
+                raise
             self._generation += 1
             lease = Lease(
                 lease_id=new_id("lease"),
@@ -192,6 +225,7 @@ class Ownership:
             return self._leases[self._active_lease] if self._active_lease else None
 
     def validate(self, lease_id: str, generation: int, session_id: str, run_id: str) -> Lease:
+        self.authorize(session_id)
         with self._lock:
             lease = self._leases.get(lease_id)
             if lease is None or lease.released_at is not None:
@@ -209,9 +243,19 @@ class Ownership:
             lease = self._leases.get(lease_id)
             if lease is None:
                 return
-            lease.released_at = self._clock()
             if self._active_lease == lease_id:
+                if self._quiesce is not None:
+                    self._quiesce()
+                if self._desktop_handle is not None:
+                    kernel32.CloseHandle(self._desktop_handle)
+                    self._desktop_handle = None
                 self._active_lease = None
+            lease.released_at = self._clock()
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_desktop_handle", None)
+        if handle is not None:
+            kernel32.CloseHandle(handle)
 
     def force_release(self) -> str | None:
         with self._lock:

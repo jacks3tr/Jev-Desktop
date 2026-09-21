@@ -311,7 +311,7 @@ def test_caller_visual_result_is_labelled_model_assessed(tmp_path):
     store = EvidenceStore(root=tmp_path / "evidence", approved_roots=[str(tmp_path)])
     shot = store.save_bytes(
         run_id=RUN_ID,
-        checkpoint="looks-right",
+        checkpoint="step-1",
         description="shot",
         data=b"\x89PNG\r\n\x1a\nx",
         kind="screenshot",

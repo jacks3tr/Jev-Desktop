@@ -87,6 +87,7 @@ SUPPORTED_CHORDS = {
     "ctrl+n",
     "ctrl+o",
     "ctrl+f",
+    "ctrl+l",
     "ctrl+shift+s",
     "ctrl+p",
     "alt+f4",
@@ -185,11 +186,7 @@ def _geometry_ok(cached: Rect, live: Rect, tolerance: int = 4) -> bool:
 
 
 def _hit_ok(worker: uia.UiaWorker, handle: uia.ElementHandle, x: int, y: int) -> bool:
-    hit = uia.hit_test(worker, x, y)
-    if hit and handle.runtime_id:
-        return uia.is_descendant_or_self(hit, handle.runtime_id)
-    # Providers that publish no runtime ids: fall back to the owning top-level window.
-    return win32.root_window(win32.window_from_point(x, y)) == win32.root_window(handle.hwnd)
+    return uia.hit_is_descendant_or_self(worker, handle, x, y)
 
 
 def require_user_path_ready(
@@ -301,16 +298,6 @@ def invoke_semantic(handle: uia.ElementHandle, request: ActionRequest) -> tuple[
         if selection is not None and handle.name.strip().lower() == request.option_label.strip().lower():
             selection.Select()
             return "selection_item", element
-        value = _pattern(element, "UIA_ValuePatternId", 10002)
-        if value is not None:
-            readonly = uia._cached(element, uia.PROP_VALUE_READONLY)
-            if readonly:
-                raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "control is read-only"})
-            value.SetValue(request.option_label)
-            return "value", element
-        if selection is not None:
-            selection.Select()
-            return "selection_item", element
         raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "no selection-compatible pattern"})
 
     if request.operation is Operation.TYPE_TEXT:
@@ -322,7 +309,13 @@ def invoke_semantic(handle: uia.ElementHandle, request: ActionRequest) -> tuple[
         readonly = uia._cached(element, uia.PROP_VALUE_READONLY)
         if readonly:
             raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "control is read-only"})
-        value.SetValue(request.text)
+        text = request.text
+        if not request.replace_existing:
+            previous = element.GetCurrentPropertyValue(uia.PROP_VALUE)
+            if not isinstance(previous, str):
+                raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "cannot append without an observed value"})
+            text = previous + text
+        value.SetValue(text)
         return "value", element
 
     if request.operation is Operation.SCROLL:
@@ -334,9 +327,9 @@ def invoke_semantic(handle: uia.ElementHandle, request: ActionRequest) -> tuple[
         large = UIA.ScrollAmount_LargeIncrement if notches > 0 else UIA.ScrollAmount_LargeDecrement
         none = UIA.ScrollAmount_NoAmount
         if bool(request.scroll.get("horizontal")):
-            scroll.Scroll(none, large)
-        else:
             scroll.Scroll(large, none)
+        else:
+            scroll.Scroll(none, large)
         return "scroll", element
 
     raise Pause(Reason.UNSUPPORTED_CONTROL, {"operation": request.operation.value, "mode": "semantic"})
@@ -364,7 +357,7 @@ def execute(
     registry = driver.registry
 
     if request.operation is Operation.HOTKEY:
-        _guard_foreground_app(driver, request)
+        _guard_foreground_app(driver, request, snapshot)
         codes = parse_chord(request.hotkey)
         guard()
         inserted = win32.key_chord(codes)
@@ -372,6 +365,35 @@ def execute(
 
     if request.operation is Operation.FOCUS_WINDOW:
         return _focus_window(driver, request, guard, started)
+
+    if request.point is not None:
+        if snapshot is None or request.mode is not InputMode.USER_PATH or request.element_id is not None:
+            raise DriverError("coordinate input requires a snapshot, user_path mode, and no element_id")
+        if request.operation not in {Operation.CLICK, Operation.TOGGLE, Operation.SCROLL}:
+            raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "coordinates support click, toggle, and scroll"})
+        _guard_foreground_app(driver, request, snapshot)
+        x, y = driver.resolve_point(request, snapshot)
+        guard()
+        previous = win32.cursor_position()
+        try:
+            if request.operation is Operation.SCROLL:
+                inserted = win32.scroll_wheel(
+                    x,
+                    y,
+                    notches=int(request.scroll.get("notches", 3)),
+                    horizontal=bool(request.scroll.get("horizontal", False)),
+                )
+            else:
+                inserted = win32.click_at(x, y)
+        finally:
+            win32.set_cursor_position(*previous)
+        return _receipt(
+            request,
+            DispatchMechanism.SEND_INPUT_MOUSE,
+            inserted,
+            started,
+            notes=(f"evidence={request.point.evidence_id}", f"point={x},{y}"),
+        )
 
     if snapshot is None:
         raise DriverError("element operations require the snapshot they were observed in")
@@ -393,10 +415,16 @@ def execute(
         )
 
     if request.mode is InputMode.SEMANTIC:
-        guard()
+        if not state.enabled or state.offscreen or not state.window_enabled:
+            raise Pause(Reason.PERMISSION_BOUNDARY, {"reason": "semantic target is disabled or offscreen"})
+
+        def dispatch_pattern(_worker):
+            guard()
+            return invoke_semantic(handle, request)[0]
+
         try:
-            pattern_name, _element = invoke_semantic(handle, request)
-        except (DriverError, Pause):
+            pattern_name = worker.submit(dispatch_pattern, timeout=request.deadline_s)
+        except Pause:
             raise
         except Exception as exc:
             raise UncertainEffect(
@@ -455,28 +483,18 @@ def execute(
         if not request.option_label:
             raise DriverError("SELECT requires an observed option label")
         option = _observed_option(driver, snapshot, handle, request.option_label)
+        if option is None:
+            raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "SELECT requires a visible observed option"})
         select_notes: tuple[str, ...]
         guard()
         previous = win32.cursor_position()
         try:
-            if option is not None:
-                option_state = option[1]
-                if not option_state.enabled or option_state.offscreen:
-                    raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "option is not selectable"})
-                ox, oy = option_state.rect.center()
-                inserted = win32.click_at(ox, oy)
-                select_notes = (f"option={request.option_label}", f"point={ox},{oy}")
-            else:
-                inserted = win32.click_at(x, y)
-                focused = live_state(worker, handle)
-                if focused.root != focused.foreground_root:
-                    raise UncertainEffect(
-                        "the control was clicked but its window is not foreground; option text was not typed",
-                        mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
-                    )
-                inserted += win32.type_unicode(request.option_label)
-                inserted += win32.key_chord([VK_BY_NAME["enter"]])
-                select_notes = (f"typeahead={request.option_label}",)
+            option_state = option[1]
+            if not option_state.enabled or option_state.offscreen:
+                raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "option is not selectable"})
+            ox, oy = option_state.rect.center()
+            inserted = win32.click_at(ox, oy)
+            select_notes = ("observed option selected", f"point={ox},{oy}")
         except DriverError as exc:
             raise UncertainEffect(
                 f"selection dispatch failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE
@@ -497,6 +515,11 @@ def execute(
             raise UncertainEffect(f"focus click failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE) from exc
         try:
             focus = live_state(worker, handle)
+            focus_deadline = time.monotonic() + min(0.5, max(0.0, request.deadline_s))
+            while not focus.focused and time.monotonic() < focus_deadline:
+                guard()
+                time.sleep(0.025)
+                focus = live_state(worker, handle)
             if not focus.focused:
                 raise UncertainEffect(
                     "click was dispatched but the control did not take focus; no text was typed",
@@ -504,10 +527,11 @@ def execute(
                 )
             ready = live_state(worker, handle)
             if ready.root != ready.foreground_root:
-                raise Pause(
-                    Reason.USER_TAKEOVER,
-                    {"reason": "the click did not bring the target window to the foreground; no text was typed"},
+                raise UncertainEffect(
+                    "focus changed after the click; no text was typed",
+                    mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
                 )
+            guard()
             if request.replace_existing:
                 # Real fields arrive prefilled or with placeholder text selected. Typing over
                 # the selection is what a person does; appending silently produces values like
@@ -517,7 +541,7 @@ def execute(
             inserted += win32.type_unicode(request.text)
         except UncertainEffect:
             raise
-        except DriverError as exc:
+        except BaseException as exc:
             raise UncertainEffect(
                 f"keyboard dispatch failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD
             ) from exc
@@ -551,13 +575,20 @@ def _receipt(
     )
 
 
-def _guard_foreground_app(driver: Any, request: ActionRequest) -> None:
+def _guard_foreground_app(driver: Any, request: ActionRequest, snapshot: Snapshot | None) -> None:
     """A chord must never leak into an application outside the approved scope."""
     foreground = win32.foreground_window()
     if not foreground:
         raise Pause(Reason.USER_TAKEOVER, {"reason": "no foreground window"})
     root = win32.root_window(foreground)
-    if root not in driver.scoped_window_handles():
+    handle = driver.registry.windows.get(request.window_ref or "")
+    if (
+        handle is None
+        or root != win32.root_window(handle.hwnd)
+        or snapshot is None
+        or handle.app_ref != snapshot.app_ref
+        or request.window_ref not in {window.window_ref for window in snapshot.windows}
+    ):
         raise Pause(
             Reason.USER_TAKEOVER,
             {"reason": "foreground window is outside the approved application", "root": root},
@@ -605,6 +636,8 @@ def _observed_option(
             continue
         if state.rect.is_empty or not state.enabled or state.offscreen:
             continue
+        if not _geometry_ok(candidate.rect, state.rect) or not _hit_ok(driver.worker, candidate, *state.rect.center()):
+            continue
         best = (element.element_id, state)
         break
     return best
@@ -614,9 +647,9 @@ def _verify_selection(worker: uia.UiaWorker, handle: uia.ElementHandle, label: s
     value = _live_value(worker, handle)
     if value is None:
         return
-    if label.strip().lower() not in value.strip().lower():
+    if label.strip().lower() != value.strip().lower():
         raise UncertainEffect(
-            f"selection was dispatched but the control reports {value!r}",
+            "selection was dispatched but the observed value does not match",
             mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
         )
 

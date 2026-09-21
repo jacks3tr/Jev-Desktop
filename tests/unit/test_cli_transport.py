@@ -123,11 +123,22 @@ def test_cli_runs_the_same_engine_and_verdict(cli_env, tmp_path):
     assert result["assertions"][0]["status"] == "passed"
 
     code, status = run_cli(cli_env, "status", "--run-id", result["run_id"])
+    assert code == 1, "a new CLI connection must not read a run using its ID alone"
+    code, status = run_cli(cli_env, "status", "--run-id", result["run_id"], "--resume-token", result["resume_token"])
     assert code == 0 and status["run"]["completed_steps"] == ["save"]
 
     evidence_id = result["evidence"][0]["evidence_id"]
     out_file = tmp_path / "evidence.bin"
-    code, fetched = run_cli(cli_env, "evidence", "--evidence-id", evidence_id, "--out", str(out_file))
+    code, fetched = run_cli(
+        cli_env,
+        "evidence",
+        "--evidence-id",
+        evidence_id,
+        "--resume-token",
+        result["resume_token"],
+        "--out",
+        str(out_file),
+    )
     assert code == 0 and fetched["written_to"] == str(out_file) and out_file.stat().st_size > 0
 
 

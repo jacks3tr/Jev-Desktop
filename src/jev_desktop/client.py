@@ -38,7 +38,7 @@ class BrokerClient:
     timeout_s: float = 120.0
 
     def __post_init__(self) -> None:
-        # JEV_DESKTOP_PIPE lets a harness point at a specific broker (alternate user or test rig).
+        # JEV_DESKTOP_PIPE selects a specific local broker.
         self.pipe = self.pipe or os.environ.get("JEV_DESKTOP_PIPE") or pipe_name("broker")
         self._client: PipeClient | None = None
         self._session_id: str | None = None

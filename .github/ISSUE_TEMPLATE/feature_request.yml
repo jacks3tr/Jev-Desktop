@@ -21,7 +21,7 @@ body:
     id: problem
     attributes:
       label: The problem
-      description: What can you not establish about your software today, and why does that matter.
+      description: Describe the workflow or verification that is missing.
     validations:
       required: true
 

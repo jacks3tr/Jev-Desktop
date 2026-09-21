@@ -18,6 +18,7 @@ from typing import Any
 from jev_desktop.contracts import (
     AppRef,
     Capture,
+    ContractError,
     Coverage,
     Decision,
     DispatchMechanism,
@@ -110,6 +111,7 @@ class FakeDriver:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.executed: list[Any] = []  # ActionRequest objects that reached the native boundary
         self.observations = 0
+        self._snapshot: Snapshot | None = None
         self.started = False
         self.emergency = False
         self.fail_next: str | None = None  # "uncertain" | "before" | "pause:<reason>"
@@ -203,7 +205,7 @@ class FakeDriver:
             for element in elements
             if element.role in {"text", "statusbar", "edit"} and element.text
         ]
-        return Snapshot(
+        snapshot = Snapshot(
             snapshot_id=new_id("snap"),
             app_ref=self.app.app_ref,
             captured_at=now(),
@@ -216,6 +218,17 @@ class FakeDriver:
             elements=tuple(elements),
             context={"texts": texts, "focused_element_id": None, "modal_windows": [], "foreground_window_ref": None},
         )
+
+        self._snapshot = snapshot
+        return snapshot
+
+    def snapshot(self, snapshot_id: str | None, scope: ScopeSpec) -> Snapshot:
+        snapshot = self._snapshot
+        if snapshot is None or snapshot.snapshot_id != snapshot_id or snapshot.app_ref != scope.app_ref:
+            raise ContractError("snapshot is unknown or stale")
+        if scope.window_refs and any(window.window_ref not in scope.window_refs for window in snapshot.windows):
+            raise ContractError("snapshot is outside scope")
+        return snapshot
 
     def geometry(self) -> Geometry:
         return Geometry(

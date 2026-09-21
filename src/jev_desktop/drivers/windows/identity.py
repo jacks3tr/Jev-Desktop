@@ -11,9 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
 
 from ...contracts import DriverError, ExpectedIdentity, IdentityReport, IdentityStatus, now
 from . import win32
@@ -83,20 +82,6 @@ def _read_marker(path: str | None) -> tuple[str | None, str | None]:
     return text, None
 
 
-def _package_instances(family: str) -> list[dict[str, Any]]:
-    """Processes belonging to a package family, with their creation times."""
-    instances: list[dict[str, Any]] = []
-    for candidate in win32.iter_process_ids():
-        if win32.process_package_family(candidate) != family:
-            continue
-        try:
-            created = win32.process_creation_time(candidate)
-        except DriverError:
-            continue
-        instances.append({"process_id": candidate, "family": family, "process_creation_time": created})
-    return instances
-
-
 def verify_identity(
     app_ref: str,
     *,
@@ -143,19 +128,36 @@ def verify_identity(
         notes.append("no build identity expectation supplied; the running build is unverified")
         return report(IdentityStatus.UNVERIFIABLE)
 
+    if (
+        observed_app is not None
+        and expected.mode in {"fresh_launch", "exe_hash"}
+        and Path(observed_app.executable_path).stem.lower()
+        in {"python", "pythonw", "node", "dotnet", "java", "javaw", "applicationframehost"}
+    ):
+        return report(
+            IdentityStatus.UNVERIFIABLE,
+            "host executable identity is not application identity; use a runtime build marker",
+        )
+
     if expected.mode == "fresh_launch":
-        if expected.launched_after is None:
-            notes.append("fresh_launch requires launched_after")
+        if expected.launched_after is None or not expected.expect_exe:
+            notes.append("fresh_launch requires launched_after and the intended executable path")
             return report(IdentityStatus.UNVERIFIABLE)
         observed["launched_after"] = expected.launched_after
         if observed_app is None:
             return report(IdentityStatus.UNVERIFIABLE)
+        if os.path.normcase(os.path.abspath(observed_app.executable_path)) != os.path.normcase(
+            os.path.abspath(expected.expect_exe)
+        ):
+            return report(IdentityStatus.MISMATCH, "fresh process is not the intended executable")
         if observed_app.creation_time + 1e-3 >= expected.launched_after:
             return report(IdentityStatus.VERIFIED)
         notes.append("process predates the requested launch window")
         return report(IdentityStatus.MISMATCH)
 
     if expected.mode == "exe_hash":
+        if not expected.expect_sha256:
+            return report(IdentityStatus.UNVERIFIABLE, "exe_hash requires the expected artifact hash")
         if observed_app is None:
             notes.append("the executable could not be inspected")
             return report(IdentityStatus.UNVERIFIABLE)
@@ -175,37 +177,24 @@ def verify_identity(
         return report(IdentityStatus.VERIFIED)
 
     if expected.mode == "package_family":
-        # Packaged applications hand their window to a frame host, whose process predates the
-        # launch, so neither exe_hash nor fresh_launch can verify them. The package family name
-        # plus a launch timestamp identifies the instance that was actually started.
-        if not expected.expect_package:
-            notes.append("package_family requires expect_package")
-            return report(IdentityStatus.UNVERIFIABLE)
-        matches: list[dict[str, Any]] = []
-        try:
-            # A packaged application can start its process a moment after its window appears,
-            # so give it a short, bounded window rather than reporting a mismatch instantly.
-            deadline = now() + 3.0
-            while True:
-                matches = _package_instances(expected.expect_package)
-                if matches or now() >= deadline:
-                    break
-                time.sleep(0.25)
-        except DriverError as exc:
-            notes.append(f"process enumeration failed: {exc}")
-            return report(IdentityStatus.UNVERIFIABLE)
-        observed["package_family"] = expected.expect_package
-        observed["instances"] = matches
-        if not matches:
-            notes.append("no running process belongs to the expected package family")
-            return report(IdentityStatus.MISMATCH)
-        if expected.launched_after is not None:
-            fresh = [item for item in matches if item["process_creation_time"] + 1e-3 >= expected.launched_after]
-            observed["instances_after_launch"] = fresh
-            if not fresh:
-                notes.append("running instances predate the requested launch window")
-                return report(IdentityStatus.MISMATCH)
-        return report(IdentityStatus.VERIFIED)
+        family = win32.process_package_family(pid)
+        observed["package_family"] = family
+        if not expected.expect_package or observed_app is None or family is None:
+            return report(IdentityStatus.UNVERIFIABLE, "the bound window process has no verifiable package identity")
+        if family != expected.expect_package:
+            return report(IdentityStatus.MISMATCH, "bound process belongs to another package family")
+        if expected.launched_after is not None and observed_app.creation_time < expected.launched_after:
+            return report(IdentityStatus.MISMATCH, "bound process predates the launch")
+        if not expected.expect_sha256:
+            return report(IdentityStatus.UNVERIFIABLE, "package family alone is not a build; supply expect_sha256")
+        observed["sha256"] = sha256_file(observed_app.executable_path)
+        if observed["sha256"] is None:
+            return report(IdentityStatus.UNVERIFIABLE, "package executable could not be hashed")
+        return report(
+            IdentityStatus.VERIFIED
+            if str(observed["sha256"]).lower() == expected.expect_sha256.lower()
+            else IdentityStatus.MISMATCH
+        )
 
     if expected.mode == "file_marker":
         value, note = _read_marker(expected.marker_path)
@@ -221,6 +210,19 @@ def verify_identity(
         if value != expected.expect_marker:
             notes.append("running build marker does not match the expected build")
             return report(IdentityStatus.MISMATCH)
+        try:
+            with open(expected.marker_path or "", encoding="utf-8") as handle:
+                marker = json.load(handle)
+            bound = (
+                isinstance(marker, dict)
+                and marker.get("pid") == pid
+                and observed_app is not None
+                and float(marker.get("started_at", 0)) >= observed_app.creation_time
+            )
+        except (OSError, ValueError, TypeError):
+            bound = False
+        if not bound:
+            return report(IdentityStatus.UNVERIFIABLE, "marker is not bound to the observed process instance")
         return report(IdentityStatus.VERIFIED)
 
     notes.append(f"unknown identity mode {expected.mode!r}")

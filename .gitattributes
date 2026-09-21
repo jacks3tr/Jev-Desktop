@@ -23,7 +23,7 @@
 *.sqlite-wal binary
 *.sqlite-shm binary
 
-# Language statistics: docs and fixtures are noise, the package is the product.
+# Exclude documentation and tests from language statistics.
 src/** linguist-detectable=true
 tests/** linguist-documentation=true
 docs/** linguist-documentation=true
