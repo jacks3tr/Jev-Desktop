@@ -508,6 +508,11 @@ def execute(
                     Reason.USER_TAKEOVER,
                     {"reason": "the click did not bring the target window to the foreground; no text was typed"},
                 )
+            if request.replace_existing:
+                # Real fields arrive prefilled or with placeholder text selected. Typing over
+                # the selection is what a person does; appending silently produces values like
+                # "*.txtC:\\path\\file.txt" that no dialog accepts.
+                inserted += win32.key_chord([VK_BY_NAME["ctrl"], VK_BY_NAME["a"]])
             guard()
             inserted += win32.type_unicode(request.text)
         except UncertainEffect:

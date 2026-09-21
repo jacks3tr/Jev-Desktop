@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -82,9 +83,16 @@ class OpContext:
 class PolicyConfig:
     model_id: str = PINNED_MODEL
     endpoint: str = ENDPOINT
-    operation_floor: float = 0.55
+    # Measured over live decisions on the fixture application with the permitted-operations
+    # hint in place: correct operations landed between 0.36 and 0.97, median 0.87, and correct
+    # targets between 0.94 and 1.0. Uniform across four operations would be 0.25, so the
+    # operation gate sits just above chance and below the observed low end. The target gate
+    # never binds on a healthy answer; it exists to catch two near-identical controls.
+    operation_floor: float = 0.35
     target_floor: float = 0.45
-    timeout_s: float = 20.0
+    # Measured decision latency: median 0.20 s, worst observed 1.13 s over roughly seventy
+    # requests. Eight seconds tolerates a seven-fold slowdown before a decision fails.
+    timeout_s: float = 8.0
     max_retries: int = 2
     api_key_env: str = "TYPESAFE_API_KEY"
 
@@ -101,6 +109,15 @@ class PolicyConfig:
             raise PolicyError("max_retries must be between 0 and 5")
         if self.timeout_s <= 0 or self.timeout_s > 120:
             raise PolicyError("timeout_s must be within (0, 120]")
+
+
+def sanitize_message(text: str, secret: str | None) -> str:
+    """Error text must never carry a credential: it ends up in journals and run detail."""
+    cleaned = text
+    if secret:
+        cleaned = cleaned.replace(secret, "<redacted>")
+    cleaned = re.sub(r"(?i)(bearer\s+)[^\s'\")]+", r"\1<redacted>", cleaned)
+    return cleaned
 
 
 class Transport(Protocol):
@@ -126,7 +143,11 @@ class HttpTransport:
         try:
             response = client.post(url, json=dict(payload), headers=dict(headers), timeout=timeout_s)
         except Exception as exc:  # network failure: never dispatch anything
-            raise PolicyError(f"policy transport failed: {type(exc).__name__}: {exc}") from exc
+            authorization = str(headers.get("Authorization", ""))
+            secret = authorization.removeprefix("Bearer ").strip() or None
+            raise PolicyError(
+                f"policy transport failed: {type(exc).__name__}: {sanitize_message(str(exc), secret)}"
+            ) from exc
         try:
             body = response.json()
         except ValueError:
@@ -345,7 +366,18 @@ class JevPolicy:
             raise PolicyError(
                 f"no TypeSafe API key: set {self.config.api_key_env} or pass api_key; policy decisions are unavailable"
             )
-        return key
+        # Trimmed because a key read from a dotenv file or a Windows `set` often carries
+        # whitespace. Rejected when it holds anything a header cannot, because the alternative
+        # is an opaque transport error and a credential echoed into the message.
+        trimmed = key.strip()
+        if not trimmed:
+            raise PolicyError(f"{self.config.api_key_env} is set but empty")
+        if any(character.isspace() or ord(character) < 32 for character in trimmed):
+            raise PolicyError(
+                f"{self.config.api_key_env} contains whitespace or control characters; "
+                "check for a stray newline or quote in the value"
+            )
+        return trimmed
 
     def decide(
         self,
@@ -396,12 +428,20 @@ class JevPolicy:
         )
 
     def _post(self, body: Mapping[str, Any]) -> tuple[int, Any]:
-        headers = {"Authorization": f"Bearer {self._key()}", "Content-Type": "application/json"}
+        secret = self._key()
+        headers = {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
         attempt = 0
         while True:
-            status, payload = self.transport.post_json(
-                self.config.endpoint, headers=headers, payload=body, timeout_s=self.config.timeout_s
-            )
+            try:
+                status, payload = self.transport.post_json(
+                    self.config.endpoint, headers=headers, payload=body, timeout_s=self.config.timeout_s
+                )
+            except Exception as exc:
+                # Any transport may raise with the header in hand. The policy owns the
+                # guarantee that the credential never reaches logs, journals, or run detail.
+                raise PolicyError(
+                    f"policy transport failed: {type(exc).__name__}: {sanitize_message(str(exc), secret)}"
+                ) from exc
             if status in RETRY_STATUS and attempt < self.config.max_retries:
                 self.sleep(min(0.5 * 2**attempt, 4.0))
                 attempt += 1
@@ -413,8 +453,31 @@ class JevPolicy:
                 raise PolicyError(f"policy request rejected (422): {detail}")
             if status in RETRY_STATUS:
                 raise Pause(Reason.LOW_CONFIDENCE, {"detail": f"policy unavailable (HTTP {status})"})
+            if (
+                status == 400
+                and isinstance(payload, dict)
+                and ((payload.get("detail") or {}).get("error_type") == "max_tokens_exceeded")
+            ):
+                raise Pause(
+                    Reason.NEEDS_NARROWER_OBSERVATION,
+                    {
+                        "cause": "max_tokens_exceeded",
+                        "detail": "the provider refused the request as too large",
+                        "hint": "the runtime shrinks the state budget and retries; if this reaches "
+                        "the caller, narrow scope.window_refs or lower scope.max_elements",
+                    },
+                )
             if status >= 400:
-                raise PolicyError(f"policy provider returned HTTP {status}")
+                # The provider explains itself in the body. Dropping that text turns a
+                # five-minute fix into an afternoon of guessing.
+                detail = ""
+                if payload is not None:
+                    try:
+                        encoded = payload if isinstance(payload, str) else canonical_json(payload)
+                    except (TypeError, ValueError):
+                        encoded = repr(payload)
+                    detail = f": {sanitize_message(encoded, self.api_key)[:500]}"
+                raise PolicyError(f"policy provider returned HTTP {status}{detail}")
             if not isinstance(payload, dict):
                 raise Pause(Reason.INVALID_MODEL_RESPONSE, {"detail": "response body is not JSON"})
             return status, payload
@@ -472,6 +535,107 @@ def describe_element(element: Mapping[str, Any], *, operation: Operation | None 
     if element.get("truncation"):
         parts.append(f"truncated:{element['truncation']}")
     return " ".join(parts)
+
+
+# Measured with scripts/calibrate_real_apps.py against a real Notepad Save As dialog:
+# a 240-element observation produced an 85 kB state (about 29k tokens by the byte/four rule)
+# and the provider refused it with max_tokens_exceeded. The same provider accepted a 64 kB
+# state, so the budget sits well below that and trimming keeps real dialogs inside it.
+# Conservative starting point, not a magic number: the provider's real ceiling depends on the
+# tokenizer and on the size of the questions sent alongside the state, which this side cannot
+# compute exactly. The runtime shrinks the budget and retries when the provider says the
+# request was too large, so this value only needs to be in the right neighbourhood.
+STATE_BUDGET_BYTES = 24_000
+STATE_STRING_LIMIT = 160
+
+
+def _shorten(value: Any, limit: int) -> Any:
+    if isinstance(value, str) and len(value) > limit:
+        return value[: limit - 1] + "\u2026"
+    return value
+
+
+def trim_element(element: Mapping[str, Any]) -> dict[str, Any]:
+    """Cut a single element down to what a decision needs, without hiding the cut."""
+    trimmed = dict(element)
+    for name in ("name", "value", "text"):
+        if name in trimmed:
+            shortened = _shorten(trimmed[name], STATE_STRING_LIMIT)
+            if shortened != trimmed[name]:
+                trimmed[name] = shortened
+                trimmed["truncation"] = trimmed.get("truncation") or "value"
+    if isinstance(trimmed.get("path"), list):
+        trimmed["path"] = [_shorten(part, 60) for part in trimmed["path"]][-3:]
+    return trimmed
+
+
+def fit_state_to_budget(
+    state: Mapping[str, Any],
+    *,
+    keep_element_ids: Sequence[str] = (),
+    budget_bytes: int = STATE_BUDGET_BYTES,
+) -> dict[str, Any]:
+    """Keep the state inside the provider's input budget without silently dropping context.
+
+    Shortens long strings first, then drops elements that cannot be acted on for the current
+    step, keeping anything that was offered as a candidate and anything the user is looking
+    at. The result records what happened in `state_trimmed`, so a decision is never made
+    against a quietly reduced observation.
+    """
+    payload = dict(state)
+    elements = [trim_element(element) for element in state.get("elements", [])]
+    payload["elements"] = elements
+    encoded = len(canonical_json(payload).encode("utf-8"))
+    if encoded <= budget_bytes:
+        return payload
+
+    keep = set(keep_element_ids)
+    priority: list[tuple[int, dict[str, Any]]] = []
+    for index, element in enumerate(elements):
+        element_id = str(element.get("element_id") or "")
+        if element_id in keep:
+            rank = 0
+        elif element.get("focused") or element.get("editable"):
+            rank = 1
+        elif element.get("role") in {"text", "statusbar", "document"}:
+            rank = 2
+        else:
+            rank = 3
+        priority.append((rank, {**element, "_order": index}))
+
+    keep_order = sorted(priority, key=lambda item: (item[0], item[1]["_order"]))
+    kept: list[dict[str, Any]] = []
+    for _rank, element in keep_order:
+        element = {key: value for key, value in element.items() if key != "_order"}
+        candidate = [*kept, element]
+        trial = dict(payload)
+        trial["elements"] = candidate
+        if len(canonical_json(trial).encode("utf-8")) > budget_bytes and kept:
+            break
+        kept.append(element)
+
+    dropped = len(elements) - len(kept)
+    payload["elements"] = kept
+    payload["state_trimmed"] = {
+        "dropped_elements": dropped,
+        "kept_elements": len(kept),
+        "reason": "state exceeded the provider input budget",
+        "budget_bytes": budget_bytes,
+    }
+    return payload
+
+
+def with_permitted_operations(state: Mapping[str, Any], operations: Sequence[Operation]) -> dict[str, Any]:
+    """State plus the operations this step actually permits.
+
+    A control can support several operations, and the observation reports all of them. When a
+    step permits exactly one, saying so stops the model from splitting probability across
+    operations the runner will never issue. Measured effect: toggle answers moved from
+    0.10-0.38 confidence to the same band as every other operation.
+    """
+    payload = dict(state)
+    payload["permitted_operations"] = [operation.value for operation in operations]
+    return payload
 
 
 def build_contexts(

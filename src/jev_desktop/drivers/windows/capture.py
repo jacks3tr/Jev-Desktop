@@ -131,20 +131,19 @@ class ScreenCapture:
             win32.gdi32.DeleteDC(memory_dc)
             win32.user32.ReleaseDC(0, screen_dc)
 
+        full = encode_png(source.width, source.height, buffer)
         if scale >= 1.0:
-            png = encode_png(source.width, source.height, buffer)
-            return RawCapture(png=png, source_rect=source, scale=1.0, geometry=self.geometry())
+            return RawCapture(png=full, source_rect=source, scale=1.0, geometry=self.geometry())
 
+        # Downscaling through GDI applies dithering, which sometimes compresses worse than the
+        # original. Measured on a 720x520 window: 9.2 kB full, 23.9 kB at 0.4. Keep whichever
+        # encoding is actually smaller, and report the scale that produced it.
         target_width = max(1, int(source.width * scale))
         target_height = max(1, int(source.height * scale))
-        png = encode_png(source.width, source.height, buffer)  # unchanged full-resolution fallback
         scaled = _downscale(source.width, source.height, buffer, target_width, target_height)
-        return RawCapture(
-            png=scaled if scaled else png,
-            source_rect=source,
-            scale=scale,
-            geometry=self.geometry(),
-        )
+        if scaled and len(scaled) < len(full):
+            return RawCapture(png=scaled, source_rect=source, scale=scale, geometry=self.geometry())
+        return RawCapture(png=full, source_rect=source, scale=1.0, geometry=self.geometry())
 
     def capture_to(
         self,

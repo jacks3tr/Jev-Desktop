@@ -62,6 +62,13 @@ application is large, or point `scope.window_refs` at the window you care about.
 assertions refuse to conclude anything from a partial observation, which is deliberate: a
 truncated tree cannot prove that a control is missing.
 
+## The run keeps pausing with `step_unresolved` after an escalation
+
+`ESCALATE` means no offered target resolved the step. The usual cause is a thin observation:
+the window is behind another window, so its controls report offscreen and observation skips
+them. Add a `FOCUS_WINDOW` step for that window before the step that needs it, and check
+`coverage` in the observation: partial coverage with a truncation note explains the escalation.
+
 ## A run pauses with `needs_visual_assistance`
 
 Structured observation could not find the control the step needs. The pause carries a scoped

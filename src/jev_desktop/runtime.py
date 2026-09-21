@@ -56,7 +56,16 @@ from .contracts import (
 from .evidence import EvidenceStore
 from .journal import DispatchJournal, JournalUnhealthy
 from .ownership import Lease, Ownership
-from .policy import JevPolicy, OpContext, PolicyError, build_contexts, summarize_state_for_policy
+from .policy import (
+    STATE_BUDGET_BYTES,
+    JevPolicy,
+    OpContext,
+    PolicyError,
+    build_contexts,
+    fit_state_to_budget,
+    summarize_state_for_policy,
+    with_permitted_operations,
+)
 from .verification import (
     ORIGIN_APPLICATION,
     EvalContext,
@@ -78,7 +87,14 @@ class RuntimeConfig:
     capture_checkpoints: bool = True
     capture_failures: bool = True
     capture_scale: float = 0.6
-    settle_seconds: float = 1.5
+    # Measured time from dispatch to an observable change: 179 ms to 365 ms across click,
+    # typing, toggle, and dialog actions, with no misses. 0.8 s is roughly twice the p99.
+    settle_seconds: float = 0.8
+    # Provider input ceilings are tokenizer dependent, so start conservative and adapt on a
+    # refusal instead of trusting one machine's measurement.
+    state_budget_bytes: int = STATE_BUDGET_BYTES
+    min_state_budget_bytes: int = 6_000
+    state_budget_shrink: float = 0.6
     fingerprint_secret: bytes = field(default_factory=lambda: os.urandom(32))
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = now
@@ -126,6 +142,7 @@ class _RunState:
     pause_detail: dict[str, Any] = field(default_factory=dict)
     model_versions: list[str] = field(default_factory=list)
     supplied_fixtures: dict[str, str] = field(default_factory=dict)
+    state_budget_bytes: int | None = None
     supplied_visual: dict[str, Mapping[str, Any]] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     pending_assertion: str | None = None
@@ -159,6 +176,7 @@ class _RunState:
             "pause_detail": dict(self.pause_detail),
             "model_versions": list(self.model_versions),
             "supplied_fixtures": dict(self.supplied_fixtures),
+            "state_budget_bytes": self.state_budget_bytes,
             "supplied_visual": {key: dict(value) for key, value in self.supplied_visual.items()},
             "summary": dict(self.summary),
             "pending_assertion": self.pending_assertion,
@@ -196,6 +214,8 @@ class _RunState:
         state.pause_detail = dict(data.get("pause_detail", {}))
         state.model_versions = [str(item) for item in data.get("model_versions", [])]
         state.supplied_fixtures = {str(k): str(v) for k, v in data.get("supplied_fixtures", {}).items()}
+        budget = data.get("state_budget_bytes")
+        state.state_budget_bytes = None if budget is None else int(budget)
         state.supplied_visual = {str(k): dict(v) for k, v in data.get("supplied_visual", {}).items()}
         state.summary = dict(data.get("summary", {}))
         state.pending_assertion = data.get("pending_assertion")
@@ -620,40 +640,69 @@ class Runtime:
             item.step_id for item in self._required_steps(state) if item.step_id not in state.completed_steps
         ]
         allow_done = state.spec.purpose is Purpose.EXPLORATORY or not required_remaining
-        decision = self.policy.decide(
+        summarised = summarize_state_for_policy(
             goal=state.spec.goal,
-            state=summarize_state_for_policy(
-                goal=state.spec.goal,
-                current_step={
-                    "step_id": step.step_id,
-                    "operation": step.operation.value,
-                    "target_description": step.target_description,
-                    "fixture_reference": step.fixture_reference,
-                    "purpose": state.spec.purpose.value,
-                    "remaining_steps": required_remaining,
-                },
-                snapshot_elements=observation["elements"],
-                context=observation["context"],
-                recent_actions=[
-                    {
-                        "step_id": record.step_id,
-                        "operation": record.operation.value,
-                        "target": record.target_description,
-                        "changed": record.observation_changed,
-                    }
-                    for record in state.steps[-6:]
-                ],
-                mode=state.spec.interaction_mode.value,
-            ),
-            contexts=contexts,
-            allow_done=allow_done,
-            allow_escalate=True,
             current_step={
                 "step_id": step.step_id,
                 "operation": step.operation.value,
                 "target_description": step.target_description,
+                "fixture_reference": step.fixture_reference,
+                "purpose": state.spec.purpose.value,
+                "remaining_steps": required_remaining,
             },
+            snapshot_elements=observation["elements"],
+            context=observation["context"],
+            recent_actions=[
+                {
+                    "step_id": record.step_id,
+                    "operation": record.operation.value,
+                    "target": record.target_description,
+                    "changed": record.observation_changed,
+                }
+                for record in state.steps[-6:]
+            ],
+            mode=state.spec.interaction_mode.value,
         )
+        keep = [candidate.element_id for context in contexts for candidate in context.candidates]
+        budget = state.state_budget_bytes or self.config.state_budget_bytes
+        while True:
+            fitted = fit_state_to_budget(summarised, keep_element_ids=keep, budget_bytes=budget)
+            try:
+                decision = self.policy.decide(
+                    goal=state.spec.goal,
+                    state=with_permitted_operations(fitted, [step.operation]),
+                    contexts=contexts,
+                    allow_done=allow_done,
+                    allow_escalate=True,
+                    current_step={
+                        "step_id": step.step_id,
+                        "operation": step.operation.value,
+                        "target_description": step.target_description,
+                    },
+                )
+                break
+            except Pause as pause:
+                if pause.detail.get("cause") != "max_tokens_exceeded":
+                    raise
+                # The provider's ceiling depends on its tokenizer and on the questions sent
+                # with the state, so treat the first refusal as a measurement: shrink, remember
+                # it for the rest of the run, and try once more.
+                if budget <= self.config.min_state_budget_bytes:
+                    raise Pause(
+                        Reason.NEEDS_NARROWER_OBSERVATION,
+                        {
+                            "detail": "the state cannot be shrunk far enough for the provider",
+                            "budget_bytes": budget,
+                            "hint": "narrow scope.window_refs or lower scope.max_elements",
+                        },
+                    ) from pause
+                budget = max(self.config.min_state_budget_bytes, int(budget * self.config.state_budget_shrink))
+                state.state_budget_bytes = budget
+                self.journal.append_trace(
+                    state.run_id,
+                    "state_budget_shrunk",
+                    {"budget_bytes": budget, "step": step.step_id},
+                )
         state.model_versions.append(decision.model)
         self.journal.append_trace(state.run_id, "decision", decision.to_json())
         return decision
@@ -802,6 +851,7 @@ class Runtime:
             lease_generation=lease.generation,
             step_id=step.step_id,
             text=text,
+            replace_existing=getattr(step, "replace_existing", True),
             option_label=option_label,
             hotkey=hotkey,
             scroll=scroll,
@@ -989,6 +1039,28 @@ class Runtime:
             self._evaluate_one(state, spec, snapshot, checkpoint)
 
     def _evaluate_one(self, state: _RunState, spec: AssertionSpec, snapshot: Snapshot, checkpoint: str) -> None:
+        """Evaluate an assertion, honouring its deadline.
+
+        A real application can take a moment to expose what the assertion looks for: a browser
+        updates its window title after the page loads, not when the click is dispatched. The
+        deadline lets the assertion wait for the state rather than testing the state at the
+        instant the input landed.
+        """
+        result = self._evaluate_once(state, spec, snapshot, checkpoint)
+        deadline = self.config.clock() + max(0.0, spec.deadline_s)
+        while result.status is not AssertionStatus.PASSED and self.config.clock() < deadline:
+            self.config.sleeper(0.25)
+            try:
+                snapshot = self._observe(state)
+            except Pause:
+                break
+            result = self._evaluate_once(state, spec, snapshot, checkpoint)
+        self._merge_assertion(state, result)
+        self.journal.append_trace(state.run_id, "assertion", result.to_json())
+
+    def _evaluate_once(
+        self, state: _RunState, spec: AssertionSpec, snapshot: Snapshot, checkpoint: str
+    ) -> AssertionResult:
         context = EvalContext(
             observation=snapshot,
             identity=None,
@@ -1006,9 +1078,7 @@ class Runtime:
             checkpoint=checkpoint,
             clock=self.config.clock,
         )
-        result = evaluate(spec, context)
-        self._merge_assertion(state, result)
-        self.journal.append_trace(state.run_id, "assertion", result.to_json())
+        return evaluate(spec, context)
 
     def _merge_assertion(self, state: _RunState, result: AssertionResult) -> None:
         for index, existing in enumerate(state.assertions):
@@ -1101,12 +1171,25 @@ class Runtime:
         verdict, _ = self._verdict(state, Execution.CANCELLED.value)
         return self._result(state, Execution.CANCELLED, verdict, reason, detail={"message": message})
 
-    def _blocked(self, state: _RunState, reason: str, message: str, snapshot: Snapshot | None = None) -> RunResult:
+    def _blocked(
+        self,
+        state: _RunState,
+        reason: str,
+        message: str,
+        snapshot: Snapshot | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> RunResult:
         state.status = RunStatus.BLOCKED.value
         state.pause_reason = reason
         if snapshot is not None:
             self._capture(state, snapshot, checkpoint="blocked", description=message, keep=True)
-        return self._result(state, Execution.BLOCKED, Verdict.INCONCLUSIVE, reason, detail={"message": message})
+        return self._result(
+            state,
+            Execution.BLOCKED,
+            Verdict.INCONCLUSIVE,
+            reason,
+            detail={"message": message, **(dict(detail) if detail else {})},
+        )
 
     def _error(self, state: _RunState, exc: BaseException) -> RunResult:
         state.status = RunStatus.ERROR.value

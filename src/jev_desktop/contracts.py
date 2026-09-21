@@ -629,7 +629,11 @@ class ScopeSpec:
     app_ref: str
     window_refs: tuple[str, ...] = ()
     include_dialogs: bool = True
-    max_elements: int = 240
+    # Measured on a content-rich Chromium page: 240 elements produced a 61 kB state (about 15k
+    # tokens) that the provider refused, while 120 elements produced 29 kB and still contained
+    # every visible control. Chrome and dialogs are collected before content rows, so a smaller
+    # cap costs coverage of list rows, not of anything a test can act on.
+    max_elements: int = 120
     max_depth: int = 12
     text_limit: int = 4000
     include_invisible: bool = False
@@ -654,7 +658,7 @@ class ScopeSpec:
                 validate_id("win", ref) for ref in _require_str_list(data.get("window_refs", []), "scope.window_refs")
             ),
             include_dialogs=_require_bool(data.get("include_dialogs", True), "scope.include_dialogs"),
-            max_elements=_require_int(data.get("max_elements", 240), "scope.max_elements", minimum=1),
+            max_elements=_require_int(data.get("max_elements", 120), "scope.max_elements", minimum=1),
             max_depth=_require_int(data.get("max_depth", 12), "scope.max_depth", minimum=1),
             text_limit=_require_int(data.get("text_limit", 4000), "scope.text_limit", minimum=0),
             include_invisible=_require_bool(data.get("include_invisible", False), "scope.include_invisible"),
@@ -665,11 +669,12 @@ class ScopeSpec:
 class ExpectedIdentity:
     """How the running build is bound to the tested artifact."""
 
-    mode: str  # "file_marker" | "exe_hash" | "fresh_launch" | "any"
+    mode: str  # "file_marker" | "exe_hash" | "fresh_launch" | "package_family" | "any"
     marker_path: str | None = None
     expect_marker: str | None = None
     expect_exe: str | None = None
     expect_sha256: str | None = None
+    expect_package: str | None = None
     launched_after: float | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -679,6 +684,7 @@ class ExpectedIdentity:
             "expect_marker": self.expect_marker,
             "expect_exe": self.expect_exe,
             "expect_sha256": self.expect_sha256,
+            "expect_package": self.expect_package,
             "launched_after": self.launched_after,
         }
 
@@ -686,7 +692,7 @@ class ExpectedIdentity:
     def from_json(cls, data: Any) -> ExpectedIdentity:
         data = _require_mapping(data, "expected_identity")
         mode = _require_str(data.get("mode", "any"), "expected_identity.mode")
-        if mode not in {"file_marker", "exe_hash", "fresh_launch", "any"}:
+        if mode not in {"file_marker", "exe_hash", "fresh_launch", "package_family", "any"}:
             raise ContractError(f"unknown identity mode: {mode}")
         return cls(
             mode=mode,
@@ -694,6 +700,7 @@ class ExpectedIdentity:
             expect_marker=_opt_str(data.get("expect_marker"), "expected_identity.expect_marker"),
             expect_exe=_opt_str(data.get("expect_exe"), "expected_identity.expect_exe"),
             expect_sha256=_opt_str(data.get("expect_sha256"), "expected_identity.expect_sha256"),
+            expect_package=_opt_str(data.get("expect_package"), "expected_identity.expect_package"),
             launched_after=(
                 None
                 if data.get("launched_after") is None
@@ -818,6 +825,7 @@ class ActionRequest:
     lease_generation: int
     step_id: str | None = None
     text: str | None = None
+    replace_existing: bool = True
     option_label: str | None = None
     hotkey: tuple[str, ...] = ()
     scroll: Mapping[str, Any] = field(default_factory=dict)
@@ -837,6 +845,7 @@ class ActionRequest:
             "lease_generation": self.lease_generation,
             "step_id": self.step_id,
             "text": self.text,
+            "replace_existing": self.replace_existing,
             "option_label": self.option_label,
             "hotkey": list(self.hotkey),
             "scroll": dict(self.scroll),
@@ -862,6 +871,7 @@ class ActionRequest:
             lease_generation=_require_int(data.get("lease_generation"), "action.lease_generation", minimum=0),
             step_id=_opt_str(data.get("step_id"), "action.step_id"),
             text=_opt_str(data.get("text"), "action.text"),
+            replace_existing=_require_bool(data.get("replace_existing", True), "action.replace_existing"),
             option_label=_opt_str(data.get("option_label"), "action.option_label"),
             hotkey=tuple(_require_str_list(data.get("hotkey", []), "action.hotkey")),
             scroll=dict(_require_mapping(data.get("scroll", {}), "action.scroll")),
@@ -978,9 +988,12 @@ class Driver(Protocol):
 # --------------------------------------------------------------------------------------
 
 
+# Defaults chosen from measurement rather than taste, see docs/calibration.md:
+# a live run consumed 1.0 model decisions and 1.09 s of wall time per dispatched action, so a
+# full 25-action budget needs about 40 decisions and 27 s of slice time.
 DEFAULT_LIMITS: dict[str, Any] = {
     "max_actions": 25,
-    "max_model_decisions": 30,
+    "max_model_decisions": 40,
     "deadline_seconds": 600.0,
     "slice_seconds": 45.0,
     "stale_retries": 2,
@@ -1053,6 +1066,7 @@ class RequiredStep:
     depends_on: tuple[str, ...] = ()
     checkpoint: bool = False
     required: bool = True
+    replace_existing: bool = True
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1063,6 +1077,7 @@ class RequiredStep:
             "depends_on": list(self.depends_on),
             "checkpoint": self.checkpoint,
             "required": self.required,
+            "replace_existing": self.replace_existing,
         }
 
     @classmethod
@@ -1076,6 +1091,7 @@ class RequiredStep:
             depends_on=tuple(_require_str_list(data.get("depends_on", []), "step.depends_on")),
             checkpoint=_require_bool(data.get("checkpoint", False), "step.checkpoint"),
             required=_require_bool(data.get("required", True), "step.required"),
+            replace_existing=_require_bool(data.get("replace_existing", True), "step.replace_existing"),
         )
 
 

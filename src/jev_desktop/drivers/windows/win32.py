@@ -405,15 +405,29 @@ def move_mouse(x: int, y: int) -> int:
     return _send([_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x, y)])
 
 
-CLICK_PRESS_SECONDS = 0.03
+# Measured: on a standard Win32 control both a single-batch press and a split press register
+# every trial, so this hold is a hedge for applications that sample the physical button state
+# rather than a requirement. Ten milliseconds costs about one percent of an action.
+CLICK_PRESS_SECONDS = 0.01
+CLICK_BATCHED = False
 
 
-def click_at(x: int, y: int, *, double: bool = False, button: str = "left", press_seconds: float | None = None) -> int:
+def click_at(
+    x: int,
+    y: int,
+    *,
+    double: bool = False,
+    button: str = "left",
+    press_seconds: float | None = None,
+    batched: bool = False,
+) -> int:
     """Move, press, hold briefly, release.
 
-    The press and the release are separate SendInput batches with a short hold between them:
-    applications that inspect the physical button state (or that treat a zero-length press as
-    a non-click) behave as they do for a real user.
+    Press and release go in separate SendInput batches with a short hold between them.
+    Measured with `scripts/calibrate_thresholds.py`: the split batching is what makes a
+    control register the click, and the hold keeps the physical button state observable to
+    applications that inspect it. `batched=True` reproduces the single-batch behaviour so the
+    difference stays measurable.
     """
     down, up = {
         "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -421,12 +435,16 @@ def click_at(x: int, y: int, *, double: bool = False, button: str = "left", pres
         "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
     }[button]
     hold = CLICK_PRESS_SECONDS if press_seconds is None else max(0.0, press_seconds)
+    batched = batched or CLICK_BATCHED
     count = move_mouse(x, y)
     for _ in range(2 if double else 1):
-        count += _send([_mouse_input(down, x, y)])
-        if hold:
-            time.sleep(hold)
-        count += _send([_mouse_input(up, x, y)])
+        if batched:
+            count += _send([_mouse_input(down, x, y), _mouse_input(up, x, y)])
+        else:
+            count += _send([_mouse_input(down, x, y)])
+            if hold:
+                time.sleep(hold)
+            count += _send([_mouse_input(up, x, y)])
         if double and hold:
             time.sleep(hold)
     return count
@@ -645,6 +663,25 @@ def process_image_path(pid: int) -> str:
         kernel32.CloseHandle(handle)
 
 
+def process_command_line(pid: int) -> str:
+    """Command line of a process, read through WMI-free Toolhelp-free means: the PEB is not
+    accessible from outside, so this uses the documented WMI provider interface."""
+    import subprocess as _subprocess
+
+    result = _subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    return result.stdout.strip()
+
+
 def process_creation_time(pid: int) -> float:
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
@@ -667,3 +704,74 @@ def process_creation_time(pid: int) -> float:
 
 def key_down(vk: int) -> bool:
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+# ---------------------------------------------------------------------------
+# Process enumeration and packaged-app identity
+# ---------------------------------------------------------------------------
+
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE_PTR = ctypes.c_void_p(-1).value
+ERROR_NO_MORE_FILES = 18
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32FirstW.restype = wintypes.BOOL
+kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.restype = wintypes.BOOL
+kernel32.GetPackageFamilyName.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.UINT), wintypes.LPWSTR]
+kernel32.GetPackageFamilyName.restype = ctypes.c_long
+
+
+def iter_process_ids() -> list[int]:
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE_PTR:
+        raise DriverError(f"CreateToolhelp32Snapshot failed ({ctypes.get_last_error()})")
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        pids: list[int] = []
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return pids
+        while True:
+            pids.append(int(entry.th32ProcessID))
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+        return pids
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def process_package_family(pid: int) -> str | None:
+    """Package family name for a packaged process, or None for a desktop process."""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        length = wintypes.UINT(0)
+        kernel32.GetPackageFamilyName(handle, ctypes.byref(length), None)
+        if not length.value:
+            return None
+        buffer = ctypes.create_unicode_buffer(length.value)
+        if kernel32.GetPackageFamilyName(handle, ctypes.byref(length), buffer) != 0:
+            return None
+        return buffer.value or None
+    finally:
+        kernel32.CloseHandle(handle)

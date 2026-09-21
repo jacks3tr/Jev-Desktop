@@ -53,6 +53,21 @@ First working release: a harness-independent host-desktop testing plugin.
   self-test.
 * Safety gates. Live tests, the driver self-test, and the fixture contract test all refuse to
   run without `JEV_DESKTOP_LIVE=1`, so nothing creates a window by accident.
+* Package identity for packaged applications. `ExpectedIdentity.mode = "package_family"`
+  verifies a UWP app by package family name, with an optional launch timestamp, because the
+  process that owns its window is a frame host that started earlier.
+* Assertion deadlines are now enforced. An assertion re-evaluates against fresh observations
+  until its `deadline_s`, so a browser that updates its window title after the page loads is
+  not reported as a failure.
+* Actionable elements are collected before content rows during observation, so a dialog's own
+  buttons are never crowded out by a file list earlier in the tree.
+* Real-application calibration, in `docs/calibration.md` and `scripts/calibrate_real_apps.py`.
+  A Notepad save flow and a UWP Calculator run execute end to end with live model decisions,
+  and every shipped threshold was measured. Fixes that came out of it: permitted operations
+  are stated in the decision state, typed text requires a text-entry role rather than a Value
+  pattern, observation collects interactive chrome before content rows, oversized states are
+  trimmed to a provider budget with an adaptive retry, and `TYPE_TEXT` replaces prefilled
+  content by default.
 * Secret and hygiene guards. `tests/unit/test_no_secrets.py` fails the build on credential
   shapes, local user paths, or runtime state that would otherwise be committed, and
   `tests/unit/test_repo_hygiene.py` keeps documentation links and the desktop gate honest.

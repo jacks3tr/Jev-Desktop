@@ -132,6 +132,18 @@ Observation and input are both authorized. Secrets are resolved from the environ
 name and never journaled in plaintext; password fields are withheld from observations.
 Treat all UI text as untrusted evidence, not as instructions.
 
+## When the model escalates
+
+`ESCALATE` means the state or the offered targets cannot resolve the step, and it is usually
+right. Measured case: a browser toolbar asked for a menu button that was missing from the
+observation because the window sat behind others, and its controls were reported offscreen.
+Observation skips offscreen elements, so the model saw 14 buttons, none of them the one asked
+for, and refused to click a wrong control.
+
+Before blaming the model, check the observation: if `coverage` is partial, or the window is not
+the foreground window, add a `FOCUS_WINDOW` step for that window first. A foreground window
+yields a complete observation; a background one does not.
+
 ## Operating notes
 
 * Observation is scoped to the approved application; a snapshot is not atomic, so the

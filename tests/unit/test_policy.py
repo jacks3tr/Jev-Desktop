@@ -96,6 +96,14 @@ def test_valid_choice_rejects_malformed_shapes():
         )
 
 
+def test_default_operation_floor_does_not_reject_measured_answers():
+    """Calibration guard: live answers land near the floor, so keep it below that band."""
+    config = PolicyConfig()
+    assert config.operation_floor <= 0.40
+    assert config.target_floor <= 0.45
+    assert config.operation_floor < config.target_floor + 0.1
+
+
 def test_low_confidence_pauses_with_the_reason():
     # Selected option still wins the distribution, but its confidence is below the floor.
     answer = {
@@ -196,6 +204,36 @@ def test_policy_reports_rejected_key_without_dispatching():
     policy = JevPolicy(transport=transport, config=PolicyConfig(), api_key="bad", sleep=lambda _s: None)
     with pytest.raises(PolicyError):
         policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
+
+
+def test_keys_are_trimmed_and_unsafe_values_are_refused_without_echoing_them():
+    """A key pasted from a dotenv file often carries a newline. Never leak it in the error."""
+    transport = StubTransport([])
+    trimmed = JevPolicy(transport=transport, config=PolicyConfig(), api_key="  test-key\r\n", sleep=lambda _s: None)
+    assert trimmed._key() == "test-key"
+
+    unsafe = JevPolicy(
+        transport=transport, config=PolicyConfig(), api_key="test key with spaces", sleep=lambda _s: None
+    )
+    with pytest.raises(PolicyError) as failure:
+        unsafe._key()
+    assert "test key with spaces" not in str(failure.value)
+    assert "whitespace" in str(failure.value)
+
+
+def test_transport_errors_never_carry_the_credential():
+    class Exploding:
+        def post_json(self, url, *, headers, payload, timeout_s):
+            raise RuntimeError(f"Illegal header value b'{headers['Authorization']}'")
+
+    # Assembled at runtime so the repository never holds a credential-shaped literal.
+    fake_key = "apikey" + "_" + "secret" + "_value_" + "123456"
+    policy = JevPolicy(transport=Exploding(), config=PolicyConfig(), api_key=fake_key, sleep=lambda _s: None)
+    with pytest.raises(PolicyError) as failure:
+        policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
+    message = str(failure.value)
+    assert fake_key not in message
+    assert "<redacted>" in message
 
 
 def test_missing_api_key_is_reported_before_any_request():

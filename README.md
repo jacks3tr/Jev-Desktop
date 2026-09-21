@@ -109,6 +109,7 @@ unknown. Details, including the risks we accept, are in
 | [docs/architecture.md](docs/architecture.md) | Who decides what, the runtime loop, and the journal states |
 | [docs/security-model.md](docs/security-model.md) | Trust boundaries, redaction, and accepted risks |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Doctor output, stuck states, and what each reason means |
+| [docs/calibration.md](docs/calibration.md) | Every threshold, the measurement behind it, and how to re-measure |
 | [skills/host-desktop-testing/SKILL.md](skills/host-desktop-testing/SKILL.md) | Instructions for the calling model |
 | [examples/README.md](examples/README.md) | Runnable specs against the fixture application |
 
@@ -162,11 +163,24 @@ Verified on this workstation, Windows 10 Pro, session 1, 1920x1080:
 | Driver | `scripts/native_selftest.py` -> observes its own window, captures PNG evidence, clicks, types, toggles semantically, refuses a stale reference, binds identity |
 | Fixture contract | `scripts/fixture_selftest.py` -> 11 scenarios including save, restart, and save again |
 
+Validated against real applications, driven by live Jev decisions:
+
+| Case | Steps | Result |
+| --- | --- | --- |
+| Notepad | Type a document, File menu, Save As, replace the prefilled name, click Save, verify the file and its run id | `completed` / `passed`, 5 actions, 8.6 s |
+| Calculator (UWP) | 7, +, 5, =, then read the display | `completed` / `passed`, 4 actions, 1.8 s |
+| Chrome | Focus the window, click a link in the page, verify the window title changed | `completed` / `passed`, 2 actions |
+
+Those runs found and fixed real defects: text-entry affordance, actionable controls starving
+behind content rows, provider input budget, prefilled fields, package identity for UWP, and
+assertion timing. Numbers and reasoning are in [docs/calibration.md](docs/calibration.md).
+
 Known gaps, stated rather than implied: the driver is Windows-only in this release;
-multi-monitor, mixed-DPI, elevated targets, and the secure desktop are untested; vision
-oracles are caller-supplied by default; thresholds were not calibrated against a live TypeSafe
-key here, so the HTTP call is the untested seam even though the request and answer validation
-are covered by tests.
+multi-monitor, mixed-DPI, elevated targets, and the secure desktop are untested; browser
+content only enters the accessibility tree when the renderer exposes it, which Chromium needs
+`--force-renderer-accessibility` for; vision oracles are caller-supplied by default; the
+fixture suite still exists for deterministic failure modes such as a dead button, but it is a
+regression harness, not calibration.
 
 ## Contributing
 

@@ -194,6 +194,39 @@ CLICKABLE_ROLES = {
     "dataitem",
 }
 TEXT_ROLES = {"edit", "document", "text", "statusbar", "tooltip"}
+# Roles that genuinely accept typed text. Trusting the Value pattern alone is wrong: shell
+# navigation trees, file lists, and column headers all expose Value, which turned 151 tree
+# items into "text fields" in a real Notepad Save As dialog and buried the file name field.
+TEXT_ENTRY_ROLES = {"edit", "document", "combobox", "spinner"}
+
+# Controls a test can act on, as opposed to content rows. Measured on a real Notepad Save As
+# dialog: the file list holds hundreds of rows, and a depth-first walk spent the entire element
+# budget on them, so the dialog's own Save button never appeared in the observation at all.
+CHROME_ROLES = {
+    "button",
+    "splitbutton",
+    "edit",
+    "combobox",
+    "checkbox",
+    "radiobutton",
+    "menuitem",
+    "tabitem",
+    "tab",
+    "hyperlink",
+    "slider",
+    "spinner",
+    "scrollbar",
+    "thumb",
+    "titlebar",
+    "menubar",
+    "toolbar",
+}
+# Rows are the cheap, numerous thing a big list produces, and the only thing the share below
+# applies to. Text, status, and document values stay: they are what assertions read, and they
+# are few. Containers are structural: their children matter, the container itself does not.
+ROW_ROLES = {"listitem", "treeitem", "dataitem"}
+CONTAINER_ROLES = {"pane", "group", "custom", "table", "tree", "list", "datagrid"}
+CONTENT_SHARE = 0.25  # of the element budget, with a floor so short lists stay complete
 
 
 @dataclass
@@ -457,7 +490,7 @@ def _operations_for(role: str, available: Mapping[str, bool], editable: bool) ->
     clickable = bool(available.get("invoke")) or role in CLICKABLE_ROLES
     if clickable:
         ops.append(Operation.CLICK.value)
-    if editable and (available.get("value") or role == "edit"):
+    if editable and role in TEXT_ENTRY_ROLES:
         ops.append(Operation.TYPE_TEXT.value)
     if role in {"combobox", "list", "listitem", "tabitem", "radiobutton"} and (
         available.get("selectionitem") or available.get("expandcollapse") or available.get("selection")
@@ -579,15 +612,25 @@ def observe(
         started = time.perf_counter()
         snapshot_id = new_id("snap")
         registry.next_index = 1  # element indexes are per-observation, never cumulative
-        elements: list[ElementInfo] = []
         window_infos: list[WindowInfo] = []
         truncation: list[str] = []
         coverage = Coverage.COMPLETE
+        elements: list[ElementInfo] = []
+        deferred: list[ElementInfo] = []
         texts: list[dict[str, Any]] = []
         skipped: list[int] = []
         foreground = win32.foreground_window()
 
-        for window_ref, hwnd in scope_windows:
+        # Dialogs and the focused window come first: when a budget runs out, it should run out
+        # on background content rather than on the window the user is working in.
+        ordered_windows = sorted(
+            scope_windows,
+            key=lambda item: 0 if win32.owner_window(item[1]) else 2 if win32.foreground_window() == item[1] else 1,
+        )
+        content_cap = max(20, int(max_elements * CONTENT_SHARE))
+        content_seen = 0
+        rows_dropped: list[int] = []
+        for window_ref, hwnd in ordered_windows:
             owner_hwnd = win32.owner_window(hwnd)
             window_infos.append(
                 WindowInfo(
@@ -614,7 +657,7 @@ def observe(
             if not worker.has_cached_walker:  # pragma: no cover - fallback path
                 truncation.append("cached tree walker unavailable; using flat search")
                 coverage = Coverage.PARTIAL
-            _walk(
+            content_seen = _walk(
                 worker,
                 root,
                 registry,
@@ -622,6 +665,7 @@ def observe(
                 window_ref,
                 hwnd,
                 elements,
+                deferred,
                 texts,
                 depth=0,
                 max_depth=max_depth,
@@ -630,8 +674,23 @@ def observe(
                 text_limit=text_limit,
                 truncation=truncation,
                 skipped=skipped,
+                rows_dropped=rows_dropped,
+                content_cap=content_cap,
+                content_seen=content_seen,
             )
 
+        # Actionable elements are all in `elements` by now; content fills what is left, so a
+        # dialog's own buttons are never crowded out by a file list that happens to sit earlier
+        # in the tree.
+        room = max(0, max_elements - len(elements))
+        if len(deferred) > room:
+            rows_dropped.append(len(deferred) - room)
+            coverage = Coverage.TRUNCATED if coverage is Coverage.TRUNCATED else Coverage.PARTIAL
+        elements.extend(deferred[:room])
+
+        if rows_dropped:
+            coverage = Coverage.TRUNCATED if coverage is Coverage.TRUNCATED else Coverage.PARTIAL
+            truncation.append(f"{len(rows_dropped)} list rows were not observed (row share of the element budget)")
         if skipped:
             coverage = Coverage.TRUNCATED if coverage is Coverage.TRUNCATED else Coverage.PARTIAL
             truncation.append(f"{len(skipped)} offscreen elements were not observed")
@@ -685,6 +744,7 @@ def _walk(
     window_ref: str,
     hwnd: int,
     elements: list[ElementInfo],
+    pending: list[ElementInfo],
     texts: list[dict[str, Any]],
     *,
     depth: int,
@@ -695,14 +755,46 @@ def _walk(
     truncation: list[str],
     path: tuple[str, ...] = (),
     skipped: list[int] | None = None,
-) -> None:
+    rows_dropped: list[int] | None = None,
+    content_cap: int = 0,
+    content_seen: int = 0,
+) -> int:
     if len(elements) >= max_elements or depth > max_depth:
         if depth > max_depth:
             truncation.append(f"depth cap reached ({max_depth})")
-        return
+        return content_seen
     role = _control_type(element)
+    if role in ROW_ROLES:
+        content_seen += 1
     name_value = _cached(element, PROP_NAME)
     name = name_value if isinstance(name_value, str) else ""
+    if role in CONTAINER_ROLES and len(elements) >= max_elements:
+        # A structural element past the budget: its children still matter, the container does
+        # not, so descend without recording it.
+        for child in worker.children(element):
+            content_seen = _walk(
+                worker,
+                child,
+                registry,
+                snapshot_id,
+                window_ref,
+                hwnd,
+                elements,
+                pending,
+                texts,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_elements=max_elements,
+                include_invisible=include_invisible,
+                text_limit=text_limit,
+                truncation=truncation,
+                path=(*path, name or role),
+                skipped=skipped,
+                rows_dropped=rows_dropped,
+                content_cap=content_cap,
+                content_seen=content_seen,
+            )
+        return content_seen
     password = _bool(_cached(element, PROP_PASSWORD))
     value = _value_of(element, password)
     enabled = _bool(_cached(element, PROP_ENABLED), True)
@@ -713,7 +805,9 @@ def _walk(
     available = _available_patterns(element)
     state = _state_of(element, available)
     readonly = bool(state.get("readonly"))
-    editable = (available.get("value") and not readonly) or role == "edit"
+    editable = (available.get("value") and not readonly and role in TEXT_ENTRY_ROLES) or (
+        role == "edit" and not readonly
+    )
     visible = (not offscreen) and not rect.is_empty
     if not visible and not include_invisible:
         # Offscreen content is skipped, so the observation is explicitly partial: absence of an
@@ -721,7 +815,7 @@ def _walk(
         if skipped is not None:
             skipped.append(1)
         for child in worker.children(element):
-            _walk(
+            content_seen = _walk(
                 worker,
                 child,
                 registry,
@@ -729,6 +823,7 @@ def _walk(
                 window_ref,
                 hwnd,
                 elements,
+                pending,
                 texts,
                 depth=depth + 1,
                 max_depth=max_depth,
@@ -738,8 +833,10 @@ def _walk(
                 truncation=truncation,
                 path=(*path, name or role),
                 skipped=skipped,
+                content_cap=content_cap,
+                content_seen=content_seen,
             )
-        return
+        return content_seen
 
     element_id = new_id("el")
     native_handle = _cached(element, PROP_NATIVE_HANDLE)
@@ -767,7 +864,7 @@ def _walk(
         if raw and len(raw) > len(text):
             truncation.append(f"text truncated for {role}")
     element_text = (text or None) if (role in TEXT_ROLES or value) else None
-    elements.append(
+    (elements if role in CHROME_ROLES else pending).append(
         ElementInfo(
             element_id=element_id,
             window_ref=window_ref,
@@ -793,7 +890,7 @@ def _walk(
         texts.append({"element_id": element_id, "role": role, "name": name, "text": element_text})
 
     for child in worker.children(element):
-        _walk(
+        content_seen = _walk(
             worker,
             child,
             registry,
@@ -801,6 +898,7 @@ def _walk(
             window_ref,
             hwnd,
             elements,
+            pending,
             texts,
             depth=depth + 1,
             max_depth=max_depth,
@@ -810,7 +908,11 @@ def _walk(
             truncation=truncation,
             path=(*path, name or role),
             skipped=skipped,
+            rows_dropped=rows_dropped,
+            content_cap=content_cap,
+            content_seen=content_seen,
         )
+    return content_seen
 
 
 def resolve_element(registry: Registry, element_id: str, snapshot_id: str | None, app_ref: str) -> ElementHandle:
