@@ -1,4 +1,10 @@
-"""Deterministic doubles for engine tests: no desktop, no network, no wall-clock waits."""
+"""Doubles for the OS and model boundaries, so engine tests need neither a desktop nor a network.
+
+What lives here: a driver double for the Windows boundary, a policy double that returns
+scripted decisions, and a clock. What does not: anything standing in for the TypeSafe HTTP
+endpoint, which the policy tests reach through a real localhost server instead
+(`tests/unit/local_server.py`).
+"""
 
 from __future__ import annotations
 
@@ -389,20 +395,6 @@ class ScriptedPolicy:
             request_digest="scripted",
             state_digest="scripted",
         )
-
-
-class StubTransport:
-    """TypeSafe transport double: replays canned responses and records requests."""
-
-    def __init__(self, responses: Sequence[tuple[int, Any]]) -> None:
-        self.responses = list(responses)
-        self.requests: list[dict[str, Any]] = []
-
-    def post_json(self, url: str, *, headers: Mapping[str, str], payload: Mapping[str, Any], timeout_s: float):
-        self.requests.append({"url": url, "headers": dict(headers), "payload": payload, "timeout_s": timeout_s})
-        if not self.responses:
-            raise AssertionError("stub transport exhausted")
-        return self.responses.pop(0)
 
 
 def choice_answer(selected: str, options: Sequence[str], *, confidence: float = 0.9) -> dict:

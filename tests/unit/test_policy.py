@@ -8,15 +8,18 @@ from jev_desktop.contracts import Operation, Pause, PolicyError, Reason, TargetC
 from jev_desktop.policy import (
     MAX_TARGETS,
     NONE,
+    HttpTransport,
     JevPolicy,
     OpContext,
     PolicyConfig,
     build_questions,
     resolve_answers,
+    sanitize_message,
     valid_choice,
 )
 
-from .fakes import StubTransport, choice_answer, fake_response
+from .fakes import choice_answer, fake_response
+from .local_server import LocalTypeSafeServer, unused_port_endpoint
 
 
 def context(operation: Operation, count: int, *, prefix: str = "el") -> OpContext:
@@ -178,69 +181,99 @@ def test_none_target_pauses_instead_of_acting():
 
 
 def test_policy_retries_rate_limits_then_succeeds():
+    """A rate limit is retried over the real transport, against a real socket."""
     contexts = [context(Operation.CLICK, 1)]
     questions = build_questions(goal="g", contexts=contexts, allow_done=True, allow_escalate=True)
     body_answers = {
         "operation": choice_answer("WAIT", list(questions["operation"]["criteria"])),
     }
-    transport = StubTransport(
-        [
-            (429, {"error": "slow down"}),
-            (200, fake_response("jev-1.13.0", body_answers)),
-        ]
-    )
-    policy = JevPolicy(
-        transport=transport, config=PolicyConfig(max_retries=2), api_key="test-key", sleep=lambda _s: None
-    )
-    decision = policy.decide(goal="g", state={"elements": []}, contexts=contexts, allow_done=True)
+    with LocalTypeSafeServer() as server:
+        server.queue(429, {"error": "slow down"})
+        server.queue(200, fake_response("jev-1.13.0", body_answers))
+        policy = JevPolicy(
+            transport=HttpTransport(),
+            config=PolicyConfig(endpoint=server.endpoint, max_retries=2),
+            api_key="test-key",
+            sleep=lambda _s: None,
+        )
+        decision = policy.decide(goal="g", state={"elements": []}, contexts=contexts, allow_done=True)
     assert decision.operation is Operation.WAIT
     assert decision.model == "jev-1.13.0"
-    assert len(transport.requests) == 2
-    assert transport.requests[0]["headers"]["Authorization"] == "Bearer test-key"
+    assert len(server.requests) == 2, "the rate limit should have produced a second request"
+    assert server.headers[0]["Authorization"] == "Bearer test-key"
 
 
 def test_policy_reports_rejected_key_without_dispatching():
-    transport = StubTransport([(401, {"error": "unauthorized"})])
-    policy = JevPolicy(transport=transport, config=PolicyConfig(), api_key="bad", sleep=lambda _s: None)
-    with pytest.raises(PolicyError):
-        policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
+    with LocalTypeSafeServer() as server:
+        server.queue(401, {"error": "unauthorized"})
+        policy = JevPolicy(
+            transport=HttpTransport(),
+            config=PolicyConfig(endpoint=server.endpoint),
+            api_key="bad",
+            sleep=lambda _s: None,
+        )
+        with pytest.raises(PolicyError) as failure:
+            policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
+    assert "401" in str(failure.value)
+    assert len(server.requests) == 1, "a rejected key must not be retried"
 
 
 def test_keys_are_trimmed_and_unsafe_values_are_refused_without_echoing_them():
     """A key pasted from a dotenv file often carries a newline. Never leak it in the error."""
-    transport = StubTransport([])
-    trimmed = JevPolicy(transport=transport, config=PolicyConfig(), api_key="  test-key\r\n", sleep=lambda _s: None)
-    assert trimmed._key() == "test-key"
+    with LocalTypeSafeServer() as server:
+        trimmed = JevPolicy(
+            transport=HttpTransport(),
+            config=PolicyConfig(endpoint=server.endpoint),
+            api_key="  test-key\r\n",
+            sleep=lambda _s: None,
+        )
+        assert trimmed._key() == "test-key"
 
-    unsafe = JevPolicy(
-        transport=transport, config=PolicyConfig(), api_key="test key with spaces", sleep=lambda _s: None
-    )
-    with pytest.raises(PolicyError) as failure:
-        unsafe._key()
+        unsafe = JevPolicy(
+            transport=HttpTransport(),
+            config=PolicyConfig(endpoint=server.endpoint),
+            api_key="test key with spaces",
+            sleep=lambda _s: None,
+        )
+        with pytest.raises(PolicyError) as failure:
+            unsafe._key()
     assert "test key with spaces" not in str(failure.value)
     assert "whitespace" in str(failure.value)
 
 
-def test_transport_errors_never_carry_the_credential():
-    class Exploding:
-        def post_json(self, url, *, headers, payload, timeout_s):
-            raise RuntimeError(f"Illegal header value b'{headers['Authorization']}'")
-
+def test_connection_failures_never_carry_the_credential():
+    """A real connection failure, at an address nothing listens on. The error must not leak the key."""
     # Assembled at runtime so the repository never holds a credential-shaped literal.
     fake_key = "apikey" + "_" + "secret" + "_value_" + "123456"
-    policy = JevPolicy(transport=Exploding(), config=PolicyConfig(), api_key=fake_key, sleep=lambda _s: None)
+    policy = JevPolicy(
+        transport=HttpTransport(),
+        config=PolicyConfig(endpoint=unused_port_endpoint(), max_retries=0, timeout_s=2.0),
+        api_key=fake_key,
+        sleep=lambda _s: None,
+    )
     with pytest.raises(PolicyError) as failure:
         policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
-    message = str(failure.value)
-    assert fake_key not in message
-    assert "<redacted>" in message
+    assert fake_key not in str(failure.value)
+
+
+def test_sanitize_message_redacts_a_credential_that_appears_in_the_text():
+    """Redaction is what protects error text that does quote the header."""
+    fake_key = "apikey" + "_" + "secret" + "_value_" + "123456"
+    leaked = f"Illegal header value b'Bearer {fake_key}'"
+    cleaned = sanitize_message(leaked, fake_key)
+    assert fake_key not in cleaned
+    assert "<redacted>" in cleaned
+    bare_header = "Bearer " + "z" * 26  # assembled at runtime, never a literal in the source
+    assert sanitize_message(bare_header, None).endswith("<redacted>")
 
 
 def test_missing_api_key_is_reported_before_any_request():
-    transport = StubTransport([])
-    policy = JevPolicy(
-        transport=transport, config=PolicyConfig(api_key_env="DEFINITELY_NOT_SET"), sleep=lambda _s: None
-    )
-    with pytest.raises(PolicyError):
-        policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
-    assert not transport.requests
+    with LocalTypeSafeServer() as server:
+        policy = JevPolicy(
+            transport=HttpTransport(),
+            config=PolicyConfig(endpoint=server.endpoint, api_key_env="DEFINITELY_NOT_SET"),
+            sleep=lambda _s: None,
+        )
+        with pytest.raises(PolicyError):
+            policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
+    assert not server.requests, "no request may leave the process without a key"

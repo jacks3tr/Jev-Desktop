@@ -195,6 +195,15 @@ skips offscreen elements. Chasing that produced three changes, all measured:
 The case now clicks a link inside web content and verifies the window title changed to the
 destination page.
 
+## Offline tests do not fake the provider
+
+The policy tests carry no hand-written response object. Canned provider responses come from a
+real HTTP server on a loopback port, and the real `HttpTransport` talks to it over a real
+socket, which is why the retry-on-429 and rejected-key tests are exercising the code that ships.
+Connection failures are tested against a port nothing listens on. The only doubles left are the
+Windows driver and the decision policy, both of which are OS and model boundaries rather than
+this project's own HTTP client.
+
 ## Known measurement gaps
 
 UWP applications hand the window to another process, so binding by launched pid fails; the

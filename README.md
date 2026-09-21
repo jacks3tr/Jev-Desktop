@@ -142,7 +142,7 @@ key for runs that need decisions. Inspection, directed actions, and stop work wi
 
 | Command | Touches your desktop |
 | --- | --- |
-| `python -m pytest tests/unit -q` | No. In-memory driver, and the fixture refuses to start. |
+| `python -m pytest tests/unit -q` | No. In-memory driver for the Windows boundary, a real localhost HTTP server for the provider, and the fixture refuses to start. |
 | `JEV_DESKTOP_LIVE=1 python -m pytest tests/windows -m live -q` | Yes. Creates windows and injects real input. |
 | `JEV_DESKTOP_LIVE=1 python scripts/native_selftest.py` | Yes. Its own window, real mouse, under a second. |
 | `JEV_DESKTOP_LIVE=1 python scripts/fixture_selftest.py` | Yes. Starts windowed fixtures, hidden, driven by window messages. |

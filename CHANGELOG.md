@@ -61,6 +61,9 @@ First working release: a harness-independent host-desktop testing plugin.
   not reported as a failure.
 * Actionable elements are collected before content rows during observation, so a dialog's own
   buttons are never crowded out by a file list earlier in the tree.
+* Policy tests drive the real HTTP transport. The hand-written response stub is gone; canned
+  provider responses are now served by a real localhost HTTP server (`tests/unit/local_server.py`),
+  so those tests exercise sockets, headers, status codes, retries, and connection failures.
 * Real-application calibration, in `docs/calibration.md` and `scripts/calibrate_real_apps.py`.
   A Notepad save flow and a UWP Calculator run execute end to end with live model decisions,
   and every shipped threshold was measured. Fixes that came out of it: permitted operations
