@@ -103,7 +103,7 @@ def test_no_secret_shaped_strings_in_tracked_files():
                 if any(marker in matched.lower() for marker in PLACEHOLDERS):
                     continue
                 line = text[: match.start()].count("\n") + 1
-                findings.append(f"{name}:{line}: {label}: {matched[:40]}")
+                findings.append(f"{name}:{line}: {label}")
     assert not findings, "possible credentials in tracked files:\n" + "\n".join(findings)
 
 

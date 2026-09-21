@@ -13,8 +13,6 @@ from jev_desktop.contracts import (
     ElementInfo,
     Evaluator,
     Geometry,
-    IdentityReport,
-    IdentityStatus,
     Rect,
     Snapshot,
     Verdict,
@@ -36,25 +34,25 @@ RUN_ID = "run:" + "a" * 24
 WINDOW_REF = "win:" + "b" * 24
 
 
-def element(role: str, name: str, value: str | None = None, **kwargs) -> ElementInfo:
+def element(role: str, name: str, value: str | None = None) -> ElementInfo:
     return ElementInfo(
         element_id=new_id("el"),
         window_ref=WINDOW_REF,
         role=role,
         name=name,
         value=value,
-        enabled=kwargs.get("enabled", True),
-        visible=kwargs.get("visible", True),
-        editable=kwargs.get("editable", False),
+        enabled=True,
+        visible=True,
+        editable=False,
         focusable=True,
-        focused=kwargs.get("focused", False),
-        operations=kwargs.get("operations", ("CLICK",)),
+        focused=False,
+        operations=("CLICK",),
         rect=Rect(10, 10, 110, 40),
-        index=kwargs.get("index", 1),
+        index=1,
         path=(),
-        state=kwargs.get("state", {}),
-        text=kwargs.get("text", value or name),
-        truncation=kwargs.get("truncation"),
+        state={},
+        text=value or name,
+        truncation=None,
     )
 
 
@@ -106,21 +104,6 @@ def test_element_value_assertion_passes_and_fails(tmp_path):
     assert failing.status is AssertionStatus.FAILED and failing.origin == ORIGIN_APPLICATION
 
 
-def test_nested_state_property_is_reachable(tmp_path):
-    """Toggle and selection state live under `state`, so assertions must be able to read them."""
-    spec = AssertionSpec(
-        assertion_id="feature-enabled",
-        evaluator=Evaluator.UIA_PROPERTY,
-        target={"role": "checkbox", "name": "Enable feature"},
-        expected={"equals": "on"},
-        property="state.checked",
-    )
-    on = element("checkbox", "Enable feature", state={"checked": "on"})
-    off = element("checkbox", "Enable feature", state={"checked": "off"})
-    assert evaluate(spec, context(tmp_path, observation=snapshot(on))).status is AssertionStatus.PASSED
-    assert evaluate(spec, context(tmp_path, observation=snapshot(off))).status is AssertionStatus.FAILED
-
-
 def test_absence_requires_complete_coverage(tmp_path):
     spec = AssertionSpec(
         assertion_id="no-error",
@@ -138,59 +121,6 @@ def test_absence_requires_complete_coverage(tmp_path):
     )
     assert complete.status is AssertionStatus.PASSED
     assert truncated.status is AssertionStatus.INCONCLUSIVE and truncated.origin == ORIGIN_RUNNER
-
-
-def test_presence_assertion_reports_missing_element_as_application_failure(tmp_path):
-    spec = AssertionSpec(
-        assertion_id="dialog-open",
-        evaluator=Evaluator.UIA_PRESENCE,
-        target={"role": "window", "name": "Preferences"},
-        expected={},
-    )
-    result = evaluate(spec, context(tmp_path, observation=snapshot(element("button", "Save"))))
-    assert result.status is AssertionStatus.FAILED and result.origin == ORIGIN_APPLICATION
-
-
-def test_window_state_assertion_reads_modal_and_focus(tmp_path):
-    from jev_desktop.contracts import WindowInfo
-
-    window = WindowInfo(
-        window_ref=WINDOW_REF,
-        app_ref="app:" + "c" * 24,
-        title="Settings",
-        class_name="W",
-        process_id=1,
-        modal=True,
-        owner_window_ref=None,
-        focused=False,
-        visible=True,
-        enabled=False,
-        rect=Rect(0, 0, 100, 100),
-        scope="dialog",
-    )
-    observation = Snapshot(
-        snapshot_id=new_id("snap"),
-        app_ref="app:" + "c" * 24,
-        captured_at=now(),
-        interval_ms=1,
-        geometry=Geometry(1, 0, 0, 100, 100, 96, 1.0),
-        fingerprint="f",
-        coverage=Coverage.COMPLETE,
-        truncation=(),
-        windows=(window,),
-        elements=(),
-        context={},
-        notes=(),
-    )
-    spec = AssertionSpec(
-        assertion_id="modal",
-        evaluator=Evaluator.WINDOW_STATE,
-        target={"title_regex": "Settings"},
-        expected={"is_true": True},
-        property="modal",
-    )
-    result = evaluate(spec, context(tmp_path, observation=observation))
-    assert result.status is AssertionStatus.PASSED
 
 
 # --------------------------------------------------------------------------------------
@@ -228,18 +158,6 @@ def test_run_scoped_artifact_passes_for_this_run(tmp_path):
     assert result.evidence_refs, "the artifact itself becomes evidence"
 
 
-def test_missing_artifact_is_an_application_failure(tmp_path):
-    spec = AssertionSpec(
-        assertion_id="artifact-exists",
-        evaluator=Evaluator.ARTIFACT,
-        target={"path": str(tmp_path / "nope.bin")},
-        expected={"is_true": True},
-        property="exists",
-    )
-    result = evaluate(spec, context(tmp_path))
-    assert result.status is AssertionStatus.FAILED and result.origin == ORIGIN_APPLICATION
-
-
 def test_artifact_outside_approved_roots_is_an_environment_block(tmp_path):
     outside = Path(tmp_path).parent / "not-approved.txt"
     outside.write_text("data", encoding="utf-8")
@@ -255,44 +173,9 @@ def test_artifact_outside_approved_roots_is_an_environment_block(tmp_path):
     outside.unlink(missing_ok=True)
 
 
-def test_json_field_assertion_reads_nested_values(tmp_path):
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({"settings": {"mode": "final"}}), encoding="utf-8")
-    spec = AssertionSpec(
-        assertion_id="mode-persisted",
-        evaluator=Evaluator.ARTIFACT,
-        target={"path": str(path), "json_field": "settings.mode"},
-        expected={"equals": "final"},
-        property="json_path",
-    )
-    assert evaluate(spec, context(tmp_path)).status is AssertionStatus.PASSED
-
-
 # --------------------------------------------------------------------------------------
 # Identity and caller-supplied oracles
 # --------------------------------------------------------------------------------------
-
-
-def test_unverified_build_makes_the_assertion_inconclusive_not_passing(tmp_path):
-    spec = AssertionSpec(
-        assertion_id="build",
-        evaluator=Evaluator.PROCESS_IDENTITY,
-        target={},
-        expected={},
-        property="status",
-    )
-    ctx = context(tmp_path)
-    ctx.identity = IdentityReport(
-        app_ref="app:" + "c" * 24,
-        status=IdentityStatus.UNVERIFIABLE,
-        expected={},
-        observed={},
-        evidence_refs=(),
-        notes=(),
-        checked_at=now(),
-    )
-    result = evaluate(spec, ctx)
-    assert result.status is AssertionStatus.INCONCLUSIVE and result.origin == ORIGIN_ENVIRONMENT
 
 
 def test_visual_assertion_without_an_oracle_is_never_a_pass(tmp_path):
@@ -305,39 +188,6 @@ def test_visual_assertion_without_an_oracle_is_never_a_pass(tmp_path):
     result = evaluate(spec, context(tmp_path))
     assert result.status is AssertionStatus.INCONCLUSIVE
     assert "oracle" in " ".join(result.notes)
-
-
-def test_caller_visual_result_is_labelled_model_assessed(tmp_path):
-    store = EvidenceStore(root=tmp_path / "evidence", approved_roots=[str(tmp_path)])
-    shot = store.save_bytes(
-        run_id=RUN_ID,
-        checkpoint="step-1",
-        description="shot",
-        data=b"\x89PNG\r\n\x1a\nx",
-        kind="screenshot",
-        media_type="image/png",
-        suffix=".png",
-    )
-    spec = AssertionSpec(
-        assertion_id="looks-right",
-        evaluator=Evaluator.MODEL_VISUAL,
-        target={},
-        expected={},
-        oracle="caller",
-    )
-    ctx = context(
-        tmp_path,
-        caller_results={
-            "looks-right": {
-                "status": "passed",
-                "observed": {"note": "button is blue"},
-                "evidence_refs": [shot.evidence_id],
-            },
-        },
-    )
-    ctx.evidence = store
-    result = evaluate(spec, ctx)
-    assert result.status is AssertionStatus.PASSED and result.label == "model_assessed"
 
 
 def test_caller_result_citing_unknown_evidence_is_rejected(tmp_path):

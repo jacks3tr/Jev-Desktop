@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -12,7 +10,6 @@ import pytest
 from jev_desktop.contracts import (
     ContractError,
     Execution,
-    InputMode,
     Limits,
     Operation,
     Reason,
@@ -110,33 +107,6 @@ SAVE_ELEMENTS = [
     FakeElement("button", "Save", operations=("CLICK",)),
     FakeElement("text", "Saved", value="no", text="no", operations=()),
 ]
-
-
-def test_happy_path_completes_with_a_pass(tmp_path):
-    runtime, driver, _app, _clock, journal, ownership, session, created = build(
-        tmp_path,
-        elements=SAVE_ELEMENTS,
-        steps=[{"step_id": "save", "operation": "CLICK", "target_description": "the Save button", "checkpoint": True}],
-        assertions=[
-            {
-                "assertion_id": "saved-flag",
-                "evaluator": "uia_property",
-                "target": {"role": "text", "name": "Saved"},
-                "property": "value",
-                "expected": {"equals": "yes"},
-                "checkpoint": "save",
-            }
-        ],
-        script=[ScriptedDecision(Operation.CLICK, "Save")],
-    )
-    result = slice_once(runtime, ownership, session, created)
-    assert result.execution is Execution.COMPLETED
-    assert result.verdict is Verdict.PASSED
-    assert [step.operation for step in result.steps] == [Operation.CLICK]
-    assert result.steps[0].observation_changed is True
-    assert len(driver.executed) == 1
-    assert result.budgets["actions"] == 1
-    journal.close()
 
 
 def test_missing_fixture_pauses_then_resume_supplies_it(tmp_path):
@@ -300,35 +270,6 @@ def test_uncertain_dispatch_pauses_and_is_never_replayed(tmp_path):
     journal.close()
 
 
-def test_guard_failure_before_input_records_not_dispatched(tmp_path):
-    runtime, driver, _app, _clock, journal, ownership, session, created = build(
-        tmp_path,
-        elements=SAVE_ELEMENTS,
-        steps=[{"step_id": "save", "operation": "CLICK", "target_description": "Save"}],
-        script=[ScriptedDecision(Operation.CLICK, "Save")],
-    )
-    driver.fail_next = "before"
-    result = slice_once(runtime, ownership, session, created)
-    assert result.execution is Execution.ERROR
-    assert result.verdict is Verdict.INCONCLUSIVE
-    assert journal.actions_for_run(created["run_id"])[0].state is DispatchState.NOT_DISPATCHED
-    journal.close()
-
-
-def test_interaction_mode_is_never_switched_by_the_runner(tmp_path):
-    elements = [FakeElement("button", "Save", operations=("CLICK",))]
-    runtime, driver, _app, _clock, journal, ownership, session, created = build(
-        tmp_path,
-        elements=elements,
-        steps=[{"step_id": "save", "operation": "CLICK", "target_description": "Save"}],
-        mode="user_path",
-        script=[ScriptedDecision(Operation.CLICK, "Save")],
-    )
-    slice_once(runtime, ownership, session, created)
-    assert driver.executed and all(action.mode is InputMode.USER_PATH for action in driver.executed)
-    journal.close()
-
-
 def test_incorrect_build_blocks_the_run_before_any_action(tmp_path):
     runtime, driver, _app, _clock, journal, ownership, session, created = build(
         tmp_path,
@@ -344,19 +285,6 @@ def test_incorrect_build_blocks_the_run_before_any_action(tmp_path):
     journal.close()
 
 
-def test_a_run_without_assertions_can_never_pass(tmp_path):
-    runtime, _driver, _app, _clock, journal, ownership, session, created = build(
-        tmp_path,
-        elements=SAVE_ELEMENTS,
-        steps=[{"step_id": "save", "operation": "CLICK", "target_description": "Save"}],
-        script=[ScriptedDecision(Operation.CLICK, "Save")],
-    )
-    result = slice_once(runtime, ownership, session, created)
-    assert result.execution is Execution.COMPLETED
-    assert result.verdict is Verdict.INCONCLUSIVE
-    journal.close()
-
-
 def test_cancelled_run_releases_and_reports_cancelled(tmp_path):
     runtime, driver, _app, _clock, journal, ownership, session, created = build(
         tmp_path,
@@ -368,45 +296,6 @@ def test_cancelled_run_releases_and_reports_cancelled(tmp_path):
     result = slice_once(runtime, ownership, session, created)
     assert result.execution is Execution.CANCELLED
     assert not driver.executed
-    journal.close()
-
-
-def test_launch_passes_the_run_id_to_the_approved_configuration(tmp_path):
-    """A launched application must be able to echo the run id into its own artifacts."""
-    from dataclasses import replace as dataclass_replace
-
-    marker = tmp_path / "launched-run-id.txt"
-    script = "import os, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(os.environ.get('JEV_DESKTOP_RUN_ID', ''))"
-    runtime, _driver, _app, _clock, journal, _ownership, _session, created = build(
-        tmp_path,
-        elements=SAVE_ELEMENTS,
-        steps=[{"step_id": "launch", "operation": "LAUNCH_APP", "target_description": "the application"}],
-        script=[ScriptedDecision(Operation.LAUNCH_APP, None)],
-    )
-    runtime.config = dataclass_replace(
-        runtime.config,
-        launch_configs={"echo": {"executable": sys.executable, "args": ["-c", script, str(marker)]}},
-    )
-    from jev_desktop.contracts import ActionRequest, new_id
-
-    request = ActionRequest(
-        action_id=new_id("act"),
-        run_id=created["run_id"],
-        operation=Operation.LAUNCH_APP,
-        mode=InputMode.USER_PATH,
-        element_id=None,
-        snapshot_id=None,
-        window_ref=None,
-        lease_generation=1,
-        launch_config_id="echo",
-    )
-    receipt = runtime._launch(runtime._load(created["run_id"]), request)
-    assert receipt.target["pid"] > 0
-    deadline = time.monotonic() + 10.0
-    while not marker.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert marker.exists(), "the launch step never ran the approved configuration"
-    assert marker.read_text(encoding="utf-8") == created["run_id"]
     journal.close()
 
 

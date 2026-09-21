@@ -1,4 +1,4 @@
-"""Support for the three optional real-Notepad acceptance cases."""
+"""Support for the two optional real-Notepad acceptance cases."""
 
 from __future__ import annotations
 

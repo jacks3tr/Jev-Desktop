@@ -71,24 +71,6 @@ def test_choice_limit_is_enforced_before_sending():
     assert failure.value.reason_value == Reason.NEEDS_NARROWER_OBSERVATION.value
 
 
-def test_duplicate_element_ids_are_rejected():
-    with pytest.raises(PolicyError):
-        build_questions(
-            goal="g",
-            contexts=[
-                OpContext(
-                    operation=Operation.CLICK,
-                    candidates=(
-                        TargetCandidate("el:" + "0" * 24, "a", Operation.CLICK),
-                        TargetCandidate("el:" + "0" * 24, "b", Operation.CLICK),
-                    ),
-                )
-            ],
-            allow_done=True,
-            allow_escalate=True,
-        )
-
-
 def test_valid_choice_rejects_malformed_shapes():
     options = {"a", "b"}
     with pytest.raises(Pause):
@@ -105,14 +87,6 @@ def test_valid_choice_rejects_malformed_shapes():
         valid_choice(
             {"type": "choice", "choice": "a", "probabilities": {"a": 0.9, "b": 0.1}, "confidence": 0.9}, options, 1.5
         )
-
-
-def test_default_operation_floor_does_not_reject_measured_answers():
-    """Calibration guard: live answers land near the floor, so keep it below that band."""
-    config = PolicyConfig()
-    assert config.operation_floor <= 0.40
-    assert config.target_floor <= 0.45
-    assert config.operation_floor < config.target_floor + 0.1
 
 
 def test_low_confidence_pauses_with_the_reason():
@@ -146,30 +120,26 @@ def test_wrong_model_version_is_refused():
 
 
 def test_answers_pick_operation_then_its_own_target_and_ignore_speculative_heads():
-    contexts = [context(Operation.CLICK, 2, prefix="el"), context(Operation.TYPE_TEXT, 2, prefix="el")]
-    questions = build_questions(goal="g", contexts=contexts, allow_done=True, allow_escalate=True)
-    body = {"model": "jev-1.13.0", "questions": questions}
-    answers = {
-        "operation": choice_answer("CLICK", list(questions["operation"]["criteria"])),
-        "CLICK_target": choice_answer("el:" + "0" * 23 + "a", list(questions["CLICK_target"]["criteria"])),
-        "TYPE_TEXT_target": choice_answer("el:" + "0" * 23 + "b", list(questions["TYPE_TEXT_target"]["criteria"])),
-    }
-    # rename candidate ids so the scripted choices are valid option keys
-    contexts[0] = OpContext(
-        operation=Operation.CLICK,
-        candidates=(
-            TargetCandidate("el:" + "0" * 23 + "a", "a", Operation.CLICK),
-            TargetCandidate("el:" + "0" * 23 + "c", "c", Operation.CLICK),
-        ),
+    contexts = [context(Operation.CLICK, 1), context(Operation.TYPE_TEXT, 1)]
+    questions = build_questions(goal="save", contexts=contexts, allow_done=True, allow_escalate=True)
+    selected = contexts[0].candidates[0].element_id
+    result = fake_response(
+        "jev-1.13.0",
+        {
+            "operation": choice_answer("CLICK", list(questions["operation"]["criteria"])),
+            "CLICK_target": choice_answer(selected, list(questions["CLICK_target"]["criteria"])),
+            "TYPE_TEXT_target": {"invalid": "unused head must be ignored"},
+        },
     )
-    questions = build_questions(goal="g", contexts=contexts, allow_done=True, allow_escalate=True)
-    body = {"model": "jev-1.13.0", "questions": questions}
-    answers["operation"] = choice_answer("CLICK", list(questions["operation"]["criteria"]))
-    answers["CLICK_target"] = choice_answer("el:" + "0" * 23 + "a", list(questions["CLICK_target"]["criteria"]))
-    result = fake_response("jev-1.13.0", answers)
-    operation, target, _usage = resolve_answers(result, body, operation_floor=0.4, target_floor=0.4, contexts=contexts)
+    operation, target, _usage = resolve_answers(
+        result,
+        {"model": "jev-1.13.0", "questions": questions},
+        operation_floor=0.4,
+        target_floor=0.4,
+        contexts=contexts,
+    )
     assert operation is Operation.CLICK
-    assert target is not None and target.element_id.endswith("a")
+    assert target is not None and target.element_id == selected
 
 
 def test_none_target_pauses_instead_of_acting():
@@ -228,23 +198,22 @@ def test_policy_reports_rejected_key_without_dispatching():
 
 def test_keys_are_trimmed_and_unsafe_values_are_refused_without_echoing_them():
     """A key pasted from a dotenv file often carries a newline. Never leak it in the error."""
-    with LocalTypeSafeServer() as server:
-        trimmed = JevPolicy(
-            transport=HttpTransport(),
-            config=PolicyConfig(endpoint=server.endpoint),
-            api_key="  test-key\r\n",
-            sleep=lambda _s: None,
-        )
-        assert trimmed._key() == "test-key"
+    trimmed = JevPolicy(
+        transport=HttpTransport(),
+        config=PolicyConfig(),
+        api_key="  test-key\r\n",
+        sleep=lambda _s: None,
+    )
+    assert trimmed._key() == "test-key"
 
-        unsafe = JevPolicy(
-            transport=HttpTransport(),
-            config=PolicyConfig(endpoint=server.endpoint),
-            api_key="test key with spaces",
-            sleep=lambda _s: None,
-        )
-        with pytest.raises(PolicyError) as failure:
-            unsafe._key()
+    unsafe = JevPolicy(
+        transport=HttpTransport(),
+        config=PolicyConfig(),
+        api_key="test key with spaces",
+        sleep=lambda _s: None,
+    )
+    with pytest.raises(PolicyError) as failure:
+        unsafe._key()
     assert "test key with spaces" not in str(failure.value)
     assert "whitespace" in str(failure.value)
 

@@ -10,34 +10,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-TEXT_SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".json", ".cfg", ".txt"}
-IGNORED_DIRS = {
-    ".git",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".mypy_cache",
-    "build",
-    "dist",
-    ".venv",
-    "venv",
-    "htmlcov",
-    ".artifacts",
-}
-
-
-def tracked_text_files() -> list[Path]:
-    files: list[Path] = []
-    for path in sorted(ROOT.rglob("*")):
-        if path.is_dir() or any(part in IGNORED_DIRS for part in path.parts):
-            continue
-        if path.suffix in TEXT_SUFFIXES or path.name in {".gitignore", ".gitattributes", ".editorconfig", "CODEOWNERS"}:
-            files.append(path)
-    return files
-
 
 def _markdown_files() -> list[Path]:
-    return [path for path in tracked_text_files() if path.suffix == ".md"]
+    names = subprocess.check_output(["git", "ls-files", "--", "*.md"], cwd=ROOT, text=True).splitlines()
+    return [ROOT / name for name in names if (ROOT / name).is_file()]
 
 
 def _strip_code_fences(text: str) -> str:

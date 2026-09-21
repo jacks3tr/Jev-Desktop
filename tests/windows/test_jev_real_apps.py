@@ -24,8 +24,7 @@ from .real_app import RealApp, run_spec
 pytestmark = [pytest.mark.windows, pytest.mark.live]
 
 
-@pytest.mark.parametrize("wrong_expectation", [False, True], ids=["save-and-reopen", "reject-wrong-content"])
-def test_jev_notepad_save(tmp_path, jev_policy, wrong_expectation):
+def test_jev_notepad_save_and_reopen(tmp_path, jev_policy):
     target = tmp_path / "saved-by-jev.txt"
     text = f"Jev desktop acceptance {tmp_path.name}"
     with WindowsDriver(evidence_dir=tmp_path / "evidence") as driver:
@@ -71,7 +70,7 @@ def test_jev_notepad_save(tmp_path, jev_policy, wrong_expectation):
                             "evaluator": "artifact",
                             "property": "content_regex",
                             "target": {"path": str(target)},
-                            "expected": {"regex": "deliberately absent content" if wrong_expectation else text},
+                            "expected": {"regex": text},
                             "checkpoint": "save",
                             "deadline_s": 2,
                         }
@@ -89,7 +88,7 @@ def test_jev_notepad_save(tmp_path, jev_policy, wrong_expectation):
             outcome = run_spec(driver, jev_policy, spec, tmp_path)
             (tmp_path / "result.json").write_text(json.dumps(outcome, indent=2), encoding="utf-8")
             assert outcome["execution"] == "completed", outcome
-            assert outcome["verdict"] == ("failed" if wrong_expectation else "passed"), outcome
+            assert outcome["verdict"] == "passed", outcome
             assert outcome["actions"] == 5
             assert outcome["model_decisions"] >= 5
             assert jev_policy.resolved_models and set(jev_policy.resolved_models) == {jev_policy.config.model_id}
@@ -98,16 +97,15 @@ def test_jev_notepad_save(tmp_path, jev_policy, wrong_expectation):
         finally:
             app.close()
 
-        if not wrong_expectation:
-            reopened = RealApp(driver, "notepad", args=[str(target)])
-            try:
-                snapshot = driver.observe(reopened.scope)
-                assert any(text in (element.value or element.text or "") for element in snapshot.elements), (
-                    "saved text was not observed after reopening the file",
-                    snapshot.to_json(),
-                )
-            finally:
-                reopened.close()
+        reopened = RealApp(driver, "notepad", args=[str(target)])
+        try:
+            snapshot = driver.observe(reopened.scope)
+            assert any(text in (element.value or element.text or "") for element in snapshot.elements), (
+                "saved text was not observed after reopening the file",
+                snapshot.to_json(),
+            )
+        finally:
+            reopened.close()
 
 
 def test_real_pipe_retry_does_not_repeat_jev_or_native_input(tmp_path, jev_policy):

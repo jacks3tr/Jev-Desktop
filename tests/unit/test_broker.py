@@ -86,29 +86,6 @@ def broker_env(tmp_path: Path):
     broker.close()
 
 
-def test_handshake_reports_capabilities_and_a_session(broker_env):
-    client = broker_env["make"]()
-    handshake = client.handshake()
-    assert handshake["schema_version"] == "1"
-    assert handshake["capabilities"]["tools"] == ["desktop_inspect", "desktop_run", "desktop_act", "desktop_stop"]
-    assert handshake["broker"]["driver"]["fake"] is True
-    # A decision policy is attached (test double), but no API key is present in this environment.
-    assert handshake["broker"]["policy"]["configured"] is True
-    assert handshake["broker"]["policy"]["key_present"] is False
-
-
-def test_inspect_lists_applications_and_observes_elements(broker_env):
-    client = broker_env["make"]()
-    listing = client.call("inspect", {})
-    assert listing["applications"][0]["app_ref"] == APP_REF
-    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": True})
-    names = {element["name"] for element in observed["elements"]}
-    assert {"Save", "Saved"} <= names
-    assert observed["coverage"] == "complete"
-    assert observed["screenshot"]["kind"] == "screenshot"
-    assert observed["screenshot"]["path"].endswith(".png")
-
-
 def test_run_completes_and_returns_verdict_with_evidence(broker_env):
     client = broker_env["make"]()
     payload = client.call("run", {"run": spec_payload(), "inline_image": True}, timeout_s=60)

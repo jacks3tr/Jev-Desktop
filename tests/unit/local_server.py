@@ -1,10 +1,4 @@
-"""A real HTTP server on localhost, standing in for the provider.
-
-The policy tests need canned responses, not canned objects. This runs an actual HTTP server
-on a loopback port, so the tests drive the real `HttpTransport`: real sockets, real headers,
-real status codes, real retries. Nothing here is a fake transport; it is the provider's
-endpoint moved onto the test machine.
-"""
+"""Stub HTTP server for retry, authentication, and transport checks. Does not call Jev."""
 
 from __future__ import annotations
 

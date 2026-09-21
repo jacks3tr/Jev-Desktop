@@ -1,10 +1,4 @@
-"""Doubles for the OS and model boundaries, so engine tests need neither a desktop nor a network.
-
-What lives here: a driver double for the Windows boundary, a policy double that returns
-scripted decisions, and a clock. What does not: anything standing in for the TypeSafe HTTP
-endpoint, which the policy tests reach through a real localhost server instead
-(`tests/unit/local_server.py`).
-"""
+"""Simulated driver and policy for runtime checks. Does not validate desktop operation."""
 
 from __future__ import annotations
 
@@ -55,9 +49,6 @@ class Clock:
 
     def __call__(self) -> float:
         return self.value
-
-    def advance(self, seconds: float) -> None:
-        self.value += seconds
 
     def sleep(self, seconds: float) -> None:
         self.value += max(seconds, 0.0)
@@ -117,10 +108,7 @@ class FakeDriver:
         self.fail_next: str | None = None  # "uncertain" | "before" | "pause:<reason>"
         self.identity_status = IdentityStatus.VERIFIED
         self.identity_checked = 0
-        self.observe_failures = 0
         self.capture_calls = 0
-        self.on_execute: Callable[[Any], None] | None = None
-        self.lease_generation = 1
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -299,8 +287,6 @@ class FakeDriver:
             reason = self.fail_next.split(":", 1)[1]
             self.fail_next = None
             raise Pause(reason, {"injected": True})
-        if self.on_execute is not None:
-            self.on_execute(request)
         self._apply(request, snapshot)
         mechanism = (
             DispatchMechanism.UIA_PATTERN if request.mode is InputMode.SEMANTIC else DispatchMechanism.SEND_INPUT_MOUSE
@@ -329,17 +315,9 @@ class FakeDriver:
                 if saved is not None:
                     saved.value = "yes"
                     saved.text = "yes"
-            elif element.name == "Open dialog":
-                self.app.dialog_open = True
-                self.app.status = "dialog open"
         elif request.operation is Operation.TYPE_TEXT:
             element.value = request.text or ""
             element.text = element.value
-        elif request.operation is Operation.TOGGLE:
-            checked = element.state.get("checked", "off")
-            element.state["checked"] = "on" if checked == "off" else "off"
-        elif request.operation is Operation.SELECT:
-            element.value = request.option_label or element.value
 
     def _element_for(self, request, snapshot: Snapshot | None) -> FakeElement | None:
         if snapshot is None or request.element_id is None:

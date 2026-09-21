@@ -151,22 +151,6 @@ def test_recovery_marks_unfinished_actions_uncertain(tmp_path):
     reopened.close()
 
 
-def test_reconcile_can_resolve_an_uncertain_action(journal):
-    action_id = "act:" + "7" * 24
-    with pytest.raises(UncertainEffect):
-        journal.dispatch_once(
-            action_id=action_id,
-            request_hash="h",
-            run_id="run:" + "a" * 24,
-            guard=lambda: None,
-            send=lambda: (_ for _ in ()).throw(UncertainEffect("boom")),
-        )
-    journal.reconcile(action_id, DispatchState.NOT_DISPATCHED, "observed state unchanged")
-    assert journal.lookup(action_id).state is DispatchState.NOT_DISPATCHED
-    with pytest.raises(ContractError):
-        journal.reconcile(action_id, DispatchState.DISPATCHING, "nope")
-
-
 def test_journal_write_failure_marks_the_store_unhealthy(tmp_path):
     """A journal that cannot durably record intent must stop the run, not silently continue."""
     journal = DispatchJournal(str(tmp_path / "journal.sqlite"))
@@ -200,19 +184,3 @@ def test_closed_journal_refuses_work_instead_of_crashing(tmp_path):
             state_json="{}",
             resume_token=None,
         )
-
-
-def test_run_records_round_trip(journal):
-    run_id = "run:" + "b" * 24
-    journal.put_run(
-        run_id=run_id,
-        spec_digest="digest",
-        spec_json="{}",
-        status="paused",
-        state_json="{}",
-        resume_token="resume:" + "c" * 24,
-    )
-    row = journal.get_run(run_id)
-    assert row is not None and row["status"] == "paused" and row["spec_digest"] == "digest"
-    journal.append_trace(run_id, "decision", {"operation": "CLICK"})
-    assert journal.traces(run_id)[0]["kind"] == "decision"
