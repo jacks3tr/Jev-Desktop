@@ -23,6 +23,18 @@ ELEMENTS = [
 ]
 
 
+def test_config_timeout_load_and_save(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text("{}", encoding="utf-8")
+    config = BrokerConfig.load(path)
+    assert config.policy.timeout_s is None
+    config.save(path)
+    assert BrokerConfig.load(path).policy.timeout_s is None
+    config.policy = PolicyConfig(timeout_s=12.5)
+    config.save(path)
+    assert BrokerConfig.load(path).policy.timeout_s == 12.5
+
+
 def spec_payload(*, goal: str = "regression: save the document") -> dict:
     return {
         "goal": goal,

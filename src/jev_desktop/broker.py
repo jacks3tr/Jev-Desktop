@@ -107,12 +107,13 @@ class BrokerConfig:
             config.secrets = dict(payload.get("secrets", {}))
             config.capture_scale = float(payload.get("capture_scale", config.capture_scale))
             policy_payload = payload.get("policy", {})
+            timeout_s = policy_payload.get("timeout_s", config.policy.timeout_s)
             config.policy = PolicyConfig(
                 model_id=str(policy_payload.get("model_id", config.policy.model_id)),
                 endpoint=str(policy_payload.get("endpoint", config.policy.endpoint)),
                 operation_floor=float(policy_payload.get("operation_floor", config.policy.operation_floor)),
                 target_floor=float(policy_payload.get("target_floor", config.policy.target_floor)),
-                timeout_s=float(policy_payload.get("timeout_s", config.policy.timeout_s)),
+                timeout_s=None if timeout_s is None else float(timeout_s),
                 max_retries=int(policy_payload.get("max_retries", config.policy.max_retries)),
                 api_key_env=str(policy_payload.get("api_key_env", config.policy.api_key_env)),
             )
