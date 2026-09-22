@@ -401,8 +401,8 @@ class UiaWorker:
 
     def children(self, element: Any) -> Iterable[Any]:
         """Fetch cached siblings lazily so a wide provider cannot allocate an entire row set."""
-        walker = self.automation.ControlViewWalker
         try:
+            walker = self.automation.ControlViewWalker
             child = walker.GetFirstChildElementBuildCache(element, self._cache)
             while child:
                 yield child
@@ -561,6 +561,10 @@ def discover_windows(
             continue
         if not win32.user32.IsWindowVisible(hwnd):
             continue
+        try:
+            rect = win32.window_rect(hwnd)
+        except DriverError:  # the window closed during enumeration
+            continue
         owner = win32.owner_window(hwnd)
         if owner and win32.window_process_id(owner) not in pids:
             owner = 0
@@ -584,7 +588,7 @@ def discover_windows(
                     focused=win32.foreground_window() == hwnd,
                     visible=True,
                     enabled=bool(win32.user32.IsWindowEnabled(hwnd)),
-                    rect=win32.window_rect(hwnd),
+                    rect=rect,
                     dpi=win32.dpi_for_window(hwnd),
                     scope="dialog" if owner else "scoped",
                 ),
@@ -655,6 +659,12 @@ def observe(
         traversal = [0]
         rows_dropped: list[int] = []
         for window_ref, hwnd in ordered_windows:
+            try:
+                rect = win32.window_rect(hwnd)
+            except DriverError:
+                truncation.append(f"window {window_ref} closed during observation")
+                coverage = Coverage.PARTIAL
+                continue
             owner_hwnd = win32.owner_window(hwnd)
             window_infos.append(
                 WindowInfo(
@@ -668,7 +678,7 @@ def observe(
                     focused=foreground == hwnd,
                     visible=bool(win32.user32.IsWindowVisible(hwnd)),
                     enabled=bool(win32.user32.IsWindowEnabled(hwnd)),
-                    rect=win32.window_rect(hwnd),
+                    rect=rect,
                     dpi=win32.dpi_for_window(hwnd),
                     scope="dialog" if owner_hwnd else "scoped",
                 )
@@ -732,6 +742,8 @@ def observe(
                 content_seen=content_seen,
                 traversal=traversal,
             )
+        if not window_infos:
+            raise DriverError("every window in scope closed during observation")
 
         # Actionable elements are all in `elements` by now; content fills what is left, so a
         # dialog's own buttons are never crowded out by a file list that happens to sit earlier
@@ -867,6 +879,11 @@ def _walk(
             element = next(iterator)
         except StopIteration:
             stack.pop()
+            continue
+        except DriverError:
+            # An element vanished mid-walk (UIA_E_ELEMENTNOTAVAILABLE): drop only its subtree.
+            stack.pop()
+            truncation.append("a subtree was not observed because its elements became unavailable")
             continue
         traversal[0] += 1
         role = _control_type(element)

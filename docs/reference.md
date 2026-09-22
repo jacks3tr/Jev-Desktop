@@ -19,8 +19,11 @@ SQLite journal. Keep all local records out of the public repository.
 ## Goal handoff
 
 `desktop_run(task=...)` keeps the observation and action loop inside the broker. Provide a
-`goal`, `app_ref`, explicit `window_refs`, optional named `texts`, and allowed `hotkeys`.
-The CLI accepts the same object with `run --task file.json`. See the
+`goal`, `app_ref`, explicit `window_refs`, optional named `texts` and `secret_texts`, and
+allowed `hotkeys`. `texts` values are sent to the TypeSafe API with the observation.
+`secret_texts` values are typed like `texts`, but Jev sees only their names and lengths, and
+they are redacted from observations sent to the model. Together they hold at most 16 uniquely
+named strings. Both are kept in the local journal with the run. The CLI accepts the same object with `run --task file.json`. See the
 [Calculator](../examples/calculator.json) and [Chrome](../examples/browser.json) tasks.
 
 Defaults are 20 actions, 40 decisions, and 60 seconds; `timeout_seconds` may not exceed 120.
@@ -155,7 +158,7 @@ and binds it to the control the policy chose, then verifies the control reports 
 | `target` | What to look at. Shape depends on the evaluator. |
 | `property` | Which value to read. Dotted paths work: `value`, `name`, `text`, `enabled`, `state.checked`, `rect.width`, or `count`. |
 | `expected` | A comparator for value checks. Presence, absence, and run-scoped checks do not require one. |
-| `checkpoint` | A step id, `any`, `run_start`, or `run_end`. `any` is evaluated after every action. |
+| `checkpoint` | A step id, `any`, `run_start`, or `run_end`. `any` is evaluated after every action and keeps its worst result. |
 | `required` | Defaults to true. Only required assertions take part in the verdict. |
 | `oracle` | Required for `model_visual`: `caller` or `provider`. |
 | `deadline_s` | Time allowed for the assertion to pass against fresh observations. |
@@ -199,6 +202,7 @@ Each result includes its label to identify how the assertion was evaluated.
 | `no_progress_retries` | 2 | 5 |
 
 The broker rejects specification limits above local ceilings when it creates the run.
+Scope `max_elements`, `max_depth`, and `text_limit` may not exceed 500, 32, and 8000.
 
 ## Resume inputs
 
@@ -212,9 +216,9 @@ kinds of input:
  "verifier_results": {"state-file": {"status": "failed", "observed": {"reason": "stale run id"}}}}
 ```
 
-A fixture name that is not declared in the specification is rejected. A visual result for an
-assertion that did not select a visual oracle is rejected. Acceptance criteria, limits, and
-failed steps cannot be touched.
+A fixture name that is not declared in the specification, or a value that is not a string, is
+rejected. A visual result for an assertion that did not select a visual oracle is rejected.
+Acceptance criteria, limits, and failed steps cannot be touched.
 
 ## Execution, verdict, reason
 
@@ -238,13 +242,15 @@ verdict:   passed | failed | inconclusive
 | `user_takeover` | A person or another process owns the desktop. Stop and ask. |
 | `uncertain_effect` | Input may have landed without a receipt. Remains paused; never assume and never replay. |
 | `incorrect_build` | The running build is not the expected one. Fix the build first. |
-| `budget_exhausted` | Check the exhausted limit. A new slice can extend a slice deadline, but cannot reset the frozen run's total budgets. |
+| `budget_exhausted` | Check `budget`. A new slice can extend `slice_deadline`, but cannot reset the frozen run's total budgets, such as `run_deadline`. |
 | `step_unresolved` | No progress after bounded retries, or the model asked to finish with required steps left. |
 
 ## Specifications that get rejected
 
 Duplicate step or assertion ids. An assertion checkpoint that names no step. A `depends_on`
-that names no step. A visual assertion without an oracle. Limits above the ceiling. More than
+that names no earlier step. A `TYPE_TEXT` or `SELECT` step without a `fixture_reference`. A
+non-numeric `gte`, `lte`, `bytes`, or `after`, an `in` that is not a list, or an invalid regular
+expression. A visual assertion without an oracle. Limits above the ceiling. More than
 254 candidate targets for one operation, which the policy reports as
 `needs_narrower_observation` instead of silently dropping options.
 
@@ -254,7 +260,8 @@ Create a run with `desktop_run(start_only=true)` to use directed actions without
 The CLI equivalent is `run --spec test.json --start-only`. Inspect it using `run_id` and `resume_token` so
 screenshots belong to that run. Every action supplies the current `snapshot_id`, `step_id`,
 `window_ref`, operation, mode, and resume token. It must match the next immutable step.
-The broker issues the action ID; callers use transport request IDs for retries.
+The broker issues the action ID; callers use transport request IDs for retries. If an action
+sends input and then pauses, the pause detail carries the new `resume_token`.
 
 For screenshot-based `CLICK`, `TOGGLE`, or `SCROLL`, omit `element_id` and supply `point`:
 
@@ -287,7 +294,9 @@ argument. Secret fixture values stay in memory; screenshots are withheld when th
 MCP and CLI clients connect to a local broker through a named pipe. The broker owns sessions,
 run state, evidence, and the desktop lease. A separate worker performs UI Automation and
 native input. The runtime records dispatch intent before input and never automatically
-replays an action whose outcome is uncertain. Resume tokens rotate after execution.
+replays an action whose outcome is uncertain. Resume tokens rotate after execution. Window
+references do not survive a broker restart; a run scoped to them pauses with `stale_observation`
+and needs a new run.
 
 ## Troubleshooting
 

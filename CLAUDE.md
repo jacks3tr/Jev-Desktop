@@ -58,8 +58,9 @@ MCP client / CLI  --(named pipe, versioned envelopes)-->  Broker  --(multiproces
 - **`broker.py`** (`Broker`) is the single per-user-session server: one named pipe
   (`ipc.pipe_name`), one `Ownership` (desktop lease/session authorization), one
   `DispatchJournal`, one driver instance. It dispatches `hello/bye/inspect/run/act/stop/
-  status/evidence/health/shutdown` envelopes, and idempotently caches `run`/`act` responses by
-  request hash so a retried client request can't double-dispatch.
+  status/evidence/health/shutdown` envelopes. There is no transport-level response cache:
+  double dispatch is prevented per action by `DispatchJournal.dispatch_once`, and a client that
+  loses a response must inspect or query status rather than resend.
 - **`drivers/windows/`** does the actual UI Automation/COM work in a **separate child process**
   (`worker.py`, spawned via `multiprocessing`) so native references never cross into the broker
   process; `win32.py`/`uia.py`/`input.py`/`capture.py`/`identity.py` are the driver internals

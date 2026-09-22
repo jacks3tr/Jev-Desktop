@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from jev_desktop.contracts import (
@@ -184,3 +186,28 @@ def test_closed_journal_refuses_work_instead_of_crashing(tmp_path):
             state_json="{}",
             resume_token=None,
         )
+
+
+def test_busy_journal_surfaces_the_original_error_and_turns_unhealthy(tmp_path):
+    """A failed BEGIN has no transaction to roll back; that must not mask why it failed."""
+    path = str(tmp_path / "journal.sqlite")
+    journal = DispatchJournal(path)
+    writer = sqlite3.connect(path, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")
+    journal._db.execute("PRAGMA busy_timeout=50")
+    sends = []
+    try:
+        with pytest.raises(JournalUnhealthy, match="locked"):
+            journal.dispatch_once(
+                action_id="act:" + "9" * 24,
+                request_hash="h",
+                run_id="run:" + "a" * 24,
+                guard=lambda: None,
+                send=lambda: sends.append(1),
+            )
+        assert not journal.healthy
+        assert not sends
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+        journal.close()

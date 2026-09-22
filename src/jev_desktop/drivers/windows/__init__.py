@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _winapi
 import multiprocessing
+import os
 import sys
 import threading
 import time
@@ -13,6 +14,37 @@ from typing import Any
 
 from ...contracts import ContractError, DriverError, EmergencyStop, Pause, Reason, UncertainEffect
 from .worker import serve
+
+_VENV_LAUNCHER = "__PYVENV_LAUNCHER__"
+
+
+def _start_worker_process(process: Any) -> None:
+    """Start the worker so that the tracked process is the interpreter running it.
+
+    A venv's Scripts\\pythonw.exe is a redirector that runs the base interpreter as its own
+    child: tracking it would leave the real worker an untracked grandchild, so terminate,
+    join, lease duplication, and the reported pid would all target the redirector. Start the
+    base pythonw.exe directly and name the venv it stands for, as multiprocessing itself does
+    for sys.executable (bpo-35797).
+    """
+    venv = Path(sys.executable).with_name("pythonw.exe")
+    base = Path(getattr(sys, "_base_executable", sys.executable)).with_name("pythonw.exe")
+    if not base.is_file():
+        raise DriverError("pythonw.exe is required to start the native worker without a console")
+    multiprocessing.set_executable(str(base))
+    if os.path.normcase(venv) == os.path.normcase(base):
+        process.start()
+        return
+    # CreateProcess inherits this environment; restore it as soon as the child exists.
+    previous = os.environ.get(_VENV_LAUNCHER)
+    os.environ[_VENV_LAUNCHER] = str(venv)
+    try:
+        process.start()
+    finally:
+        if previous is None:
+            os.environ.pop(_VENV_LAUNCHER, None)
+        else:
+            os.environ[_VENV_LAUNCHER] = previous
 
 
 class WindowsDriver:
@@ -36,17 +68,14 @@ class WindowsDriver:
                 if not self._process.is_alive():
                     raise DriverError("native worker stopped; restart the broker and rebind the application")
                 return
-            executable = Path(sys.executable).with_name("pythonw.exe")
-            if not executable.is_file():
-                raise DriverError("pythonw.exe is required to start the native worker without a console")
-            multiprocessing.set_executable(str(executable))
             context = multiprocessing.get_context("spawn")
             parent, child = context.Pipe()
-            self._process = context.Process(
+            process = context.Process(
                 target=serve, args=(child, self.evidence_dir, self._pending_inputs, self._pending_count), daemon=True
             )
+            _start_worker_process(process)
+            self._process = process
             self._connection = parent
-            self._process.start()
             child.close()
         self._call("start")
 

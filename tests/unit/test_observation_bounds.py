@@ -73,6 +73,43 @@ def test_wide_observation_releases_discarded_handles_and_tracks_focus(monkeypatc
     assert any(e.name == "1" and e.visible for e in second.elements)
 
 
+def test_scope_bounds_have_local_ceilings():
+    import pytest
+
+    from jev_desktop.contracts import SCOPE_LIMITS, ContractError, ScopeSpec
+
+    app_ref = "app:" + "a" * 24
+    assert ScopeSpec.from_json({"app_ref": app_ref, **SCOPE_LIMITS}).max_elements == SCOPE_LIMITS["max_elements"]
+    for key, ceiling in SCOPE_LIMITS.items():
+        with pytest.raises(ContractError):
+            ScopeSpec.from_json({"app_ref": app_ref, key: ceiling + 1})
+
+
+def test_scroll_notches_are_bounded_integers():
+    import pytest
+
+    from jev_desktop.contracts import ContractError, _scroll
+
+    assert _scroll({"notches": -3}) == {"notches": -3}
+    for bad in ({"notches": 51}, {"amount": -51}, {"notches": 1.5}, {"notches": True}):
+        with pytest.raises(ContractError):
+            _scroll(bad)
+
+
+def test_task_text_names_must_be_unique_across_plain_and_secret_inputs():
+    import pytest
+
+    from jev_desktop.broker import Broker
+    from jev_desktop.contracts import ContractError
+
+    task = {"goal": "g", "texts": {"password": "a"}, "secret_texts": {"password": "b"}, "window_refs": ["w"]}
+    with pytest.raises(ContractError, match="uniquely named"):
+        Broker._run_task(SimpleNamespace(), None, {"task": task})
+    too_many = {"texts": {f"t{i}": "x" for i in range(9)}, "secret_texts": {f"s{i}": "x" for i in range(8)}}
+    with pytest.raises(ContractError, match="at most 16"):
+        Broker._run_task(SimpleNamespace(), None, {"task": {**task, **too_many}})
+
+
 def test_owned_dialog_scope_excludes_unrelated_windows():
     from jev_desktop.contracts import ScopeSpec
     from jev_desktop.drivers.windows.native import NativeWindowsDriver

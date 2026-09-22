@@ -25,7 +25,7 @@ For an interactive drive, use the documented production entry point in a dedicat
 python -m jev_desktop.transports.cli broker
 ```
 
-This uses the default per-logon pipe and local configuration. First establish that no other broker/agent owns that session; never replace or terminate an existing instance. Stop a broker you launched with Ctrl+C in its owning terminal. The CLI's `--pipe` / `JEV_DESKTOP_PIPE` controls clients only: the production broker's `serve_forever` uses the default pipe. Use the smoke helper for isolated discovery, not an assumed server override.
+This uses the default per-logon pipe and local configuration. First establish that no other broker/agent owns that session; never replace or terminate an existing instance. Stop a broker you launched with Ctrl+C in its owning terminal. `JEV_DESKTOP_PIPE` also selects the pipe an autostarted broker serves on. Use the smoke helper for isolated discovery.
 
 Storage and pipes can be isolated; keyboard, mouse, foreground window, ownership mutex, and emergency stop are session-wide. Never run input drives concurrently or while the user is interacting. Use disposable application windows; the smoke drive can read discovery without taking input ownership.
 

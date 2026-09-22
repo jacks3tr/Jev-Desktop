@@ -294,12 +294,22 @@ def _require_bool(value: Any, what: str) -> bool:
     return value
 
 
-def _require_int(value: Any, what: str, *, minimum: int | None = None) -> int:
+def _require_int(value: Any, what: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ContractError(f"{what} must be an integer")
     if minimum is not None and value < minimum:
         raise ContractError(f"{what} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ContractError(f"{what} must be <= {maximum}")
     return value
+
+
+def _scroll(value: Any) -> dict[str, Any]:
+    scroll = dict(_require_mapping(value, "action.scroll"))
+    for key in ("notches", "amount"):
+        if key in scroll:
+            _require_int(scroll[key], f"action.scroll.{key}", minimum=-50, maximum=50)
+    return scroll
 
 
 def _require_number(value: Any, what: str) -> float:
@@ -625,6 +635,10 @@ class Snapshot:
         raise ContractError(f"element {element_id} is not part of snapshot {self.snapshot_id}")
 
 
+# Local ceilings on one observation; callers may narrow them but never exceed them.
+SCOPE_LIMITS: dict[str, int] = {"max_elements": 500, "max_depth": 32, "text_limit": 8000}
+
+
 @dataclass(frozen=True)
 class ScopeSpec:
     app_ref: str
@@ -656,9 +670,18 @@ class ScopeSpec:
                 validate_id("win", ref) for ref in _require_str_list(data.get("window_refs", []), "scope.window_refs")
             ),
             include_dialogs=_require_bool(data.get("include_dialogs", True), "scope.include_dialogs"),
-            max_elements=_require_int(data.get("max_elements", 120), "scope.max_elements", minimum=1),
-            max_depth=_require_int(data.get("max_depth", 12), "scope.max_depth", minimum=1),
-            text_limit=_require_int(data.get("text_limit", 4000), "scope.text_limit", minimum=0),
+            max_elements=_require_int(
+                data.get("max_elements", 120),
+                "scope.max_elements",
+                minimum=1,
+                maximum=SCOPE_LIMITS["max_elements"],
+            ),
+            max_depth=_require_int(
+                data.get("max_depth", 12), "scope.max_depth", minimum=1, maximum=SCOPE_LIMITS["max_depth"]
+            ),
+            text_limit=_require_int(
+                data.get("text_limit", 4000), "scope.text_limit", minimum=0, maximum=SCOPE_LIMITS["text_limit"]
+            ),
             include_invisible=_require_bool(data.get("include_invisible", False), "scope.include_invisible"),
         )
 
@@ -945,7 +968,7 @@ class ActionRequest:
             replace_existing=_require_bool(data.get("replace_existing", True), "action.replace_existing"),
             option_label=_opt_str(data.get("option_label"), "action.option_label"),
             hotkey=tuple(_require_str_list(data.get("hotkey", []), "action.hotkey")),
-            scroll=dict(_require_mapping(data.get("scroll", {}), "action.scroll")),
+            scroll=_scroll(data.get("scroll", {})),
             launch_config_id=_opt_str(data.get("launch_config_id"), "action.launch_config_id"),
             deadline_s=_require_number(data.get("deadline_s", 10.0), "action.deadline_s"),
             request_hash=_require_str(data.get("request_hash", ""), "action.request_hash"),

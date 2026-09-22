@@ -8,14 +8,19 @@ from pathlib import Path
 import pytest
 
 from jev_desktop.contracts import (
+    ActionRequest,
     ContractError,
+    Coverage,
     Execution,
+    InputMode,
     Limits,
     Operation,
+    Pause,
     Reason,
     RunResult,
     RunSpec,
     Verdict,
+    new_id,
 )
 from jev_desktop.evidence import EvidenceStore
 from jev_desktop.journal import DispatchJournal, DispatchState
@@ -535,3 +540,297 @@ def test_task_selects_field_then_value_without_cartesian_candidates(tmp_path):
     assert len(driver.executed) == 1
     assert all(len(context.candidates) <= 16 for call in runtime.policy.calls for context in call["contexts"])
     journal.close()
+
+
+def test_task_secret_text_is_typed_but_never_sent_to_the_model(tmp_path):
+    secret = "correct-horse-battery"
+    runtime, _driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("edit", "User", editable=True, operations=("TYPE_TEXT",)),
+            FakeElement("edit", "Password", editable=True, operations=("TYPE_TEXT",)),
+        ],
+        steps=[],
+        purpose="task",
+        fixtures={"text:user": "ada", "secret:password": secret},
+        script=[
+            ScriptedDecision(Operation.TYPE_TEXT, "Password"),
+            ScriptedDecision(Operation.TYPE_TEXT),
+            ScriptedDecision(Operation.DONE),
+        ],
+    )
+    from dataclasses import replace
+
+    from jev_desktop.contracts import canonical_json
+
+    decide = runtime.policy.decide
+
+    def select_secret(**kwargs):
+        decision = decide(**kwargs)
+        if decision.operation is Operation.TYPE_TEXT and decision.target is None:
+            target = next(
+                c for group in kwargs["contexts"] for c in group.candidates if c.fixture_ref == "secret:password"
+            )
+            return replace(decision, target=target)
+        return decision
+
+    runtime.policy.decide = select_secret
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert app.find("Password").value == secret
+    calls = runtime.policy.calls
+    assert calls[0]["state"]["supplied_text"] == {"user": "ada"}
+    assert calls[0]["state"]["secret_text"] == {"password": f"withheld, {len(secret)} characters"}
+    for call in calls:
+        sent = canonical_json({"state": call["state"], "contexts": [c.to_json() for c in call["contexts"]]})
+        assert secret not in sent
+    journal.close()
+
+
+def fresh_save_elements() -> list[FakeElement]:
+    # The fake driver mutates elements it acts on, so each test needs its own copies.
+    return [
+        FakeElement("button", "Save", operations=("CLICK",)),
+        FakeElement("text", "Saved", value="no", text="no", operations=()),
+    ]
+
+
+def _saved_check(checkpoint: str = "run_start") -> dict:
+    return {
+        "assertion_id": "saved-flag",
+        "evaluator": "uia_property",
+        "target": {"role": "text", "name": "Saved"},
+        "property": "value",
+        "expected": {"equals": "yes"},
+        "checkpoint": checkpoint,
+    }
+
+
+def _click_save(runtime, driver, app, created) -> ActionRequest:
+    snapshot = driver.observe(runtime._scope(runtime._state[created["run_id"]]))
+    element = next(item for item in snapshot.elements if item.name == "Save")
+    return ActionRequest(
+        action_id=new_id("act"),
+        run_id=created["run_id"],
+        operation=Operation.CLICK,
+        mode=InputMode.USER_PATH,
+        element_id=element.element_id,
+        snapshot_id=snapshot.snapshot_id,
+        window_ref=app.window_ref,
+        lease_generation=0,
+        step_id="save",
+    )
+
+
+SAVE_STEP = [{"step_id": "save", "operation": "CLICK", "target_description": "Save"}]
+
+
+def test_restart_pauses_instead_of_widening_explicit_window_scope(tmp_path):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=SAVE_STEP,
+        limits={**Limits.defaults().to_json(), "slice_seconds": 0.5},
+        script=[ScriptedDecision(Operation.WAIT), ScriptedDecision(Operation.CLICK, "Save")],
+    )
+    first = slice_once(runtime, ownership, session, created, seconds=None)
+    assert first.reason == Reason.BUDGET_EXHAUSTED.value
+    driver.bind_process = lambda pid, creation_time: APP_REF  # a driver that can rebind after restart
+    runtime._state.clear()  # simulate a broker restart: state reloads from the journal
+    second = slice_once(runtime, ownership, session, created, resume_token=first.resume_token)
+    assert second.execution is Execution.PAUSED and second.reason == Reason.STALE_OBSERVATION.value
+    assert "bound_app_ref" not in runtime._state[created["run_id"]].summary
+    assert not driver.executed
+    journal.close()
+
+
+@pytest.mark.parametrize("boundary", ["unsupported", "visual"])
+def test_visual_and_unsupported_pauses_keep_a_proven_failure(tmp_path, monkeypatch, boundary):
+    from dataclasses import replace
+
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=[{**SAVE_STEP[0], "operation": "TOGGLE" if boundary == "unsupported" else "CLICK"}],
+        assertions=[{**_saved_check(), "deadline_s": 0}],
+        script=[ScriptedDecision(Operation.CLICK, "Save")],
+    )
+    if boundary == "unsupported":
+        observe = driver.observe
+        monkeypatch.setattr(driver, "observe", lambda scope: replace(observe(scope), coverage=Coverage.PARTIAL))
+    else:
+        driver.fail_next = "pause:needs_visual_assistance"
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.PAUSED and result.reason == Reason.NEEDS_VISUAL_ASSISTANCE.value
+    assert result.verdict is Verdict.FAILED
+    assert runtime._state[created["run_id"]].status == "paused"
+    journal.close()
+
+
+def test_visual_boundary_honours_cancellation(tmp_path):
+    runtime, driver, _app, _clock, journal, ownership, _session, created = build(
+        tmp_path, elements=fresh_save_elements(), steps=SAVE_STEP
+    )
+    state = runtime._state[created["run_id"]]
+    ownership.request_cancel(created["run_id"], "user pressed stop")
+    result = runtime._visual_boundary(state, driver.observe(state.spec.scope), None)
+    assert result.execution is Execution.CANCELLED
+    journal.close()
+
+
+def test_every_action_assertion_keeps_its_worst_result(tmp_path):
+    from jev_desktop.contracts import AssertionResult, AssertionStatus, Evaluator
+
+    runtime, _driver, _app, _clock, journal, _ownership, _session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=SAVE_STEP,
+        assertions=[_saved_check("any"), {**_saved_check("save"), "assertion_id": "at-save"}],
+    )
+    state = runtime._state[created["run_id"]]
+
+    def merge(assertion_id: str, status: AssertionStatus) -> AssertionStatus:
+        result = AssertionResult(assertion_id, status, Evaluator.UIA_PROPERTY, "application", {}, {}, "save", 0.0)
+        runtime._merge_assertion(state, result)
+        return next(item.status for item in state.assertions if item.assertion_id == assertion_id)
+
+    assert merge("saved-flag", AssertionStatus.PASSED) is AssertionStatus.PASSED
+    assert merge("saved-flag", AssertionStatus.INCONCLUSIVE) is AssertionStatus.INCONCLUSIVE
+    assert merge("saved-flag", AssertionStatus.PASSED) is AssertionStatus.INCONCLUSIVE
+    assert merge("saved-flag", AssertionStatus.FAILED) is AssertionStatus.FAILED
+    assert merge("at-save", AssertionStatus.PASSED) is AssertionStatus.PASSED
+    assert merge("at-save", AssertionStatus.INCONCLUSIVE) is AssertionStatus.PASSED
+    journal.close()
+
+
+def test_resume_values_are_validated_at_the_edge():
+    with pytest.raises(ContractError):
+        ResumeInputs(fixtures={"name_value": None})
+    with pytest.raises(ContractError):
+        ResumeInputs(verifier_results={"check": "passed"})
+
+
+def test_rejected_resume_records_nothing(tmp_path):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path, elements=fresh_save_elements(), steps=SAVE_STEP, fixtures={"name_value": None}
+    )
+    inputs = ResumeInputs(fixtures={"name_value": "Ada"}, verifier_results={"unknown": {}})
+    with pytest.raises(ContractError):
+        slice_once(runtime, ownership, session, created, inputs=inputs)
+    state = runtime._state[created["run_id"]]
+    assert "fixture_fingerprints" not in state.summary and not state.supplied_fixtures
+    assert not driver.executed
+    journal.close()
+
+
+@pytest.mark.parametrize(("deadline", "budget"), [(0.5, "run_deadline"), (600.0, "slice_deadline")])
+def test_deadline_pause_names_the_expired_deadline(tmp_path, deadline, budget):
+    runtime, _driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=SAVE_STEP,
+        limits={**Limits.defaults().to_json(), "deadline_seconds": deadline, "slice_seconds": 0.5},
+        script=[ScriptedDecision(Operation.WAIT)],
+    )
+    result = slice_once(runtime, ownership, session, created, seconds=None)
+    assert result.reason == Reason.BUDGET_EXHAUSTED.value and result.detail["budget"] == budget
+    journal.close()
+
+
+def test_act_rotates_the_token_when_it_pauses_after_input(tmp_path):
+    runtime, driver, app, _clock, journal, _ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=SAVE_STEP,
+        assertions=[
+            {"assertion_id": "looks-right", "evaluator": "model_visual", "oracle": "caller", "checkpoint": "save"}
+        ],
+    )
+    request = _click_save(runtime, driver, app, created)
+    act = {"run_id": created["run_id"], "session_id": session.session_id, "request": request}
+    with pytest.raises(Pause) as paused:
+        runtime.act(resume_token=created["resume_token"], **act)
+    assert paused.value.reason is Reason.NEEDS_VISUAL_ASSISTANCE and len(driver.executed) == 1
+    token = paused.value.detail["resume_token"]
+    assert token != created["resume_token"] and token == runtime._state[created["run_id"]].resume_token
+    with pytest.raises(ContractError, match="resume token"):
+        runtime.act(resume_token=created["resume_token"], **act)
+    journal.close()
+
+
+def test_act_evaluates_run_start_assertions_before_input(tmp_path):
+    runtime, driver, app, _clock, journal, _ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=SAVE_STEP,
+        assertions=[{**_saved_check(), "expected": {"equals": "no"}}],
+    )
+    runtime.act(
+        run_id=created["run_id"],
+        session_id=session.session_id,
+        resume_token=created["resume_token"],
+        request=_click_save(runtime, driver, app, created),
+    )
+    results = runtime._state[created["run_id"]].assertions
+    assert [(item.checkpoint, item.status.value) for item in results] == [("run_start", "passed")]
+    assert len(driver.executed) == 1
+    journal.close()
+
+
+def test_stale_retries_reset_after_progress(tmp_path):
+    elements = [FakeElement("edit", "Name", value="", editable=True, operations=("TYPE_TEXT",)), *fresh_save_elements()]
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=elements,
+        steps=[
+            *SAVE_STEP,
+            {"step_id": "name", "operation": "TYPE_TEXT", "target_description": "Name", "fixture_reference": "name"},
+        ],
+        fixtures={"name": "Ada"},
+        limits={**Limits.defaults().to_json(), "stale_retries": 1},
+        script=[
+            ScriptedDecision(Operation.CLICK, "Save"),
+            ScriptedDecision(Operation.CLICK, "Save"),
+            ScriptedDecision(Operation.TYPE_TEXT, "Name"),
+            ScriptedDecision(Operation.TYPE_TEXT, "Name"),
+        ],
+    )
+    execute = driver.execute
+    attempts = []
+
+    def stale_before_each_step(request, guard, snapshot):
+        attempts.append(request)
+        if len(attempts) in {1, 3}:
+            raise Pause(Reason.STALE_OBSERVATION, {"injected": True})
+        return execute(request, guard, snapshot)
+
+    driver.execute = stale_before_each_step
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert app.find("Name").value == "Ada"
+    journal.close()
+
+
+ARTIFACT = {"evaluator": "artifact", "target": {"path": "state.json"}}
+
+
+@pytest.mark.parametrize(
+    ("steps", "assertion"),
+    [
+        (SAVE_STEP, {"expected": {"gte": "3"}}),
+        (SAVE_STEP, {"expected": {"in": 5}}),
+        (SAVE_STEP, {"target": {"name_regex": "("}}),
+        (SAVE_STEP, {**ARTIFACT, "property": "size_at_least", "expected": {"bytes": "x"}}),
+        (SAVE_STEP, {**ARTIFACT, "property": "mtime_after", "expected": {"after": "x"}}),
+        ([{"step_id": "type", "operation": "TYPE_TEXT", "target_description": "Name"}], None),
+        ([{**SAVE_STEP[0], "depends_on": ["later"]}, {**SAVE_STEP[0], "step_id": "later"}], None),
+    ],
+)
+def test_malformed_specs_are_rejected_before_any_input(tmp_path, steps, assertion):
+    with pytest.raises(ContractError):
+        build(
+            tmp_path,
+            elements=fresh_save_elements(),
+            steps=steps,
+            assertions=[{**_saved_check("save"), **assertion}] if assertion else None,
+        )

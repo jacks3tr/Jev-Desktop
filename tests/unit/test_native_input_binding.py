@@ -88,3 +88,39 @@ def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     with pytest.raises(UncertainEffect):
         native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert sent == ["Read-only", "Read-only"]
+
+    # Multi-line Win32 edits read typed "\n" back as CRLF.
+    request.text = "first\nsecond\rthird"
+    monkeypatch.setattr(native_input, "_live_value", lambda *_: "first\r\nsecond\r\nthird")
+    receipt = native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+    assert "observed value differs from dispatched text" not in receipt.notes
+
+
+def _semantic_scroll(monkeypatch, scroll):
+    calls = []
+    pattern = NS(Scroll=lambda horizontal, vertical: calls.append((horizontal, vertical)))
+    constants = NS(ScrollAmount_SmallIncrement="inc", ScrollAmount_SmallDecrement="dec", ScrollAmount_NoAmount="-")
+    monkeypatch.setattr(native_input, "_pattern", lambda *_: pattern)
+    monkeypatch.setattr(uia, "uia_module", lambda: constants)
+    request = NS(operation=Operation.SCROLL, scroll=scroll)
+    assert native_input.invoke_semantic(NS(element=object()), request)[0] == "scroll"
+    return calls
+
+
+def test_semantic_scroll_follows_the_wheel_convention_and_magnitude(monkeypatch):
+    assert _semantic_scroll(monkeypatch, {"notches": 3}) == [("-", "dec")] * 3
+    assert _semantic_scroll(monkeypatch, {"notches": -2}) == [("-", "inc")] * 2
+    assert _semantic_scroll(monkeypatch, {"notches": 2, "horizontal": True}) == [("inc", "-")] * 2
+    assert _semantic_scroll(monkeypatch, {"notches": -1, "horizontal": True}) == [("dec", "-")]
+
+
+def test_failed_activation_after_the_boundary_is_uncertain(monkeypatch):
+    user32 = native_input.win32.user32
+    monkeypatch.setattr(user32, "IsWindow", lambda _hwnd: True)
+    monkeypatch.setattr(user32, "IsWindowEnabled", lambda _hwnd: True)
+    monkeypatch.setattr(native_input.win32, "activate_window", lambda _hwnd: False)
+    driver = NS(registry=NS(windows={"window": NS(hwnd=5)}))
+    guarded = []
+    with pytest.raises(UncertainEffect):
+        native_input._focus_window(driver, NS(window_ref="window"), lambda: guarded.append(True), 0.0)
+    assert guarded == [True]

@@ -17,6 +17,7 @@ Exactly-once GUI effects are NOT claimed: only single-use dispatch identities.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -39,11 +40,8 @@ from .contracts import (
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value BLOB NOT NULL);
-CREATE TABLE IF NOT EXISTS requests (
-    request_id TEXT PRIMARY KEY,
-    request_hash TEXT NOT NULL,
-    response TEXT
-);
+-- Former transport response cache: it could never serve a retry and kept inline images forever.
+DROP TABLE IF EXISTS requests;
 CREATE TABLE IF NOT EXISTS effects (
     action_id    TEXT PRIMARY KEY,
     request_hash TEXT NOT NULL,
@@ -123,25 +121,6 @@ class DispatchJournal:
 
     # -- health -------------------------------------------------------------------
 
-    def begin_request(self, request_id: str, request_hash: str) -> dict | None:
-        """Durably reserve a transport request before it can create a run or action."""
-        self.require_healthy()
-        with self._lock:
-            row = self._execute(
-                "SELECT request_hash, response FROM requests WHERE request_id=?", (request_id,)
-            ).fetchone()
-            if row is not None:
-                if row[0] != request_hash:
-                    raise ContractError("request_id was reused with different parameters")
-                if row[1] is None:
-                    raise Pause(Reason.UNCERTAIN_EFFECT, {"request_id": request_id})
-                return json.loads(row[1])
-            self._execute("INSERT INTO requests VALUES (?, ?, NULL)", (request_id, request_hash))
-        return None
-
-    def finish_request(self, request_id: str, response: Mapping) -> None:
-        self._execute("UPDATE requests SET response=? WHERE request_id=?", (canonical_json(response), request_id))
-
     @property
     def healthy(self) -> bool:
         return self._unhealthy is None
@@ -204,7 +183,10 @@ class DispatchJournal:
                 )
                 self._db.execute("COMMIT")  # durable before any native input
             except sqlite3.Error as exc:
-                self._db.execute("ROLLBACK")
+                # BEGIN itself may have failed (e.g. SQLITE_BUSY); a failed ROLLBACK must not mask exc.
+                with contextlib.suppress(sqlite3.Error):
+                    if self._db.in_transaction:
+                        self._db.execute("ROLLBACK")
                 self._unhealthy = f"could not persist dispatch intent: {exc}"
                 raise JournalUnhealthy(self._unhealthy) from exc
 

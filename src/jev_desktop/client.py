@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import Envelope
-from .ipc import ConnectionClosed, PipeClient, pipe_name
+from .ipc import ConnectionClosed, PipeClient, UntrustedServer, pipe_name
 
 
 class BrokerError(RuntimeError):
@@ -53,8 +53,8 @@ class BrokerClient:
             self._client = PipeClient(name=self.pipe, timeout_s=timeout_s or self.timeout_s)
         try:
             self._client.connect(timeout_s=1.0)
-        except ConnectionClosed:
-            if not self.autostart:
+        except ConnectionClosed as exc:
+            if not self.autostart or isinstance(exc, UntrustedServer):
                 raise
             self._spawn_broker()
             self._client.connect(timeout_s=timeout_s or 30.0)
@@ -65,7 +65,9 @@ class BrokerClient:
         if os.name == "nt":
             creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         environment = dict(os.environ)
-        source_root = str(Path(__file__).resolve().parents[2])
+        assert self.pipe is not None
+        environment["JEV_DESKTOP_PIPE"] = self.pipe  # the broker serves the pipe this client dials
+        source_root = str(Path(__file__).resolve().parents[1])  # the src directory
         existing = environment.get("PYTHONPATH", "")
         if source_root not in existing.split(os.pathsep):
             environment["PYTHONPATH"] = os.pathsep.join(filter(None, [source_root, existing]))
@@ -85,8 +87,9 @@ class BrokerClient:
                 if self._session_id:
                     self.call("bye", {"session_id": self._session_id}, timeout_s=5.0)
             except Exception:
-                pass
-            self._client.close()
+                pass  # a failed bye already dropped the connection
+            if self._client is not None:
+                self._client.close()
         self._client = None
         self._session_id = None
         self._hello = None
@@ -109,11 +112,28 @@ class BrokerClient:
     def call(
         self, method: str, params: Mapping[str, Any] | None = None, *, timeout_s: float | None = None
     ) -> dict[str, Any]:
+        session_id = self._session_id
+        if method == "stop" and session_id is not None:
+            # A run may hold the main connection for a whole slice; stop must not queue behind it.
+            return self._stop_request(session_id, params, timeout_s=timeout_s)
         with self._request_lock:
             self._ensure_session()
             payload = dict(params or {})
             payload.setdefault("session_id", self._session_id)
             return self._transact(Envelope.request(method, payload, session_id=self._session_id), timeout_s=timeout_s)
+
+    def _stop_request(
+        self, session_id: str, params: Mapping[str, Any] | None, *, timeout_s: float | None
+    ) -> dict[str, Any]:
+        payload = {**dict(params or {}), "session_id": session_id}
+        side = PipeClient(name=self.pipe, timeout_s=timeout_s or self.timeout_s)
+        try:
+            response = side.request(
+                Envelope.request("stop", payload, session_id=session_id), timeout_s=timeout_s or self.timeout_s
+            )
+        finally:
+            side.close()
+        return _result(response)
 
     def _transact(self, envelope: Envelope, *, timeout_s: float | None) -> dict[str, Any]:
         try:
@@ -127,10 +147,7 @@ class BrokerClient:
             self._session_id = None
             self._hello = None
             raise
-        if not response.ok:
-            error = response.error or {}
-            raise BrokerError(str(error.get("code", "error")), str(error.get("message", "")), error.get("detail"))
-        return dict(response.result or {})
+        return _result(response)
 
     # -- convenience ---------------------------------------------------------------
 
@@ -151,6 +168,13 @@ class BrokerClient:
                 self._session_id = None
                 time.sleep(0.2)
         raise BrokerError("broker_unavailable", f"broker did not become available: {last}")
+
+
+def _result(response: Envelope) -> dict[str, Any]:
+    if not response.ok:
+        error = response.error or {}
+        raise BrokerError(str(error.get("code", "error")), str(error.get("message", "")), error.get("detail"))
+    return dict(response.result or {})
 
 
 def load_json_argument(value: str | None) -> dict[str, Any]:

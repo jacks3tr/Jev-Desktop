@@ -3,6 +3,7 @@
 import multiprocessing
 import struct
 import time
+import uuid
 import zlib
 from dataclasses import replace
 from types import SimpleNamespace
@@ -198,3 +199,34 @@ def test_returned_uncertain_action_allows_fresh_observation():
         process.join(5)
     finally:
         driver.close()
+
+
+def test_emergency_stop_survives_its_event_dying_with_the_last_process(tmp_path, monkeypatch):
+    from jev_desktop import ownership
+
+    name = f"Local\\JevDesktopTest.{uuid.uuid4().hex}"  # never touch the real per-session stop
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(ownership, "_event_name", lambda: name)
+    monkeypatch.setattr(ownership, "_event_handle", None)
+
+    def restart() -> None:
+        # Closing the only handle destroys the kernel event, as when every broker/client exits.
+        ownership.kernel32.CloseHandle(ownership._event_handle)
+        ownership._event_handle = None
+
+    def markers() -> list:
+        return list((tmp_path / "JevDesktop").glob("emergency-*.stop"))
+
+    try:
+        assert not ownership.emergency_is_set()
+        ownership.emergency_signal()
+        assert markers()
+        restart()
+        assert ownership.emergency_is_set(), "a restarted broker must not silently clear the stop"
+        ownership.emergency_clear()
+        assert not markers()
+        restart()
+        assert not ownership.emergency_is_set()
+    finally:
+        if ownership._event_handle is not None:
+            ownership.kernel32.CloseHandle(ownership._event_handle)

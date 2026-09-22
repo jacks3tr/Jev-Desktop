@@ -6,7 +6,9 @@ An identifier is never permission: every request carries a session and run id th
 match an active, authorized session and the current lease generation.
 
 The emergency stop uses a named kernel event with an explicit DACL. A local process running
-as the same user can set it independently of the broker, model, or capture work.
+as the same user can set it independently of the broker, model, or capture work. A marker
+file (same DACL) persists the stop, so it survives the event dying with its last process;
+only an explicit clear removes it.
 """
 
 from __future__ import annotations
@@ -66,6 +68,8 @@ def _retained_event() -> int:
             if not handle:
                 raise ContractError("could not create the emergency-stop event")
             _event_handle = int(handle)
+            if _stop_marker().exists():  # the event died with the last process; the stop did not
+                kernel32.SetEvent(_event_handle)
         return _event_handle
 
 
@@ -75,12 +79,28 @@ def _event_name() -> str:
     return f"Local\\JevDesktop.EmergencyStop.{sid}.{logon_session_id()}"
 
 
+def _local_path(name: str, suffix: str) -> Path:
+    """Per-user, per-logon-session state file under the user's local application data."""
+    directory = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "JevDesktop"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{name}-{current_user_sid()}-{logon_session_id()}{suffix}"
+
+
+def _stop_marker() -> Path:
+    return _local_path("emergency", ".stop")
+
+
 def emergency_signal() -> bool:
-    """Set the local emergency-stop event. Safe to call from any local process."""
+    """Set the local emergency stop. Safe to call from any local process; survives restarts."""
+    with SecurityAttributes() as attributes:
+        handle = kernel32.CreateFileW(str(_stop_marker()), 0x40000000, 0, ctypes.byref(attributes), 2, 0x80, None)
+    if handle != ctypes.c_void_p(-1).value:
+        kernel32.CloseHandle(handle)
     return bool(kernel32.SetEvent(_retained_event()))
 
 
 def emergency_clear() -> bool:
+    _stop_marker().unlink(missing_ok=True)
     return bool(kernel32.ResetEvent(_retained_event()))
 
 
@@ -180,8 +200,8 @@ class Ownership:
     # -- lease ---------------------------------------------------------------------
 
     def acquire(self, session_id: str, run_id: str) -> Lease:
-        session = self.authorize(session_id)
-        with self._lock:
+        with self._lock:  # authorize inside the lock: a session closed meanwhile must not get a lease
+            session = self.authorize(session_id)
             if self._active_lease is not None:
                 holder = self._leases[self._active_lease]
                 if holder.session_id != session_id or holder.run_id != run_id:
@@ -191,9 +211,7 @@ class Ownership:
                 return holder
             # Share mode zero excludes every other broker/direct engine, independent
             # of thread identity. Windows closes the handle on process termination.
-            directory = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "JevDesktop"
-            directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"desktop-{current_user_sid()}-{logon_session_id()}.lock"
+            path = _local_path("desktop", ".lock")
             with SecurityAttributes() as attributes:
                 handle = kernel32.CreateFileW(
                     str(path), 0x80000000 | 0x40000000, 0, ctypes.byref(attributes), 4, 0x80, None
