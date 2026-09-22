@@ -27,6 +27,26 @@ python -m pip install -e .
 jev-desktop doctor
 ~~~
 
+## Install the plugin
+
+Install the Python package first. Set `TYPESAFE_API_KEY`, then run your agent from that Python environment.
+
+### Codex
+
+~~~powershell
+codex plugin marketplace add https://github.com/jacks3tr/Jev-Desktop.git
+codex plugin add jev-desktop@jev-desktop
+~~~
+
+### Claude Code
+
+~~~powershell
+claude plugin marketplace add jacks3tr/Jev-Desktop
+claude plugin install jev-desktop@jev-desktop
+~~~
+
+Start a new session to use the plugin.
+
 ## Connect your agent
 
 Configure your MCP client to use the Python environment where you installed Jev Desktop:
