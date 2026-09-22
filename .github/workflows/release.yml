@@ -45,7 +45,7 @@ jobs:
           files: dist/*
           generate_release_notes: true
           draft: true
-          prerelease: true
+          prerelease: false
 
       - uses: actions/upload-artifact@v7
         with:
