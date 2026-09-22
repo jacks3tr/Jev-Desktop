@@ -1,0 +1,12 @@
+{
+  "name": "jev-desktop",
+  "owner": {
+    "name": "jacks3tr"
+  },
+  "plugins": [
+    {
+      "name": "jev-desktop",
+      "source": "./"
+    }
+  ]
+}
