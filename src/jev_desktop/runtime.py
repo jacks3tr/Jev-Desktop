@@ -59,12 +59,10 @@ from .evidence import EvidenceStore
 from .journal import DispatchJournal, JournalUnhealthy
 from .ownership import Lease, Ownership
 from .policy import (
-    STATE_BUDGET_BYTES,
     JevPolicy,
     OpContext,
     PolicyError,
     build_contexts,
-    fit_state_to_budget,
     summarize_state_for_policy,
     with_permitted_operations,
 )
@@ -91,11 +89,6 @@ class RuntimeConfig:
     capture_scale: float = 0.6
     # Bounded settling allowance; a receipt is not proof the application processed input.
     settle_seconds: float = 0.8
-    # Provider input ceilings are tokenizer dependent, so start conservative and adapt on a
-    # refusal instead of trusting one machine's measurement.
-    state_budget_bytes: int = STATE_BUDGET_BYTES
-    min_state_budget_bytes: int = 6_000
-    state_budget_shrink: float = 0.6
     fingerprint_secret: bytes = field(default_factory=lambda: os.urandom(32))
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = now
@@ -143,7 +136,6 @@ class _RunState:
     pause_detail: dict[str, Any] = field(default_factory=dict)
     model_versions: list[str] = field(default_factory=list)
     supplied_fixtures: dict[str, str] = field(default_factory=dict)
-    state_budget_bytes: int | None = None
     supplied_visual: dict[str, Mapping[str, Any]] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     pending_assertion: str | None = None
@@ -179,7 +171,6 @@ class _RunState:
             "model_versions": list(self.model_versions),
             # Resumed fixture values may be credentials; retain them only in memory.
             "supplied_fixtures": {},
-            "state_budget_bytes": self.state_budget_bytes,
             "supplied_visual": {key: dict(value) for key, value in self.supplied_visual.items()},
             "summary": dict(self.summary),
             "pending_assertion": self.pending_assertion,
@@ -217,8 +208,6 @@ class _RunState:
         state.pause_detail = dict(data.get("pause_detail", {}))
         state.model_versions = [str(item) for item in data.get("model_versions", [])]
         state.supplied_fixtures = {str(k): str(v) for k, v in data.get("supplied_fixtures", {}).items()}
-        budget = data.get("state_budget_bytes")
-        state.state_budget_bytes = None if budget is None else int(budget)
         state.supplied_visual = {str(k): dict(v) for k, v in data.get("supplied_visual", {}).items()}
         state.summary = dict(data.get("summary", {}))
         state.pending_assertion = data.get("pending_assertion")
@@ -531,6 +520,8 @@ class Runtime:
         snapshot = self._observe(state)
         completion_probe = False
         completion_probe_used = False
+        value_target: TargetCandidate | None = None
+        inputs_without_value: set[str] = set()
         while True:
             self.ownership.checkpoint(
                 run_id=state.run_id,
@@ -546,11 +537,13 @@ class Runtime:
             observation = self._observation_for_policy(state, snapshot)
             contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
-            for operation in (Operation.TYPE_TEXT, Operation.SELECT, Operation.SCROLL):
+            for operation in (Operation.TYPE_TEXT, Operation.SCROLL):
                 base = build_contexts(observation=observation, operations=[operation])
                 choices = []
                 for context in base:
                     for target in context.candidates:
+                        if target.element_id in inputs_without_value:
+                            continue
                         values = (
                             [("up", 3), ("down", -3)]
                             if operation is Operation.SCROLL
@@ -558,11 +551,16 @@ class Runtime:
                                 (name, value) for name, value in state.spec.fixtures.items() if name.startswith("text:")
                             ]
                         )
+                        if operation is not Operation.SCROLL and len(values) > 1:
+                            choices.append(target)
+                            continue
                         for name, value in values:
                             if operation is Operation.TYPE_TEXT and snapshot.element(target.element_id).value == value:
                                 continue
                             candidate = replace(
-                                target, element_id=new_id("cfg"), description=f"{target.description}; {name}={value!r}"
+                                target,
+                                element_id=new_id("cfg"),
+                                description=f"{target.description}; supplied value {name}",
                             )
                             choices.append(candidate)
                             bindings[candidate.element_id] = (
@@ -573,7 +571,7 @@ class Runtime:
                 if choices:
                     contexts.append(OpContext(operation=operation, candidates=tuple(choices)))
             focused = next((window for window in snapshot.windows if window.focused), None)
-            unfocused = [window for window in snapshot.windows if not window.focused]
+            unfocused = [window for window in snapshot.windows if not window.focused and window.enabled]
             if unfocused:
                 contexts.append(
                     OpContext(
@@ -603,6 +601,36 @@ class Runtime:
                     )
             if focused is None:
                 contexts = [context for context in contexts if context.operation is Operation.FOCUS_WINDOW]
+            if value_target is not None:
+                choices = []
+                for name, value in state.spec.fixtures.items():
+                    if not name.startswith("text:"):
+                        continue
+                    if (
+                        value_target.operation is Operation.TYPE_TEXT
+                        and snapshot.element(value_target.element_id).value == value
+                    ):
+                        continue
+                    candidate = replace(
+                        value_target,
+                        element_id=new_id("cfg"),
+                        description=f"Enter {value!r}, supplied as {name.removeprefix('text:')}",
+                        fixture_ref=name,
+                    )
+                    choices.append(candidate)
+                    bindings[candidate.element_id] = (value_target, name, {})
+                contexts = (
+                    [
+                        OpContext(
+                            operation=value_target.operation,
+                            candidates=tuple(choices),
+                            note=f"Choose a supplied value for the selected control: {value_target.description}",
+                            selecting_value=True,
+                        )
+                    ]
+                    if choices
+                    else []
+                )
             # At the action limit, a final decision may report completion but cannot dispatch.
             if completion_probe or state.actions >= state.spec.limits.max_actions:
                 contexts = []
@@ -617,10 +645,17 @@ class Runtime:
                         "operation": step.operation.value,
                         "target": step.target_description,
                         "changed": step.observation_changed,
+                        "input": self._redact(
+                            self._fixture_value(state, step.fixture_reference), self._secret_values(state)
+                        )
+                        if step.fixture_reference
+                        else None,
                     }
-                    for step in state.steps[-6:]
+                    for step in state.steps
                 ],
             )
+            if value_target is not None:
+                model_state["selected_input_control"] = value_target.description
             model_state["supplied_text"] = {
                 name.removeprefix("text:"): value
                 for name, value in state.spec.fixtures.items()
@@ -642,7 +677,7 @@ class Runtime:
             try:
                 decision = self.policy.decide(
                     goal=state.spec.goal,
-                    state=fit_state_to_budget(model_state, budget_bytes=self.config.state_budget_bytes),
+                    state=model_state,
                     contexts=contexts,
                     allow_done=True,
                     allow_escalate=True,
@@ -654,13 +689,21 @@ class Runtime:
                     ),
                 )
             except Pause as pause:
+                if pause.reason is Reason.NO_APPROPRIATE_TARGET and value_target is not None:
+                    inputs_without_value.add(value_target.element_id)
+                    value_target = None
+                    continue
                 if pause.reason is not Reason.LOW_CONFIDENCE or completion_probe_used or not state.actions:
                     raise
                 # A transition can hide the result. Recheck once without offering more input.
                 completion_probe = completion_probe_used = True
                 self.config.sleeper(min(1.0, max(0.0, deadline - self.config.clock())))
+                value_target = None
                 snapshot = self._observe(state, completion=True)
                 continue
+            finally:
+                if isinstance(self.policy, JevPolicy):
+                    self._record_model_attempts(state)
             self.ownership.checkpoint(
                 run_id=state.run_id,
                 lease_id=lease.lease_id,
@@ -668,16 +711,18 @@ class Runtime:
                 session_id=lease.session_id,
             )
             state.model_versions.append(decision.model)
-            metrics = state.summary.setdefault(
-                "task_metrics", {"model_latency_ms": 0, "input_tokens": 0, "output_tokens": 0, "usage_complete": True}
-            )
-            metrics["model_latency_ms"] += decision.latency_ms
-            for key in ("input_tokens", "output_tokens"):
-                value = decision.usage.get(key)
-                if isinstance(value, int) and value >= 0:
-                    metrics[key] += value
-                else:
-                    metrics["usage_complete"] = False
+            if not isinstance(self.policy, JevPolicy):
+                metrics = state.summary.setdefault(
+                    "task_metrics",
+                    {"model_latency_ms": 0, "input_tokens": 0, "output_tokens": 0, "usage_complete": True},
+                )
+                metrics["model_latency_ms"] += decision.latency_ms
+                for key in ("input_tokens", "output_tokens"):
+                    value = decision.usage.get(key)
+                    if isinstance(value, int) and value >= 0:
+                        metrics[key] += value
+                    else:
+                        metrics["usage_complete"] = False
             self.journal.append_trace(state.run_id, "decision", decision.to_json())
             self._persist(state)
             if decision.operation is Operation.DONE:
@@ -710,12 +755,18 @@ class Runtime:
                     {"detail": "task needs caller judgment or an input not supplied"},
                 )
             if decision.operation is Operation.WAIT:
+                value_target = None
+                inputs_without_value.clear()
                 self.config.sleeper(min(0.2, max(0.0, deadline - self.config.clock())))
                 snapshot = self._observe(state)
                 continue
             if decision.target is None:
                 return self._pause(state, Reason.NO_APPROPRIATE_TARGET.value, {})
             target, fixture, scroll = bindings.get(decision.target.element_id, (decision.target, None, {}))
+            if decision.operation in {Operation.TYPE_TEXT, Operation.SELECT} and fixture is None:
+                value_target = target
+                continue
+            value_target = None
             step = RequiredStep(
                 step_id=f"action-{state.actions + 1}",
                 operation=decision.operation,
@@ -729,6 +780,34 @@ class Runtime:
             if isinstance(dispatched, RunResult):
                 return dispatched
             snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
+            inputs_without_value.clear()
+
+    def _record_model_attempts(self, state: _RunState) -> None:
+        if not isinstance(self.policy, JevPolicy):
+            return
+        metrics = state.summary.setdefault(
+            "task_metrics",
+            {
+                "model_latency_ms": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "usage_complete": True,
+            },
+        )
+        metrics["model_latency_ms"] += self.policy.last_latency_ms
+        self.policy.last_latency_ms = 0
+        for attempt in self.policy.last_attempts:
+            self.journal.append_trace(state.run_id, "model_attempt", attempt)
+            metrics["http_requests"] = metrics.get("http_requests", 0) + 1
+            usage = attempt.get("usage")
+            for key in ("input_tokens", "output_tokens"):
+                value = usage.get(key) if isinstance(usage, dict) else None
+                if type(value) is int and value >= 0:
+                    metrics[key] += value
+                else:
+                    metrics["usage_complete"] = False
+        self.policy.last_attempts = []
+        self._persist(state)
 
     def _loop(self, state: _RunState, lease: Lease, deadline: float) -> RunResult:
         spec = state.spec
@@ -991,54 +1070,29 @@ class Runtime:
             ],
             mode=state.spec.interaction_mode.value,
         )
-        keep = [candidate.element_id for context in contexts for candidate in context.candidates]
-        budget = state.state_budget_bytes or self.config.state_budget_bytes
-        while True:
-            fitted = fit_state_to_budget(summarised, keep_element_ids=keep, budget_bytes=budget)
-            remaining = state.slice_deadline - self.config.clock()
-            if remaining <= 0:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
-            if state.decisions >= state.spec.limits.max_model_decisions:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_model_decisions"})
-            state.decisions += 1
-            self._persist(state)
-            try:
-                decision = self.policy.decide(
-                    goal=state.spec.goal,
-                    state=with_permitted_operations(fitted, [step.operation]),
-                    contexts=contexts,
-                    allow_done=allow_done,
-                    allow_escalate=True,
-                    current_step={
-                        "step_id": step.step_id,
-                        "operation": step.operation.value,
-                        "target_description": step.target_description,
-                    },
-                    **({"deadline": time.monotonic() + remaining} if isinstance(self.policy, JevPolicy) else {}),
-                )
-                break
-            except Pause as pause:
-                if pause.detail.get("cause") != "max_tokens_exceeded":
-                    raise
-                # The provider's ceiling depends on its tokenizer and on the questions sent
-                # with the state, so treat the first refusal as a measurement: shrink, remember
-                # it for the rest of the run, and try once more.
-                if budget <= self.config.min_state_budget_bytes:
-                    raise Pause(
-                        Reason.NEEDS_NARROWER_OBSERVATION,
-                        {
-                            "detail": "the state cannot be shrunk far enough for the provider",
-                            "budget_bytes": budget,
-                            "hint": "narrow scope.window_refs or lower scope.max_elements",
-                        },
-                    ) from pause
-                budget = max(self.config.min_state_budget_bytes, int(budget * self.config.state_budget_shrink))
-                state.state_budget_bytes = budget
-                self.journal.append_trace(
-                    state.run_id,
-                    "state_budget_shrunk",
-                    {"budget_bytes": budget, "step": step.step_id},
-                )
+        remaining = state.slice_deadline - self.config.clock()
+        if remaining <= 0:
+            raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+        if state.decisions >= state.spec.limits.max_model_decisions:
+            raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_model_decisions"})
+        state.decisions += 1
+        self._persist(state)
+        try:
+            decision = self.policy.decide(
+                goal=state.spec.goal,
+                state=with_permitted_operations(summarised, [step.operation]),
+                contexts=contexts,
+                allow_done=allow_done,
+                allow_escalate=True,
+                current_step={
+                    "step_id": step.step_id,
+                    "operation": step.operation.value,
+                    "target_description": step.target_description,
+                },
+                **({"deadline": time.monotonic() + remaining} if isinstance(self.policy, JevPolicy) else {}),
+            )
+        finally:
+            self._record_model_attempts(state)
         state.model_versions.append(decision.model)
         self.journal.append_trace(state.run_id, "decision", decision.to_json())
         return decision
@@ -1046,10 +1100,13 @@ class Runtime:
     def _observation_for_policy(self, state: _RunState, snapshot: Snapshot) -> dict[str, Any]:
         secrets = self._secret_values(state)
         elements: list[dict[str, Any]] = []
+        enabled_windows = {window.window_ref for window in snapshot.windows if window.enabled}
         for element in snapshot.elements:
             payload = {
                 "index": element.index,
                 "element_id": element.element_id,
+                "window_ref": element.window_ref,
+                "text": self._redact(element.text, secrets),
                 "role": element.role,
                 "name": self._redact(element.name, secrets),
                 "value": self._redact(element.value, secrets),
@@ -1057,12 +1114,12 @@ class Runtime:
                 "visible": element.visible,
                 "editable": element.editable,
                 "focused": element.focused,
-                "operations": list(element.operations),
+                "operations": list(element.operations) if element.window_ref in enabled_windows else [],
                 "path": [self._redact(part, secrets) for part in element.path],
                 "state": dict(element.state),
                 "truncation": element.truncation,
             }
-            if element.role == "edit" and element.value is None:
+            if element.state.get("password"):
                 payload["value"] = "(withheld)"  # password fields never leave the driver
             elements.append(payload)
         texts = [

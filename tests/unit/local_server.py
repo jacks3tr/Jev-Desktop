@@ -26,6 +26,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
+        for name, value in owner.response_headers.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -39,6 +41,7 @@ class LocalTypeSafeServer:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.headers: list[dict[str, str]] = []
+        self.response_headers: dict[str, str] = {}
         self._responses: list[tuple[int, Any]] = []
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)

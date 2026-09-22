@@ -164,7 +164,7 @@ class WindowsDriver:
                         raise EmergencyStop(message)
                     raise DriverError(message)
             except BaseException as exc:
-                if not received_response or poisoned or isinstance(exc, UncertainEffect):
+                if not received_response or poisoned or self._pending_count.value:
                     self.abort()
                 if approved_dispatch and not received_response and not isinstance(exc, UncertainEffect):
                     raise UncertainEffect(f"native action interrupted after dispatch authorization: {exc}") from exc
@@ -175,6 +175,9 @@ class WindowsDriver:
 
     def execute(self, request, guard, snapshot=None):
         return self._call("execute", request, snapshot, guard=guard)
+
+    def discover(self, app_ref: str | None = None):
+        return self._call("discover", app_ref)
 
     def list_apps(self):
         return self._call("list_apps")

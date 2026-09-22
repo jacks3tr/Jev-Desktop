@@ -127,47 +127,62 @@ class NativeWindowsDriver:
             raise ContractError("launched process identity no longer matches")
         return app_ref
 
-    def list_apps(self) -> list[AppRef]:
+    def discover(self, app_ref: str | None = None) -> tuple[list[AppRef], list[WindowInfo]]:
         self._require_started()
-        pids: set[int] = set()
-        for hwnd in win32.enum_top_level_windows():
-            if not win32.is_top_level(hwnd) or not win32.user32.IsWindowVisible(hwnd):
-                continue
-            if win32.is_owned_popup(hwnd) or win32.is_cloaked(hwnd):
-                continue
-            pids.add(win32.window_process_id(hwnd))
+        handles = win32.enum_top_level_windows()
+        pids = (
+            {self.process_id_for(app_ref)}
+            if app_ref
+            else {
+                win32.window_process_id(hwnd)
+                for hwnd in handles
+                if win32.is_top_level(hwnd)
+                and win32.user32.IsWindowVisible(hwnd)
+                and not win32.is_owned_popup(hwnd)
+                and not win32.is_cloaked(hwnd)
+            }
+        )
         apps: list[AppRef] = []
+        windows: list[WindowInfo] = []
         for pid in sorted(pids):
             try:
-                app_ref = self._register_app(pid)
+                ref = self._register_app(pid)
             except DriverError:
-                continue  # protected process: not observable, not selectable
-            windows = uia.discover_windows(self.registry, app_ref=app_ref, process_ids={pid})
-            app = self._apps[app_ref]
+                continue
+            discovered = uia.discover_windows(self.registry, app_ref=ref, process_ids={pid}, handles=handles)
+            app = self._apps[ref]
             apps.append(
                 AppRef(
-                    app_ref=app.app_ref,
+                    app_ref=ref,
                     package_identity=app.package_identity,
                     executable_path=app.executable_path,
-                    process_id=app.process_id,
+                    process_id=pid,
                     process_creation_time=app.process_creation_time,
-                    window_refs=tuple(window.window_ref for window in windows),
+                    window_refs=tuple(window.window_ref for window in discovered),
                 )
             )
-            for window in windows:
-                self._scope[window.window_ref] = (
-                    self.registry.windows[window.window_ref].hwnd,
-                    app_ref,
-                )
-        return apps
+            windows.extend(discovered)
+            for window in discovered:
+                self._scope[window.window_ref] = (self.registry.windows[window.window_ref].hwnd, ref)
+        return apps, windows
+
+    def list_apps(self) -> list[AppRef]:
+        return self.discover()[0]
 
     def list_windows(self) -> list[WindowInfo]:
-        self._require_started()
-        windows: list[WindowInfo] = []
-        for app in self.list_apps():
-            pid = self.process_id_for(app.app_ref)
-            windows.extend(uia.discover_windows(self.registry, app_ref=app.app_ref, process_ids={pid}))
-        return windows
+        return self.discover()[1]
+
+    def _scoped_windows(self, scope: ScopeSpec, windows: list[WindowInfo]) -> list[WindowInfo]:
+        if not scope.window_refs:
+            return [w for w in windows if scope.include_dialogs or w.scope != "dialog"]
+        allowed = set(scope.window_refs)
+        if scope.include_dialogs:
+            for _ in range(len(windows)):
+                added = {w.window_ref for w in windows if w.app_ref == scope.app_ref and w.owner_window_ref in allowed}
+                if added <= allowed:
+                    break
+                allowed.update(added)
+        return [w for w in windows if w.app_ref == scope.app_ref and w.window_ref in allowed]
 
     def scoped_window_handles(self) -> set[int]:
         return {hwnd for hwnd, _app in self._scope.values()}
@@ -194,30 +209,27 @@ class NativeWindowsDriver:
             raise ContractError(
                 "shared application host requires explicit window_refs; process scope includes unrelated apps"
             )
-        windows = self._observe_windows(scope.app_ref)
-        if scope.window_refs:
-            wanted = set(scope.window_refs)
-            windows = [window for window in windows if window.window_ref in wanted]
-        elif scope.include_dialogs:
-            # include every observed window of the process (dialogs already included)
-            pass
-        else:
-            windows = [window for window in windows if window.scope != "dialog"]
-        if not windows:
-            raise DriverError("no windows in scope for observation")
-        pairs = [(window.window_ref, self.registry.windows[window.window_ref].hwnd) for window in windows]
-        snapshot = uia.observe(
-            self.worker,
-            self.registry,
-            app_ref=scope.app_ref,
-            process_id=self.process_id_for(scope.app_ref),
-            scope_windows=pairs,
-            max_elements=scope.max_elements,
-            max_depth=scope.max_depth,
-            text_limit=scope.text_limit,
-            include_invisible=scope.include_invisible,
-            geometry=self.screen.geometry(),
-        )
+        for _ in range(2):
+            foreground_before = win32.foreground_window()
+            windows = self._observe_windows(scope.app_ref)
+            windows = self._scoped_windows(scope, windows)
+            if not windows:
+                raise DriverError("no windows in scope for observation")
+            pairs = [(window.window_ref, self.registry.windows[window.window_ref].hwnd) for window in windows]
+            snapshot = uia.observe(
+                self.worker,
+                self.registry,
+                app_ref=scope.app_ref,
+                process_id=self.process_id_for(scope.app_ref),
+                scope_windows=pairs,
+                max_elements=scope.max_elements,
+                max_depth=scope.max_depth,
+                text_limit=scope.text_limit,
+                include_invisible=scope.include_invisible,
+                geometry=self.screen.geometry(),
+            )
+            if win32.foreground_window() == foreground_before:
+                break
         self._snapshots[scope.app_ref] = snapshot
         self._captures.clear()
         return snapshot
@@ -226,7 +238,8 @@ class NativeWindowsDriver:
         snapshot = self._snapshots.get(scope.app_ref)
         if snapshot is None or snapshot.snapshot_id != snapshot_id:
             raise ContractError("snapshot is unknown or stale; inspect the application again")
-        if scope.window_refs and any(window.window_ref not in scope.window_refs for window in snapshot.windows):
+        allowed = {w.window_ref for w in self._scoped_windows(scope, self._observe_windows(scope.app_ref))}
+        if any(window.window_ref not in allowed for window in snapshot.windows):
             raise ContractError("snapshot includes windows outside the run scope")
         return snapshot
 
@@ -254,8 +267,7 @@ class NativeWindowsDriver:
         if scope is not None:
             try:
                 windows = self._observe_windows(scope.app_ref)
-                if scope.window_refs:
-                    windows = [window for window in windows if window.window_ref in scope.window_refs]
+                windows = self._scoped_windows(scope, windows)
                 foreground = win32.root_window(win32.foreground_window())
                 windows = [
                     window

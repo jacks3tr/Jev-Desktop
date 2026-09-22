@@ -155,3 +155,16 @@ def test_stop_releases_the_lease(broker_env):
     assert stopped["status"] == "cancelled"
     assert broker.ownership.active_lease() is None
     assert broker.ownership.flags(run_id).cancelled is True
+
+
+def test_optional_capture_failure_preserves_inspection(broker_env, monkeypatch):
+    from jev_desktop.contracts import DriverError
+
+    def unavailable(**kwargs):
+        raise DriverError("window is covered")
+
+    monkeypatch.setattr(broker_env["driver"], "capture", unavailable)
+    observed = broker_env["make"]().call("inspect", {"app_ref": APP_REF, "screenshot": True})
+    assert observed["elements"] and observed["access_token"]
+    assert observed["screenshot"] is None
+    assert observed["screenshot_error"]["reason"] == "DriverError"

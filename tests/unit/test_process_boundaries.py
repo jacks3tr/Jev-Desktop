@@ -5,6 +5,7 @@ import struct
 import time
 import zlib
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,3 +173,28 @@ def test_coordinate_transform_binds_snapshot_crop_and_actual_image_dimensions():
             altered.resolve(evidence, evidence.run_id, evidence.snapshot_id)
     with pytest.raises(ContractError):
         point.resolve(evidence, "run:" + "4" * 24, evidence.snapshot_id)
+
+
+def _returned_uncertain_worker(connection):
+    connection.recv()
+    connection.send(("error", ("UncertainEffect", "input outcome unknown", {"poisoned": False})))
+    connection.recv()
+    connection.send(("result", "fresh observation"))
+
+
+def test_returned_uncertain_action_allows_fresh_observation():
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_returned_uncertain_worker, args=(child,))
+    driver = WindowsDriver()
+    driver._connection = parent
+    driver._process = process
+    try:
+        process.start()
+        child.close()
+        with pytest.raises(UncertainEffect, match="input outcome unknown"):
+            driver._call("execute", SimpleNamespace(deadline_s=5))
+        assert driver._call("observe") == "fresh observation"
+        process.join(5)
+    finally:
+        driver.close()

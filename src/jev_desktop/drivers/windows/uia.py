@@ -76,6 +76,7 @@ PROP_OFFSCREEN = _prop("UIA_IsOffscreenPropertyId", 30022)
 PROP_FOCUSED = _prop("UIA_HasKeyboardFocusPropertyId", 30008)
 PROP_FOCUSABLE = _prop("UIA_IsKeyboardFocusablePropertyId", 30009)
 PROP_VALUE = _prop("UIA_ValueValuePropertyId", 30045)
+PROP_LEGACY_VALUE = _prop("UIA_LegacyIAccessibleValuePropertyId", 30093)
 PROP_VALUE_READONLY = _prop("UIA_ValueIsReadOnlyPropertyId", 30046)
 PROP_TOGGLE = _prop("UIA_ToggleToggleStatePropertyId", 30086)
 PROP_SELECTED = _prop("UIA_SelectionItemIsSelectedPropertyId", 30079)
@@ -111,6 +112,7 @@ CACHE_PROPERTIES = [
     PROP_FOCUSED,
     PROP_FOCUSABLE,
     PROP_VALUE,
+    PROP_LEGACY_VALUE,
     PROP_VALUE_READONLY,
     PROP_TOGGLE,
     PROP_SELECTED,
@@ -182,6 +184,7 @@ CONTROL_TYPES: dict[int, str] = {
 }
 
 CLICKABLE_ROLES = {
+    "combobox",
     "button",
     "splitbutton",
     "hyperlink",
@@ -217,12 +220,9 @@ CHROME_ROLES = {
     "menubar",
     "toolbar",
 }
-# Rows are the cheap, numerous thing a big list produces, and the only thing the share below
-# applies to. Text, status, and document values stay: they are what assertions read, and they
-# are few. Containers are structural: their children matter, the container itself does not.
+# Scan collections after controls, then retain focus and populated content before empty rows.
 ROW_ROLES = {"listitem", "treeitem", "dataitem"}
 CONTAINER_ROLES = {"pane", "group", "custom", "table", "tree", "list", "datagrid"}
-CONTENT_SHARE = 0.25  # of the element budget, with a floor so short lists stay complete
 
 
 @dataclass
@@ -391,18 +391,24 @@ class UiaWorker:
         except Exception:
             return None
 
-    def children(self, element: Any) -> list[Any]:
-        """Direct children with every cached property/pattern already attached.
-
-        One COM call per node instead of one per property: the cache request resolves
-        properties and patterns together, as Microsoft's caching guidance describes.
-        """
-        UIA = uia_module()
+    def focused_element(self, hwnd: int) -> Any | None:
+        if win32.root_window(win32.foreground_window()) != win32.root_window(hwnd):
+            return None
         try:
-            array = element.FindAllBuildCache(UIA.TreeScope_Children, self._true_condition, self._cache)
+            return self.automation.GetFocusedElementBuildCache(self._cache)
+        except Exception:
+            return None
+
+    def children(self, element: Any) -> Iterable[Any]:
+        """Fetch cached siblings lazily so a wide provider cannot allocate an entire row set."""
+        walker = self.automation.ControlViewWalker
+        try:
+            child = walker.GetFirstChildElementBuildCache(element, self._cache)
+            while child:
+                yield child
+                child = walker.GetNextSiblingElementBuildCache(child, self._cache)
         except Exception as exc:
             raise DriverError(f"cached traversal failed: {exc}") from exc
-        return [array.GetElement(index) for index in range(array.Length)]
 
 
 # --------------------------------------------------------------------------------------
@@ -441,7 +447,10 @@ def _runtime_id(element: Any) -> tuple[int, ...]:
         except Exception:
             return ()
     if isinstance(value, (list, tuple)):
-        return tuple(int(item) for item in value)
+        try:
+            return tuple(int(item) for item in value)
+        except (TypeError, ValueError):
+            return ()
     return ()
 
 
@@ -485,7 +494,8 @@ def _value_of(element: Any, password: bool) -> str | None:
     value = _cached(element, PROP_VALUE)
     if isinstance(value, str) and value:
         return value
-    return None
+    legacy = _cached(element, PROP_LEGACY_VALUE)
+    return legacy if isinstance(legacy, str) and legacy else None
 
 
 def _operations_for(role: str, available: Mapping[str, bool], editable: bool) -> tuple[str, ...]:
@@ -532,7 +542,9 @@ def _available_patterns(element: Any) -> dict[str, bool]:
 # --------------------------------------------------------------------------------------
 
 
-def discover_windows(registry: Registry, *, app_ref: str, process_ids: Iterable[int]) -> list[WindowInfo]:
+def discover_windows(
+    registry: Registry, *, app_ref: str, process_ids: Iterable[int], handles: Iterable[int] | None = None
+) -> list[WindowInfo]:
     """Top-level windows for the given processes, including owned dialogs.
 
     Window references are stable across observations of the same HWND: the registry is
@@ -541,7 +553,7 @@ def discover_windows(registry: Registry, *, app_ref: str, process_ids: Iterable[
     pids = set(process_ids)
     by_hwnd = {handle.hwnd: ref for ref, handle in registry.windows.items()}
     collected: list[tuple[int, int, WindowInfo]] = []
-    for hwnd in win32.enum_top_level_windows():
+    for hwnd in handles if handles is not None else win32.enum_top_level_windows():
         pid = win32.window_process_id(hwnd)
         if pid not in pids:
             continue
@@ -556,6 +568,7 @@ def discover_windows(registry: Registry, *, app_ref: str, process_ids: Iterable[
         if ref is None:
             ref = new_id("win")
             registry.windows[ref] = WindowHandle(window_ref=ref, hwnd=hwnd, app_ref=app_ref, process_id=pid)
+        by_hwnd[hwnd] = ref
         collected.append(
             (
                 hwnd,
@@ -626,6 +639,7 @@ def observe(
         coverage = Coverage.COMPLETE
         elements: list[ElementInfo] = []
         deferred: list[ElementInfo] = []
+        focused_elements: list[ElementInfo] = []
         texts: list[dict[str, Any]] = []
         skipped: list[int] = []
         foreground = win32.foreground_window()
@@ -634,10 +648,11 @@ def observe(
         # on background content rather than on the window the user is working in.
         ordered_windows = sorted(
             scope_windows,
-            key=lambda item: 0 if win32.owner_window(item[1]) else 2 if win32.foreground_window() == item[1] else 1,
+            key=lambda item: 0 if win32.owner_window(item[1]) else 1 if foreground == item[1] else 2,
         )
-        content_cap = max(20, int(max_elements * CONTENT_SHARE))
+        content_cap = max_elements
         content_seen = 0
+        traversal = [0]
         rows_dropped: list[int] = []
         for window_ref, hwnd in ordered_windows:
             owner_hwnd = win32.owner_window(hwnd)
@@ -667,6 +682,34 @@ def observe(
             if not worker.has_cached_walker:  # pragma: no cover - fallback path
                 truncation.append("cached tree walker unavailable; using flat search")
                 coverage = Coverage.PARTIAL
+            get_focused = getattr(worker, "focused_element", None)
+            focused_element = get_focused(hwnd) if get_focused is not None else None
+            if focused_element is not None:
+                focused_chrome: list[ElementInfo] = []
+                focused_content: list[ElementInfo] = []
+                _walk(
+                    worker,
+                    focused_element,
+                    registry,
+                    snapshot_id,
+                    window_ref,
+                    hwnd,
+                    focused_chrome,
+                    focused_content,
+                    texts,
+                    depth=0,
+                    max_depth=0,
+                    max_elements=max_elements,
+                    include_invisible=include_invisible,
+                    text_limit=text_limit,
+                    truncation=[],
+                    skipped=[],
+                    rows_dropped=[],
+                    content_cap=max_elements,
+                    content_seen=0,
+                    traversal=[0],
+                )
+                focused_elements.extend(focused_chrome + focused_content)
             content_seen = _walk(
                 worker,
                 root,
@@ -687,11 +730,25 @@ def observe(
                 rows_dropped=rows_dropped,
                 content_cap=content_cap,
                 content_seen=content_seen,
+                traversal=traversal,
             )
 
         # Actionable elements are all in `elements` by now; content fills what is left, so a
         # dialog's own buttons are never crowded out by a file list that happens to sit earlier
         # in the tree.
+        observed_runtime_ids = {registry.elements[item.element_id].runtime_id for item in elements + deferred}
+        for item in focused_elements:
+            runtime_id = registry.elements[item.element_id].runtime_id
+            if not runtime_id or runtime_id not in observed_runtime_ids:
+                deferred.insert(0, item)
+        deferred.sort(
+            key=lambda item: (
+                not item.focused,
+                not item.state.get("selected", False),
+                not bool(item.value),
+                item.role not in ROW_ROLES,
+            )
+        )
         room = max(0, max_elements - len(elements))
         if len(deferred) > room:
             rows_dropped.append(len(deferred) - room)
@@ -700,7 +757,7 @@ def observe(
 
         if rows_dropped:
             coverage = Coverage.TRUNCATED if coverage is Coverage.TRUNCATED else Coverage.PARTIAL
-            truncation.append(f"{len(rows_dropped)} list rows were not observed (row share of the element budget)")
+            truncation.append(f"{sum(rows_dropped)} list rows were not observed (collection row budget)")
         if skipped:
             coverage = Coverage.TRUNCATED if coverage is Coverage.TRUNCATED else Coverage.PARTIAL
             truncation.append(f"{len(skipped)} offscreen elements were not observed")
@@ -709,15 +766,27 @@ def observe(
             coverage = Coverage.TRUNCATED
             truncation.append(f"element cap reached ({max_elements})")
 
+        retained = {e.element_id for e in elements}
+        texts = [item for item in texts if item["element_id"] in retained]
+        if truncation and coverage is Coverage.COMPLETE:
+            coverage = Coverage.PARTIAL
         interval_ms = int((time.perf_counter() - started) * 1000)
         fingerprint = hashlib.blake2s(
             canonical_json(
-                [[e.role, e.name, e.value, e.enabled, e.visible, e.rect.to_json(), e.state] for e in elements]
-                + [[w.title, w.rect.to_json(), w.enabled, w.modal] for w in window_infos]
+                [
+                    [e.window_ref, e.role, e.name, e.value, e.enabled, e.visible, e.focused, e.rect.to_json(), e.state]
+                    for e in elements
+                ]
+                + [[w.window_ref, w.title, w.rect.to_json(), w.enabled, w.modal, w.focused] for w in window_infos]
             ).encode("utf-8"),
             digest_size=16,
         ).hexdigest()
 
+        focus_ids = {registry.elements[item.element_id].runtime_id for item in focused_elements} - {()}
+        actual_focus = next(
+            (item.element_id for item in elements if registry.elements[item.element_id].runtime_id in focus_ids),
+            next((item.element_id for item in elements if item.focused), None),
+        )
         snapshot = Snapshot(
             snapshot_id=snapshot_id,
             app_ref=app_ref,
@@ -726,12 +795,12 @@ def observe(
             geometry=geometry,
             fingerprint=fingerprint,
             coverage=coverage,
-            truncation=tuple(truncation),
+            truncation=tuple(dict.fromkeys(truncation)),
             windows=tuple(window_infos),
             elements=tuple(elements),
             context={
                 "texts": texts,
-                "focused_element_id": next((e.element_id for e in elements if e.focused), None),
+                "focused_element_id": actual_focus,
                 "modal_windows": [w.window_ref for w in window_infos if w.modal],
                 "foreground_window_ref": next((w.window_ref for w in window_infos if w.focused), None),
             },
@@ -743,7 +812,19 @@ def observe(
 
     if not scope_windows:
         raise DriverError("no windows in scope for observation")
-    return worker.submit(_build)
+
+    def build_and_release(current: UiaWorker) -> Snapshot:
+        before = set(registry.elements)
+        retained: set[str] = set()
+        try:
+            result = _build(current)
+            retained = {element.element_id for element in result.elements}
+            return result
+        finally:
+            for element_id in set(registry.elements) - before - retained:
+                registry.elements.pop(element_id, None)
+
+    return worker.submit(build_and_release)
 
 
 def _walk(
@@ -763,165 +844,134 @@ def _walk(
     include_invisible: bool,
     text_limit: int,
     truncation: list[str],
-    path: tuple[str, ...] = (),
-    skipped: list[int] | None = None,
-    rows_dropped: list[int] | None = None,
-    content_cap: int = 0,
-    content_seen: int = 0,
+    skipped: list[int],
+    rows_dropped: list[int],
+    content_cap: int,
+    content_seen: int,
+    traversal: list[int],
 ) -> int:
-    if len(elements) >= max_elements or depth > max_depth:
-        if depth > max_depth:
+    stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
+    collections: list[tuple[Any, int, tuple[str, ...]]] = []
+    collection_phase = False
+    while stack or collections:
+        if not stack:
+            stack.append(collections.pop(0))
+            collection_phase = True
+        if traversal[0] >= max(64, max_elements * 4):
+            truncation.append("traversal node budget reached")
+            break
+        if len(elements) >= max_elements:
+            break
+        iterator, depth, path = stack[-1]
+        try:
+            element = next(iterator)
+        except StopIteration:
+            stack.pop()
+            continue
+        traversal[0] += 1
+        role = _control_type(element)
+        native_handle = _cached(element, PROP_NATIVE_HANDLE)
+        if (
+            role == "window"
+            and isinstance(native_handle, int)
+            and native_handle
+            and native_handle != hwnd
+            and win32.root_window(native_handle) == native_handle
+        ):
+            continue
+        name_value = _cached(element, PROP_NAME)
+        name = name_value if isinstance(name_value, str) else ""
+        if depth < max_depth:
+            children = (iter(worker.children(element)), depth + 1, (*path, name or role))
+            if role in {"list", "tree", "datagrid", "table"}:
+                collections.append(children)
+            else:
+                stack.append(children)
+        else:
             truncation.append(f"depth cap reached ({max_depth})")
-        return content_seen
-    role = _control_type(element)
-    if role in ROW_ROLES:
-        content_seen += 1
-    name_value = _cached(element, PROP_NAME)
-    name = name_value if isinstance(name_value, str) else ""
-    if role in CONTAINER_ROLES and len(elements) >= max_elements:
-        # A structural element past the budget: its children still matter, the container does
-        # not, so descend without recording it.
-        for child in worker.children(element):
-            content_seen = _walk(
-                worker,
-                child,
-                registry,
-                snapshot_id,
-                window_ref,
-                hwnd,
-                elements,
-                pending,
-                texts,
-                depth=depth + 1,
-                max_depth=max_depth,
-                max_elements=max_elements,
-                include_invisible=include_invisible,
-                text_limit=text_limit,
-                truncation=truncation,
-                path=(*path, name or role),
-                skipped=skipped,
-                rows_dropped=rows_dropped,
-                content_cap=content_cap,
-                content_seen=content_seen,
-            )
-        return content_seen
-    password = _bool(_cached(element, PROP_PASSWORD))
-    value = _value_of(element, password)
-    enabled = _bool(_cached(element, PROP_ENABLED), True)
-    offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
-    rect = _rect_of(_cached(element, PROP_BOUNDS))
-    focusable = _bool(_cached(element, PROP_FOCUSABLE))
-    focused = _bool(_cached(element, PROP_FOCUSED))
-    available = _available_patterns(element)
-    state = _state_of(element, available)
-    readonly = bool(state.get("readonly"))
-    editable = (available.get("value") and not readonly and role in TEXT_ENTRY_ROLES) or (
-        role == "edit" and not readonly
-    )
-    visible = (not offscreen) and not rect.is_empty
-    if not visible and not include_invisible:
-        # Offscreen content is skipped, so the observation is explicitly partial: absence of an
-        # element in a partial observation is never proof of absence.
-        if skipped is not None:
+        if role in ROW_ROLES:
+            content_seen += 1
+            if content_seen > content_cap:
+                rows_dropped.append(1)
+                if collection_phase:
+                    stack.clear()
+                    truncation.append("remaining collection content was not observed (collection row budget)")
+                elif depth < max_depth:
+                    stack.pop()
+                continue
+        password = _bool(_cached(element, PROP_PASSWORD))
+        value = _value_of(element, password)
+        enabled = _bool(_cached(element, PROP_ENABLED), True)
+        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
+        rect = _rect_of(_cached(element, PROP_BOUNDS))
+        if offscreen and role in ROW_ROLES and not rect.is_empty:
+            offscreen = not point_hits_element(worker, element, *rect.center())
+        focusable = _bool(_cached(element, PROP_FOCUSABLE))
+        focused = _bool(_cached(element, PROP_FOCUSED))
+        available = _available_patterns(element)
+        state = _state_of(element, available)
+        readonly = bool(state.get("readonly"))
+        editable = (available.get("value") and not readonly and role in TEXT_ENTRY_ROLES) or (
+            role == "edit" and not readonly
+        )
+        visible = (not offscreen) and not rect.is_empty
+        if not visible and not include_invisible:
             skipped.append(1)
-        for child in worker.children(element):
-            content_seen = _walk(
-                worker,
-                child,
-                registry,
-                snapshot_id,
-                window_ref,
-                hwnd,
-                elements,
-                pending,
-                texts,
-                depth=depth + 1,
-                max_depth=max_depth,
-                max_elements=max_elements,
-                include_invisible=include_invisible,
-                text_limit=text_limit,
-                truncation=truncation,
-                path=(*path, name or role),
-                skipped=skipped,
-                content_cap=content_cap,
-                content_seen=content_seen,
-            )
-        return content_seen
-
-    element_id = new_id("el")
-    native_handle = _cached(element, PROP_NATIVE_HANDLE)
-    element_hwnd = int(native_handle) if isinstance(native_handle, int) and native_handle else hwnd
-    operations = _operations_for(role, available, editable)
-    registry.elements[element_id] = ElementHandle(
-        element_id=element_id,
-        element=element,
-        runtime_id=_runtime_id(element),
-        snapshot_id=snapshot_id,
-        window_ref=window_ref,
-        hwnd=element_hwnd,
-        role=role,
-        name=name,
-        rect=rect,
-        enabled=enabled,
-        visible=visible,
-        operations=operations,
-        created_at=now(),
-    )
-    text: str | None = None
-    if role in TEXT_ROLES or value:
-        raw = value or name
-        text = raw[:text_limit] if text_limit else raw[:0]
-        if raw and len(raw) > len(text):
-            truncation.append(f"text truncated for {role}")
-    element_text = (text or None) if (role in TEXT_ROLES or value) else None
-    (elements if role in CHROME_ROLES else pending).append(
-        ElementInfo(
+            continue
+        if role not in CHROME_ROLES and len(pending) >= max_elements + content_cap:
+            truncation.append("content element cap reached")
+            continue
+        element_id = new_id("el")
+        native_handle = _cached(element, PROP_NATIVE_HANDLE)
+        element_hwnd = int(native_handle) if isinstance(native_handle, int) and native_handle else hwnd
+        operations = _operations_for(role, available, editable)
+        registry.elements[element_id] = ElementHandle(
             element_id=element_id,
+            element=element,
+            runtime_id=_runtime_id(element),
+            snapshot_id=snapshot_id,
             window_ref=window_ref,
+            hwnd=element_hwnd,
             role=role,
             name=name,
-            value=None if password else value,
+            rect=rect,
             enabled=enabled,
             visible=visible,
-            editable=bool(editable),
-            focusable=focusable,
-            focused=focused,
             operations=operations,
-            rect=rect,
-            index=registry.next_index,
-            path=path[-4:],
-            state={**state, "password": password},
-            text=None if password else element_text,
-            truncation=None if element_text is None or text is None or len(text) < text_limit else "length",
+            created_at=now(),
         )
-    )
-    registry.next_index += 1
-    if element_text and len(texts) < 40:
-        texts.append({"element_id": element_id, "role": role, "name": name, "text": element_text})
+        text: str | None = None
+        if role in TEXT_ROLES or value:
+            raw = value or name
+            text = raw[:text_limit] if text_limit else raw[:0]
+            if raw and len(raw) > len(text):
+                truncation.append(f"text truncated for {role}")
+        element_text = (text or None) if (role in TEXT_ROLES or value) else None
+        (elements if role in CHROME_ROLES else pending).append(
+            ElementInfo(
+                element_id=element_id,
+                window_ref=window_ref,
+                role=role,
+                name=name,
+                value=None if password else value,
+                enabled=enabled,
+                visible=visible,
+                editable=bool(editable),
+                focusable=focusable,
+                focused=focused,
+                operations=operations,
+                rect=rect,
+                index=registry.next_index,
+                path=path[-4:],
+                state={**state, "password": password},
+                text=None if password else element_text,
+                truncation=None if element_text is None or text is None or len(text) < text_limit else "length",
+            )
+        )
+        registry.next_index += 1
+        if element_text and len(texts) < 40:
+            texts.append({"element_id": element_id, "role": role, "name": name, "text": element_text})
 
-    for child in worker.children(element):
-        content_seen = _walk(
-            worker,
-            child,
-            registry,
-            snapshot_id,
-            window_ref,
-            hwnd,
-            elements,
-            pending,
-            texts,
-            depth=depth + 1,
-            max_depth=max_depth,
-            max_elements=max_elements,
-            include_invisible=include_invisible,
-            text_limit=text_limit,
-            truncation=truncation,
-            path=(*path, name or role),
-            skipped=skipped,
-            rows_dropped=rows_dropped,
-            content_cap=content_cap,
-            content_seen=content_seen,
-        )
     return content_seen
 
 
@@ -959,18 +1009,45 @@ def run_on_worker(worker: UiaWorker, fn: Callable[[UiaWorker], Any], timeout: fl
     return worker.submit(fn, timeout=timeout)
 
 
-def hit_is_descendant_or_self(worker: UiaWorker, target: ElementHandle, x: int, y: int) -> bool:
-    """Runtime IDs are opaque. Walk actual UIA parents to prove hit ancestry."""
-
-    def check(_worker: UiaWorker) -> bool:
+def point_hits_element(worker: UiaWorker, element: Any, x: int, y: int) -> bool:
+    """Run on the COM worker. Prove visibility through the actual hit and its ancestors."""
+    try:
         hit = worker.element_at_point(x, y)
         walker = worker.automation.RawViewWalker
         for _ in range(64):
             if not hit:
                 return False
-            if worker.automation.CompareElements(hit, target.element):
+            if worker.automation.CompareElements(hit, element):
                 return True
             hit = walker.GetParentElement(hit)
+    except Exception:
+        return False
+    return False
+
+
+def hit_is_descendant_or_self(worker: UiaWorker, target: ElementHandle, x: int, y: int) -> bool:
+    return worker.submit(lambda _: point_hits_element(worker, target.element, x, y), timeout=10.0)
+
+
+def selection_belongs_to(worker: UiaWorker, option: ElementHandle, container: ElementHandle) -> bool:
+    def check(_worker: UiaWorker) -> bool:
+        if not _bool(option.element.GetCurrentPropertyValue(AVAILABILITY["selectionitem"])):
+            return False
+        # Property exposes the owning selection container, including provider-linked popups.
+        owner = option.element.GetCurrentPropertyValue(30080)
+        if owner:
+            try:
+                if worker.automation.CompareElements(owner, container.element):
+                    return True
+            except Exception:
+                pass
+        current = option.element
+        for _ in range(32):
+            current = worker.automation.RawViewWalker.GetParentElement(current)
+            if not current:
+                break
+            if worker.automation.CompareElements(current, container.element):
+                return True
         return False
 
-    return worker.submit(check, timeout=10.0)
+    return bool(worker.submit(check, timeout=10.0))

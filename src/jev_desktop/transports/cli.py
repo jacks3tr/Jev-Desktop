@@ -66,7 +66,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {
         "screenshot": not args.no_screenshot,
         "inline_image": args.inline_image,
-        "scope": {"max_elements": args.max_elements, "window_refs": args.window},
+        "scope": {"max_elements": args.max_elements, "max_depth": args.max_depth, "window_refs": args.window},
     }
     if args.app_ref:
         params["app_ref"] = args.app_ref
@@ -266,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--run-id")
     inspect.add_argument("--resume-token")
     inspect.add_argument("--max-elements", type=int, default=240)
+    inspect.add_argument("--max-depth", type=int, default=12)
     inspect.add_argument("--no-screenshot", action="store_true")
     inspect.add_argument("--inline-image", action="store_true")
     inspect.set_defaults(func=cmd_inspect)

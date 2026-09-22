@@ -330,6 +330,7 @@ class PipeClient:
         self.timeout_s = timeout_s
         self._handle: int | None = None
         self._stream: _FramedHandle | None = None
+        self._request_lock = threading.RLock()
 
     def connect(self, *, timeout_s: float | None = None) -> None:
         if self._handle is not None:
@@ -355,17 +356,25 @@ class PipeClient:
             time.sleep(0.05)
 
     def request(self, envelope: Envelope, *, timeout_s: float | None = None) -> Envelope:
-        self.connect()
-        assert self._stream is not None
-        self._stream.write_line(json.dumps(envelope.to_json(), ensure_ascii=False).encode("utf-8") + b"\n")
-        deadline = time.monotonic() + (timeout_s if timeout_s is not None else self.timeout_s)
-        line = self._stream.read_line(deadline=deadline)
-        if line is None:
-            raise TimeoutError(f"no response from broker within {timeout_s or self.timeout_s}s")
-        return Envelope.from_json(json.loads(line.decode("utf-8")))
+        with self._request_lock:
+            try:
+                self.connect()
+                assert self._stream is not None
+                self._stream.write_line(json.dumps(envelope.to_json(), ensure_ascii=False).encode("utf-8") + b"\n")
+                deadline = time.monotonic() + (timeout_s if timeout_s is not None else self.timeout_s)
+                line = self._stream.read_line(deadline=deadline)
+                if line is None:
+                    raise TimeoutError("broker response timed out; input may have executed")
+                response = Envelope.from_json(json.loads(line.decode("utf-8")))
+                if response.kind != "response" or response.request_id != envelope.request_id:
+                    raise ConnectionClosed("broker response request ID does not match")
+                return response
+            except Exception:
+                self.close()
+                raise
 
     def close(self) -> None:
         if self._handle is not None:
             kernel32.CloseHandle(self._handle)
             self._handle = None
-            self._stream = None
+        self._stream = None

@@ -1,0 +1,21 @@
+{
+  "goal": "In the open Excel worksheet, set B2 to 18 and C3 to 7.5. Preserve all other cells. Use the Name Box to navigate: type the cell address and press Enter. Enter its value in the Formula Bar only after that worksheet cell is selected, then press Enter to commit. Stop when both cells show the requested values.",
+  "app_ref": "<from inspection>",
+  "window_refs": [
+    "<from inspection>"
+  ],
+  "texts": {
+    "B2_address_for_Name_Box": "B2",
+    "B2_value_for_Formula_Bar": "18",
+    "C3_address_for_Name_Box": "C3",
+    "C3_value_for_Formula_Bar": "7.5"
+  },
+  "hotkeys": [
+    "enter"
+  ],
+  "max_actions": 12,
+  "max_model_decisions": 24,
+  "max_elements": 240,
+  "max_depth": 24,
+  "timeout_seconds": 60
+}

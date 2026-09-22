@@ -115,7 +115,9 @@ def test_mcp_tools_expose_the_same_engine(live_broker, tmp_path):
             await session.initialize()
             tools = await session.list_tools()
             names = sorted(tool.name for tool in tools.tools)
-            observed = await session.call_tool("desktop_inspect", {"app_ref": APP_REF, "inline_image": True})
+            observed = await session.call_tool(
+                "desktop_inspect", {"app_ref": APP_REF, "inline_image": True, "max_depth": 24}
+            )
             text_blocks = [block for block in observed.content if getattr(block, "type", "") == "text"]
             image_blocks = [block for block in observed.content if getattr(block, "type", "") == "image"]
             payload = json.loads(text_blocks[0].text) if text_blocks else {}
@@ -202,7 +204,7 @@ def test_mcp_standalone_action_needs_no_test_and_consumes_inspection(live_broker
                             "jev-1.13.0",
                             {
                                 "operation": choice_answer("CLICK", ["CLICK", "WAIT", "ESCALATE"]),
-                                "CLICK_target": choice_answer(selected, [selected, NONE]),
+                                "CLICK_target": choice_answer("t1", ["t1", NONE]),
                             },
                         ),
                     )

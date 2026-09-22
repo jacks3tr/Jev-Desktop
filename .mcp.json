@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jev-desktop": {
+      "command": "python",
+      "args": [
+        "-m",
+        "jev_desktop.transports.mcp_stdio"
+      ]
+    }
+  }
+}

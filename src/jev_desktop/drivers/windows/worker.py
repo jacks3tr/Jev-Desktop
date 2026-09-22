@@ -9,7 +9,17 @@ from typing import Any
 
 from ...contracts import Pause
 
-METHODS = {"start", "list_apps", "list_windows", "observe", "snapshot", "capture", "identity", "bind_process"}
+METHODS = {
+    "discover",
+    "start",
+    "list_apps",
+    "list_windows",
+    "observe",
+    "snapshot",
+    "capture",
+    "identity",
+    "bind_process",
+}
 
 
 def serve(connection, evidence_dir: str, pending_inputs, pending_count) -> None:

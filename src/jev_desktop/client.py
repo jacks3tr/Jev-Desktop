@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ class BrokerClient:
         self._client: PipeClient | None = None
         self._session_id: str | None = None
         self._hello: dict[str, Any] | None = None
+        self._request_lock = threading.RLock()
 
     # -- connection ----------------------------------------------------------------
 
@@ -107,15 +109,24 @@ class BrokerClient:
     def call(
         self, method: str, params: Mapping[str, Any] | None = None, *, timeout_s: float | None = None
     ) -> dict[str, Any]:
-        self._ensure_session()
-        payload = dict(params or {})
-        payload.setdefault("session_id", self._session_id)
-        return self._transact(Envelope.request(method, payload, session_id=self._session_id), timeout_s=timeout_s)
+        with self._request_lock:
+            self._ensure_session()
+            payload = dict(params or {})
+            payload.setdefault("session_id", self._session_id)
+            return self._transact(Envelope.request(method, payload, session_id=self._session_id), timeout_s=timeout_s)
 
     def _transact(self, envelope: Envelope, *, timeout_s: float | None) -> dict[str, Any]:
-        self.connect(timeout_s=timeout_s)
-        assert self._client is not None
-        response = self._client.request(envelope, timeout_s=timeout_s or self.timeout_s)
+        try:
+            self.connect(timeout_s=timeout_s)
+            assert self._client is not None
+            response = self._client.request(envelope, timeout_s=timeout_s or self.timeout_s)
+        except Exception:
+            if self._client is not None:
+                self._client.close()
+            self._client = None
+            self._session_id = None
+            self._hello = None
+            raise
         if not response.ok:
             error = response.error or {}
             raise BrokerError(str(error.get("code", "error")), str(error.get("message", "")), error.get("detail"))
