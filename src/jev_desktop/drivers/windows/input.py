@@ -528,7 +528,7 @@ def execute(
                     mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
                 )
             ready = live_state(worker, handle)
-            if ready.root != ready.foreground_root:
+            if not ready.focused or ready.root != ready.foreground_root:
                 raise UncertainEffect(
                     "focus changed after the click; no text was typed",
                     mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
@@ -554,20 +554,24 @@ def execute(
         finally:
             win32.set_cursor_position(*previous)
         type_notes = [f"chars={len(request.text)}"]
-        observed = _live_value(worker, handle)
-        # SendInput can return while the application is still consuming the text.
-        # A strict prefix is evidence of pending input, not a reason to type again.
-        while (
-            request.replace_existing
-            and bool(observed)
-            and observed is not None
-            and observed != request.text
-            and request.text.startswith(observed)
-            and time.time() - started < request.deadline_s
-        ):
-            guard()
-            time.sleep(0.01)
+        try:
             observed = _live_value(worker, handle)
+            while request.replace_existing and observed is not None and observed != request.text:
+                if time.time() - started >= request.deadline_s:
+                    raise UncertainEffect(
+                        "text was dispatched but the field has not confirmed it; inspect before retrying",
+                        mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
+                    )
+                guard()
+                time.sleep(0.01)
+                observed = _live_value(worker, handle)
+        except UncertainEffect:
+            raise
+        except BaseException as exc:
+            raise UncertainEffect(
+                f"text was dispatched but readback failed: {exc}",
+                mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
+            ) from exc
         if observed is not None and observed != request.text:
             type_notes.append("observed value differs from dispatched text")
         return _receipt(request, DispatchMechanism.SEND_INPUT_KEYBOARD, inserted, started, notes=tuple(type_notes))

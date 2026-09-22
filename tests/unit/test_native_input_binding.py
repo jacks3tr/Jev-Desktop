@@ -2,9 +2,12 @@
 
 from types import SimpleNamespace as NS
 
+import pytest
+
 from jev_desktop.contracts import InputMode, Operation, Rect
 from jev_desktop.drivers.windows import input as native_input
 from jev_desktop.drivers.windows import uia
+from jev_desktop.journal import UncertainEffect
 
 
 def test_same_label_option_must_belong_to_selected_container(monkeypatch):
@@ -35,7 +38,7 @@ def test_same_label_option_must_belong_to_selected_container(monkeypatch):
     assert result[0] == "right-list"
 
 
-def test_empty_replacement_sends_delete_but_empty_append_does_not(monkeypatch):
+def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     rect = Rect(0, 0, 20, 20)
     handle = NS(operations=("TYPE_TEXT",), rect=rect)
     state = NS(rect=rect, focused=True, root=1, foreground_root=1)
@@ -69,3 +72,19 @@ def test_empty_replacement_sends_delete_but_empty_append_does_not(monkeypatch):
     request.replace_existing = False
     native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert keys == []
+
+    request.replace_existing = True
+    request.text = "Read-only"
+    sent = []
+    monkeypatch.setattr(native_input.win32, "type_unicode", lambda text: sent.append(text) or 18)
+    values = iter(["", "ead-only", "Read-only"])
+    monkeypatch.setattr(native_input, "_live_value", lambda *_: next(values))
+    monkeypatch.setattr(native_input.time, "sleep", lambda _: None)
+    native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+    assert sent == ["Read-only"]
+
+    request.deadline_s = 0
+    monkeypatch.setattr(native_input, "_live_value", lambda *_: "")
+    with pytest.raises(UncertainEffect):
+        native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+    assert sent == ["Read-only", "Read-only"]
