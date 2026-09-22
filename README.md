@@ -96,6 +96,7 @@ a screenshot to the calling agent after every action.
 ```
 
 For tasks that type, supply named exact strings in `texts` and allowed chords in `hotkeys`.
+Put passwords and other sensitive values in `secret_texts`; Jev sees only their names.
 See the [Chrome task](examples/browser.json). Jev returns control when it finishes, needs
 judgment or missing input, or reaches a limit. Check the final observation before reporting
 success. Tasks report actions, elapsed time, model latency, and reported token usage.

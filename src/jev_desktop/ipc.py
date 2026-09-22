@@ -2,8 +2,11 @@
 
 The pipe is created with a security descriptor that grants access only to SYSTEM, the
 object owner, and the current user SID, because Windows named-pipe defaults can otherwise include
-read access for Everyone and anonymous users. Client and server both verify that the peer
-runs in the same logon session; the pipe name itself embeds the logon session id.
+read access for Everyone and anonymous users. The server verifies that the client runs in the
+same Terminal Services session. The client grants the server identification only (never
+impersonation) and refuses a server process that does not run as the current user in the same
+session, so a pre-created (squatted) pipe never receives requests. The pipe name embeds the
+logon session id.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from typing import Any
 from uuid import uuid4
 
 from .contracts import ContractError, Envelope
-from .security import SecurityAttributes, current_user_sid, logon_session_id, session_id
+from .security import SecurityAttributes, current_user_sid, logon_session_id, process_user_sid, session_id
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -41,7 +44,7 @@ GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
 SECURITY_SQOS_PRESENT = 0x00100000
-SECURITY_IMPERSONATION = 0x00020000
+SECURITY_IDENTIFICATION = 0x00010000
 
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
@@ -103,6 +106,9 @@ kernel32.GetNamedPipeClientProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER
 kernel32.GetNamedPipeClientProcessId.restype = wintypes.BOOL
 kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
 kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+kernel32.FlushFileBuffers.restype = wintypes.BOOL
 
 
 def pipe_name(suffix: str = "broker") -> str:
@@ -118,19 +124,35 @@ def client_process_id(handle: int) -> int:
     return int(pid.value)
 
 
+def _process_session(pid: int) -> int | None:
+    value = wintypes.DWORD(0)
+    if not pid or not kernel32.ProcessIdToSessionId(pid, ctypes.byref(value)):
+        return None
+    return int(value.value)
+
+
 def peer_session_matches(handle: int) -> bool:
     """Verify the connected client runs in this Terminal Services session."""
-    pid = client_process_id(handle)
-    if not pid:
-        return False
-    peer_session = wintypes.DWORD(0)
-    if not kernel32.ProcessIdToSessionId(pid, ctypes.byref(peer_session)):
-        return False
-    return int(peer_session.value) == session_id()
+    return _process_session(client_process_id(handle)) == session_id()
+
+
+def verify_server(handle: int) -> None:
+    """Refuse a pipe server that is not this user's process in this session."""
+    pid = wintypes.ULONG(0)
+    if not kernel32.GetNamedPipeServerProcessId(handle, ctypes.byref(pid)):
+        raise UntrustedServer(f"could not identify the pipe server ({ctypes.get_last_error()})")
+    if process_user_sid(pid.value) != current_user_sid():
+        raise UntrustedServer(f"pipe server process {pid.value} does not run as the current user")
+    if _process_session(pid.value) != session_id():
+        raise UntrustedServer(f"pipe server process {pid.value} runs in a different session")
 
 
 class ConnectionClosed(RuntimeError):
     pass
+
+
+class UntrustedServer(ConnectionClosed):
+    """The pipe exists but is served by another account or session; never send it requests."""
 
 
 @dataclass
@@ -209,6 +231,12 @@ class PipeServer:
         self._stop = threading.Event()
         self._first = True
         self._lock = threading.Lock()
+        # One slot per pipe instance, listening or connected: when every instance is in use the
+        # accept loop waits for a connection to end instead of failing CreateNamedPipe.
+        self._slots = threading.BoundedSemaphore(max_instances)
+        self._pending: int | None = None
+        self._accept_done = threading.Event()
+        self._accept_done.set()
         self._threads: list[threading.Thread] = []
         self._on_event = on_event
         self._on_disconnect = on_disconnect
@@ -217,34 +245,78 @@ class PipeServer:
         if self._on_event is not None:
             self._on_event(kind, payload)
 
-    def serve_forever(self) -> None:
-        while not self._stop.is_set():
-            handle = self._create_instance()
-            if not handle:
-                self._log("pipe_create_failed", {"error": ctypes.get_last_error()})
-                break
-            connected = kernel32.ConnectNamedPipe(handle, None)
+    def claim(self) -> None:
+        """Create the first pipe instance now; raises if another server already owns the name."""
+        if self._pending is not None:
+            return
+        self._slots.acquire()
+        handle = self._create_instance()
+        if not handle:
             error = ctypes.get_last_error()
-            if not connected and error != ERROR_PIPE_CONNECTED:
-                kernel32.CloseHandle(handle)
-                continue
-            if self._stop.is_set():
-                kernel32.CloseHandle(handle)
-                break
-            thread = threading.Thread(target=self._serve, args=(handle,), daemon=True, name="pipe-conn")
-            thread.start()
-            self._threads.append(thread)
+            self._slots.release()
+            raise ctypes.WinError(error, f"could not create pipe {self.name}")
+        self._pending = handle
+
+    def serve_forever(self) -> None:
+        self._accept_done.clear()
+        try:
+            while not self._stop.is_set():
+                handle, self._pending = self._pending, None
+                if handle is None:
+                    if not self._slots.acquire(timeout=0.25):
+                        continue
+                    handle = self._create_instance()
+                    if not handle:  # instance exhaustion waits on a slot above, so this is fatal
+                        error = ctypes.get_last_error()
+                        self._slots.release()
+                        self._log("pipe_create_failed", {"error": error})
+                        break
+                connected = kernel32.ConnectNamedPipe(handle, None)
+                error = ctypes.get_last_error()
+                if self._stop.is_set() or (not connected and error != ERROR_PIPE_CONNECTED):
+                    self._close_instance(handle)
+                    continue
+                thread = threading.Thread(target=self._serve, args=(handle,), daemon=True, name="pipe-conn")
+                thread.start()
+                self._threads.append(thread)
+        finally:
+            if self._pending is not None:
+                self._close_instance(self._pending)
+                self._pending = None
+            self._accept_done.set()
         self._join_connections()
+
+    def shutdown(self) -> None:
+        """Stop accepting connections without waiting; safe to call from a request handler."""
+        self._stop.set()
+        threading.Thread(target=self._wake_accept, daemon=True, name="pipe-wake").start()
 
     def stop(self, *, timeout: float = 5.0) -> None:
         """Stop accepting connections and wait for the in-flight ones to finish."""
-        self._stop.set()
+        self.shutdown()
+        self._accept_done.wait(timeout)
         self._join_connections(timeout=timeout)
 
+    def _wake_accept(self) -> None:
+        # ConnectNamedPipe blocks until a client arrives, so connect throwaway clients until the
+        # accept loop has seen the stop flag.
+        while not self._accept_done.wait(0.05):
+            handle = kernel32.CreateFileW(
+                self.name, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, SECURITY_SQOS_PRESENT, None
+            )
+            if handle and handle != INVALID_HANDLE_VALUE:
+                kernel32.CloseHandle(handle)
+
     def _join_connections(self, *, timeout: float = 0.0) -> None:
+        current = threading.current_thread()
         for thread in list(self._threads):
-            thread.join(timeout=timeout)
+            if thread is not current:
+                thread.join(timeout=timeout)
         self._threads = [thread for thread in self._threads if thread.is_alive()]
+
+    def _close_instance(self, handle: int) -> None:
+        kernel32.CloseHandle(handle)
+        self._slots.release()
 
     def _create_instance(self) -> int:
         with self._lock:
@@ -309,7 +381,14 @@ class PipeServer:
                         )
                 if response is None:
                     break
-                stream.write_line(json.dumps(response.to_json(), ensure_ascii=False).encode("utf-8") + b"\n")
+                frame = json.dumps(response.to_json(), ensure_ascii=False).encode("utf-8") + b"\n"
+                if len(frame) > MAX_MESSAGE_BYTES:
+                    # The client drops the connection on an oversized frame; send a small error instead.
+                    too_large = Envelope.failure(
+                        response.request_id, "response_too_large", "response exceeds the maximum frame size"
+                    )
+                    frame = json.dumps(too_large.to_json()).encode("utf-8") + b"\n"
+                stream.write_line(frame)
         except ConnectionClosed as exc:
             self._log("connection_closed", {"error": str(exc)})
         finally:
@@ -320,8 +399,9 @@ class PipeServer:
                     self._on_disconnect(info)
                 except Exception as exc:
                     self._log("disconnect_handler_failed", {"error": str(exc)})
+            kernel32.FlushFileBuffers(handle)  # DisconnectNamedPipe discards a reply the client has not read
             kernel32.DisconnectNamedPipe(handle)
-            kernel32.CloseHandle(handle)
+            self._close_instance(handle)
 
 
 class PipeClient:
@@ -344,10 +424,15 @@ class PipeClient:
                     0,
                     None,
                     OPEN_EXISTING,
-                    SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                     None,
                 )
                 if handle and handle != INVALID_HANDLE_VALUE:
+                    try:
+                        verify_server(int(handle))
+                    except UntrustedServer:
+                        kernel32.CloseHandle(handle)
+                        raise
                     self._handle = int(handle)
                     self._stream = _FramedHandle(self._handle)
                     return

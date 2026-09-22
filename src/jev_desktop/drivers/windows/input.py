@@ -324,17 +324,27 @@ def invoke_semantic(handle: uia.ElementHandle, request: ActionRequest) -> tuple[
         scroll = _pattern(element, "UIA_ScrollPatternId", 10004)
         if scroll is None:
             raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "no scroll pattern"})
-        notches = int(request.scroll.get("notches", request.scroll.get("amount", 3)) or 3)
+        notches = _scroll_notches(request)
+        horizontal = bool(request.scroll.get("horizontal"))
         UIA = uia.uia_module()
-        large = UIA.ScrollAmount_LargeIncrement if notches > 0 else UIA.ScrollAmount_LargeDecrement
+        # Same convention as the wheel: positive is up or right. A UIA increment moves down
+        # (vertical) or right (horizontal), so only the vertical axis flips.
+        forward = notches > 0 if horizontal else notches < 0
+        step = UIA.ScrollAmount_SmallIncrement if forward else UIA.ScrollAmount_SmallDecrement
         none = UIA.ScrollAmount_NoAmount
-        if bool(request.scroll.get("horizontal")):
-            scroll.Scroll(large, none)
-        else:
-            scroll.Scroll(none, large)
+        for _ in range(abs(notches)):
+            if horizontal:
+                scroll.Scroll(step, none)
+            else:
+                scroll.Scroll(none, step)
         return "scroll", element
 
     raise Pause(Reason.UNSUPPORTED_CONTROL, {"operation": request.operation.value, "mode": "semantic"})
+
+
+def _scroll_notches(request: ActionRequest) -> int:
+    """Wheel notches: positive scrolls up (vertical) or right (horizontal)."""
+    return int(request.scroll.get("notches", request.scroll.get("amount", 3)) or 3)
 
 
 # --------------------------------------------------------------------------------------
@@ -382,7 +392,7 @@ def execute(
                 inserted = win32.scroll_wheel(
                     x,
                     y,
-                    notches=int(request.scroll.get("notches", 3)),
+                    notches=_scroll_notches(request),
                     horizontal=bool(request.scroll.get("horizontal", False)),
                 )
             else:
@@ -461,7 +471,7 @@ def execute(
         return _receipt(request, DispatchMechanism.SEND_INPUT_MOUSE, inserted, started, notes=(f"point={x},{y}",))
 
     if request.operation is Operation.SCROLL:
-        notches = int(request.scroll.get("notches", request.scroll.get("amount", 3)) or 3)
+        notches = _scroll_notches(request)
         horizontal = bool(request.scroll.get("horizontal"))
         guard()
         previous = win32.cursor_position()
@@ -554,9 +564,11 @@ def execute(
         finally:
             win32.set_cursor_position(*previous)
         type_notes = [f"chars={len(request.text)}"]
+        # Multi-line Win32 edits read back CRLF for every typed "\n".
+        expected = _newlines(request.text)
         try:
             observed = _live_value(worker, handle)
-            while request.replace_existing and observed is not None and observed != request.text:
+            while request.replace_existing and observed is not None and _newlines(observed) != expected:
                 if time.time() - started >= request.deadline_s:
                     raise UncertainEffect(
                         "text was dispatched but the field has not confirmed it; inspect before retrying",
@@ -572,11 +584,15 @@ def execute(
                 f"text was dispatched but readback failed: {exc}",
                 mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
             ) from exc
-        if observed is not None and observed != request.text:
+        if observed is not None and _newlines(observed) != expected:
             type_notes.append("observed value differs from dispatched text")
         return _receipt(request, DispatchMechanism.SEND_INPUT_KEYBOARD, inserted, started, notes=tuple(type_notes))
 
     raise Pause(Reason.UNSUPPORTED_CONTROL, {"operation": request.operation.value})
+
+
+def _newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _receipt(
@@ -629,7 +645,8 @@ def _focus_window(driver: Any, request: ActionRequest, guard: Any, started: floa
     guard()
     activated = win32.activate_window(handle.hwnd)
     if not activated:
-        raise Pause(Reason.PERMISSION_BOUNDARY, {"reason": "window could not be activated"})
+        # Activation may already have restored, raised, or reordered the window.
+        raise UncertainEffect("window could not be activated; it may have been restored or raised")
     return _receipt(
         request,
         DispatchMechanism.NONE,

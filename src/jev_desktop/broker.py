@@ -10,6 +10,7 @@ no input is issued unattended.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import sys
@@ -43,7 +44,7 @@ from .contracts import (
 )
 from .drivers.windows import WindowsDriver
 from .evidence import EvidenceStore, RetentionPolicy
-from .ipc import ConnectionInfo, PipeServer, pipe_name
+from .ipc import MAX_MESSAGE_BYTES, ConnectionInfo, PipeServer, pipe_name
 from .journal import DispatchJournal, JournalUnhealthy
 from .ownership import Ownership, emergency_clear, emergency_is_set, emergency_signal, session_description
 from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError, build_contexts
@@ -216,15 +217,19 @@ class Broker:
             self.journal.close()
 
     def serve_forever(self) -> None:
-        self.start()
-        self._server = PipeServer(
-            name=pipe_name("broker"),
+        server = PipeServer(
+            name=os.environ.get("JEV_DESKTOP_PIPE") or pipe_name("broker"),
             handler=self.handle,
             on_event=lambda kind, payload: self.journal.append_trace(None, f"pipe_{kind}", payload),
             on_disconnect=self.on_disconnect,
         )
+        # Claim the pipe first: a second broker must exit before it starts a driver or
+        # recovers the journal that the running broker is still using.
+        server.claim()
+        self._server = server
         try:
-            self._server.serve_forever()
+            self.start()
+            server.serve_forever()
         finally:
             self.close()
 
@@ -256,31 +261,19 @@ class Broker:
                 result = self._bye(params)
             else:
                 session = self.ownership.authorize(str(params.get("session_id") or "") or None)
-                if session.session_id not in self._by_peer.get(info.connection_id, []):
+                # Stop only removes capability. Its client sends it on a separate connection so it
+                # never waits behind that session's in-flight run.
+                if method != "stop" and session.session_id not in self._by_peer.get(info.connection_id, []):
                     raise AuthorizationError("session is bound to another connection")
                 if method in {"run", "act", "inspect"}:
                     with self._driver_lock:
-                        if method in {"run", "act"}:
-                            request_hash = keyed_fingerprint(
-                                self.runtime.config.fingerprint_secret,
-                                canonical_json({"method": method, "params": params}),
-                            )
-                            cached = self.journal.begin_request(envelope.request_id, request_hash)
-                            if cached is not None:
-                                return Envelope.from_json(cached)
                         result = getattr(self, f"_m_{method}")(session, params)
-                        response = Envelope.success(
-                            envelope.request_id,
-                            result,
-                            session_id=params.get("session_id"),
-                            run_id=params.get("run_id"),
-                        )
-                        if method in {"run", "act"}:
-                            self.journal.finish_request(envelope.request_id, response.to_json())
-                        return response
-                result = getattr(self, f"_m_{method}")(session, params)
-            return Envelope.success(
-                envelope.request_id, result, session_id=params.get("session_id"), run_id=params.get("run_id")
+                else:
+                    result = getattr(self, f"_m_{method}")(session, params)
+            return fit_frame(
+                Envelope.success(
+                    envelope.request_id, result, session_id=params.get("session_id"), run_id=params.get("run_id")
+                )
             )
         except AuthorizationError as exc:
             return Envelope.failure(envelope.request_id, "unauthorized", str(exc))
@@ -326,7 +319,7 @@ class Broker:
                 "operations": [operation.value for operation in Operation],
                 "input_modes": [mode.value for mode in InputMode],
                 "transport": "named_pipe",
-                "pipe": pipe_name("broker"),
+                "pipe": self._server.name if self._server is not None else pipe_name("broker"),
             },
         }
 
@@ -479,13 +472,19 @@ class Broker:
         if not isinstance(task, dict):
             raise ContractError("task must be an object")
         texts = task.get("texts", {})
+        secret_texts = task.get("secret_texts", {})
         hotkeys = task.get("hotkeys", [])
         if (
             not isinstance(texts, dict)
-            or len(texts) > 16
-            or any(not isinstance(name, str) or not isinstance(value, str) for name, value in texts.items())
+            or not isinstance(secret_texts, dict)
+            or len(texts) + len(secret_texts) > 16
+            or set(texts) & set(secret_texts)
+            or any(
+                not isinstance(name, str) or not isinstance(value, str)
+                for name, value in [*texts.items(), *secret_texts.items()]
+            )
         ):
-            raise ContractError("texts must contain at most 16 named strings")
+            raise ContractError("texts and secret_texts must hold at most 16 uniquely named strings")
         if not isinstance(hotkeys, list) or len(hotkeys) > 8 or any(not isinstance(key, str) for key in hotkeys):
             raise ContractError("hotkeys must contain at most 8 chords")
         from .drivers.windows.input import parse_chord
@@ -512,6 +511,7 @@ class Broker:
             },
             "fixtures": {
                 **{f"text:{name}": value for name, value in texts.items()},
+                **{f"secret:{name}": value for name, value in secret_texts.items()},
                 **{f"key:{index}": value for index, value in enumerate(hotkeys)},
             },
             "limits": {
@@ -535,13 +535,13 @@ class Broker:
                 f"no decision policy is configured: set {self.config.policy.api_key_env} for the broker "
                 "process, or drive the run with desktop_act"
             )
-        created = self.runtime.create_run(spec, session_id=session.session_id)
         inputs_payload = dict(params.get("inputs") or {})
         inputs = ResumeInputs(
             fixtures=dict(inputs_payload.get("fixtures") or {}),
             visual_results=dict(inputs_payload.get("visual_results") or {}),
             verifier_results=dict(inputs_payload.get("verifier_results") or {}),
         )
+        created = self.runtime.create_run(spec, session_id=session.session_id)
         if params.get("start_only"):
             state = self.runtime._load(created["run_id"])
             self.runtime._apply_inputs(state, inputs)
@@ -761,7 +761,8 @@ class Broker:
     def _m_shutdown(self, session, params) -> dict[str, Any]:
         self.journal.append_trace(None, "shutdown_requested", {"session": session.session_id})
         if self._server is not None:
-            self._server.stop()
+            # This runs on a connection thread: signal only. serve_forever's caller joins and closes.
+            self._server.shutdown()
         return {"stopping": True}
 
     # -- helpers -------------------------------------------------------------------
@@ -838,6 +839,50 @@ class Broker:
             images.append(self._evidence_payload(reference, include_base64=True))
         payload["images"] = images
         return payload
+
+
+def _frame_size(payload: Envelope) -> int:
+    return len(json.dumps(payload.to_json(), ensure_ascii=False).encode("utf-8")) + 1  # + newline
+
+
+def _inline_images(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        found = [value] if isinstance(value.get("base64"), str) else []
+        return found + [image for item in value.values() for image in _inline_images(item)]
+    if isinstance(value, list):
+        return [image for item in value for image in _inline_images(item)]
+    return []
+
+
+def fit_frame(response: Envelope, limit: int = MAX_MESSAGE_BYTES) -> Envelope:
+    """Keep a response inside one pipe frame, so a rotated resume token always reaches the client.
+
+    Inline images are dropped first (largest first; each stays fetchable by evidence ID). If
+    the rest is still too large, only the run identity and resume token are returned.
+    """
+    size = _frame_size(response)
+    if size <= limit or not response.ok:
+        return response
+    result = copy.deepcopy(dict(response.result or {}))
+    for image in sorted(_inline_images(result), key=lambda item: len(item["base64"]), reverse=True):
+        size -= len(image.pop("base64")) - 32  # conservative: the omission marker adds a few bytes
+        image["inline_omitted"] = True
+        if size <= limit:
+            break
+    fitted = replace(response, result=result)
+    if _frame_size(fitted) <= limit:
+        return fitted
+    kept: dict[str, Any] = {
+        key: result[key] for key in ("run_id", "resume_token", "execution", "reason") if key in result
+    }
+    return Envelope.failure(
+        response.request_id,
+        "response_too_large",
+        "response exceeds the maximum frame size; fetch evidence and status separately",
+        kept,
+        session_id=response.session_id,
+        run_id=response.run_id,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

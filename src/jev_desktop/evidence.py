@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,8 @@ class EvidenceStore:
     retention: RetentionPolicy = field(default_factory=RetentionPolicy)
     _index: dict[str, EvidenceRef] = field(default_factory=dict)
     _keep: set[str] = field(default_factory=set)
+    # Health reports read usage from any connection thread while inspection and runs register/prune.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -142,14 +145,16 @@ class EvidenceStore:
 
     def register(self, reference: EvidenceRef) -> EvidenceRef:
         resolve_approved_path(reference.path, [str(self.root)], must_exist=True)
-        if reference.evidence_id not in self._index:
-            self._append_reference(reference)
-        self._index[reference.evidence_id] = reference
+        with self._lock:
+            if reference.evidence_id not in self._index:
+                self._append_reference(reference)
+            self._index[reference.evidence_id] = reference
         return reference
 
     def retain(self, evidence_id: str) -> None:
-        self._keep.add(evidence_id)
-        self._append_reference(self.get(evidence_id))
+        with self._lock:
+            self._keep.add(evidence_id)
+            self._append_reference(self.get(evidence_id))
 
     def _append_reference(self, reference: EvidenceRef) -> None:
         payload = {**reference.to_json(), "retained": reference.evidence_id in self._keep}
@@ -175,7 +180,10 @@ class EvidenceStore:
 
     def prune(self, *, now: float | None = None) -> dict[str, int]:
         """Delete aged evidence, but keep failure/visual-boundary evidence until the hard cap."""
-        moment = time.time() if now is None else now
+        with self._lock:
+            return self._prune(time.time() if now is None else now)
+
+    def _prune(self, moment: float) -> dict[str, int]:
         removed, kept, freed = 0, 0, 0
         changed_runs: set[str] = set()
         for reference in list(self._index.values()):
@@ -247,8 +255,9 @@ class EvidenceStore:
             temporary.replace(manifest)
 
     def usage(self) -> dict[str, int]:
-        return {
-            "references": len(self._index),
-            "bytes": sum(reference.size_bytes for reference in self._index.values()),
-            "disc_root_bytes": sum(child.stat().st_size for child in self.root.rglob("*") if child.is_file()),
-        }
+        with self._lock:
+            return {
+                "references": len(self._index),
+                "bytes": sum(reference.size_bytes for reference in self._index.values()),
+                "disc_root_bytes": sum(child.stat().st_size for child in self.root.rglob("*") if child.is_file()),
+            }

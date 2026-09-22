@@ -129,7 +129,8 @@ def desktop_inspect(
 @server.tool(
     description=(
         "Preferred for routine desktop use: supply task with goal, app_ref, window_refs, optional "
-        "texts (named exact strings), hotkeys (chords), max_actions (default 20), max_model_decisions "
+        "texts (named exact strings), secret_texts (named strings Jev never sees), hotkeys (chords), "
+        "max_actions (default 20), max_model_decisions "
         "(default 40), max_elements (default 180), max_depth (default 12), and timeout_seconds "
         "(default 60). Jev observes and acts locally until done or blocked. Returns final observation "
         "and action/timing/token metrics without requiring a caller turn per action. "
@@ -235,25 +236,23 @@ def desktop_act(
 
 @server.tool(
     description=(
-        "Cancel the caller's run, release desktop control, or operate the local emergency stop. The "
+        "Cancel the caller's run, release desktop control, or set the local emergency stop. The "
         "emergency stop is independent of any run, model, or capture work: it blocks all further input "
-        "until it is explicitly cleared."
+        "until the user clears it."
     )
 )
 def desktop_stop(
     run_id: str | None = None,
     emergency: bool = False,
-    clear_emergency: bool = False,
     reason: str | None = None,
     resume_token: str | None = None,
 ) -> list[Any]:
     if emergency:
-        from ..ownership import emergency_clear, emergency_signal
+        # Clearing is deliberately not offered here: the agent being halted must not undo the halt.
+        from ..ownership import emergency_signal
 
-        ok = emergency_clear() if clear_emergency else emergency_signal()
-        return _content({"emergency_stop": "cleared" if clear_emergency else "set", "ok": ok})
-    params: dict[str, Any] = {"emergency": emergency, "clear": clear_emergency}
-    params["resume_token"] = resume_token
+        return _content({"emergency_stop": "set", "ok": emergency_signal()})
+    params: dict[str, Any] = {"resume_token": resume_token}
     if run_id:
         params["run_id"] = run_id
     if reason:

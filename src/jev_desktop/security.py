@@ -17,6 +17,7 @@ advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 TOKEN_QUERY = 0x0008
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TokenUser = 1
 SDDL_REVISION_1 = 1
 ERROR_INSUFFICIENT_BUFFER = 122
@@ -59,12 +60,32 @@ advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
 advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
 kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 kernel32.LocalFree.restype = ctypes.c_void_p
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 
 def current_user_sid() -> str:
     """SID string of the process token's user, e.g. ``S-1-5-21-...-1001``."""
+    return _process_user_sid(kernel32.GetCurrentProcess())
+
+
+def process_user_sid(pid: int) -> str | None:
+    """SID string of another local process's token user, or None when it cannot be read."""
+    process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not process:
+        return None
+    try:
+        return _process_user_sid(process)
+    except DriverError:
+        return None
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _process_user_sid(process: int) -> str:
     token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+    if not advapi32.OpenProcessToken(process, TOKEN_QUERY, ctypes.byref(token)):
         raise DriverError(f"OpenProcessToken failed ({ctypes.get_last_error()})")
     try:
         size = wintypes.DWORD(0)
@@ -124,7 +145,7 @@ def session_id() -> int:
 
 
 def logon_session_id() -> int:
-    """Logon session LUID lower half for the process token (distinguishes RDP/local logons)."""
+    """Logon session LUID of the process token as one 64-bit value (distinguishes RDP/local logons)."""
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
         raise DriverError(f"OpenProcessToken failed ({ctypes.get_last_error()})")
@@ -138,7 +159,9 @@ def logon_session_id() -> int:
         if not advapi32.GetTokenInformation(token, 10, buffer, size.value, ctypes.byref(size)):
             raise DriverError(f"GetTokenInformation(TokenStatistics) failed ({ctypes.get_last_error()})")
         # TOKEN_STATISTICS: LUID TokenId (8 bytes), LUID AuthenticationId (8 bytes) ...
-        authentication_id_low = ctypes.c_uint32.from_buffer(buffer, 12).value
-        return int(authentication_id_low)
+        # A LUID is {DWORD LowPart; LONG HighPart}, so AuthenticationId.LowPart sits at offset 8.
+        low = ctypes.c_uint32.from_buffer(buffer, 8).value
+        high = ctypes.c_uint32.from_buffer(buffer, 12).value
+        return (high << 32) | low
     finally:
         kernel32.CloseHandle(token)

@@ -17,18 +17,10 @@ from pathlib import Path
 from ...contracts import DriverError, ExpectedIdentity, IdentityReport, IdentityStatus, now
 from . import win32
 
-_HASH_CACHE: dict[tuple[str, int, int], str] = {}
-
 
 def sha256_file(path: str) -> str | None:
-    try:
-        stat = os.stat(path)
-        key = (os.path.normcase(os.path.abspath(path)), stat.st_size, int(stat.st_mtime_ns))
-    except OSError:
-        return None
-    cached = _HASH_CACHE.get(key)
-    if cached is not None:
-        return cached
+    """Hash the file as it is now. Deliberately uncached: a rebuilt executable copied with
+    its size and timestamps preserved must never be reported as the previous build."""
     digest = hashlib.sha256()
     try:
         with open(path, "rb") as handle:
@@ -36,10 +28,7 @@ def sha256_file(path: str) -> str | None:
                 digest.update(block)
     except OSError:
         return None
-    value = digest.hexdigest()
-    _HASH_CACHE.clear()  # bounded: only the most recent file matters for identity work
-    _HASH_CACHE[key] = value
-    return value
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)

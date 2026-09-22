@@ -115,6 +115,7 @@ def test_mcp_tools_expose_the_same_engine(live_broker, tmp_path):
             await session.initialize()
             tools = await session.list_tools()
             names = sorted(tool.name for tool in tools.tools)
+            stop_tool = next(tool for tool in tools.tools if tool.name == "desktop_stop")
             observed = await session.call_tool(
                 "desktop_inspect", {"app_ref": APP_REF, "inline_image": True, "max_depth": 24}
             )
@@ -131,6 +132,7 @@ def test_mcp_tools_expose_the_same_engine(live_broker, tmp_path):
             stop_payload = json.loads(stop_text[0].text) if stop_text else {}
         return {
             "tools": names,
+            "stop_arguments": set(stop_tool.input_schema["properties"]),
             "inspect": payload,
             "images": len(image_blocks),
             "run": run_payload,
@@ -143,6 +145,8 @@ def test_mcp_tools_expose_the_same_engine(live_broker, tmp_path):
         log.close()
 
     assert result["tools"] == ["desktop_act", "desktop_inspect", "desktop_run", "desktop_stop"]
+    assert "emergency" in result["stop_arguments"]
+    assert not {name for name in result["stop_arguments"] if "clear" in name}, "the halted agent cannot clear"
     assert {element["name"] for element in result["inspect"]["elements"]} == {"Save", "Saved"}
     assert result["images"] >= 1, "the screenshot must arrive as MCP image content"
     assert result["run"]["execution"] == "completed"

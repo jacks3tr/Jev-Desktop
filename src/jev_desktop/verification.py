@@ -101,6 +101,30 @@ def compare(observed: Any, expected: Mapping[str, Any]) -> tuple[bool, str]:
     raise ContractError(f"unsupported comparator {comparator}")
 
 
+def validate_assertion(spec: AssertionSpec) -> None:
+    """Reject operands that would otherwise fail during evaluation, after input was sent."""
+
+    def number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    expected = spec.expected or {}
+    target = spec.target or {}
+    numeric = ["gte", "lte"] + (["bytes", "after"] if spec.evaluator is Evaluator.ARTIFACT else [])
+    for key in numeric:
+        if key in expected and not number(expected[key]):
+            raise ContractError(f"assertion {spec.assertion_id}: {key} must be a number")
+    if "in" in expected and not isinstance(expected["in"], list):
+        raise ContractError(f"assertion {spec.assertion_id}: in must be a list")
+    patterns = [target.get(key) for key in ("name_regex", "value_regex", "title_regex", "content_regex")]
+    for pattern in [*patterns, expected.get("regex")]:
+        if not pattern:
+            continue
+        try:
+            re.compile(str(pattern))
+        except re.error as exc:
+            raise ContractError(f"assertion {spec.assertion_id}: invalid regular expression: {exc}") from exc
+
+
 # --------------------------------------------------------------------------------------
 # Element matching
 # --------------------------------------------------------------------------------------

@@ -28,6 +28,7 @@ psapi = ctypes.WinDLL("psapi", use_last_error=True)
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
 SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
 SM_CXSCREEN, SM_CYSCREEN = 0, 1
+SM_SWAPBUTTON = 23
 
 INPUT_MOUSE, INPUT_KEYBOARD = 0, 1
 MOUSEEVENTF_MOVE = 0x0001
@@ -338,6 +339,15 @@ gdi32.DeleteDC.restype = wintypes.BOOL
 gdi32.SetStretchBltMode.argtypes = [wintypes.HDC, ctypes.c_int]
 gdi32.SetStretchBltMode.restype = ctypes.c_int
 
+dwmapi: Any
+try:
+    dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+except OSError:  # pragma: no cover - DWM is part of every supported Windows
+    dwmapi = None
+else:
+    dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
 SRCCOPY = 0x00CC0020
 HALFTONE = 4
 CAPTUREBLT = 0x40000000
@@ -418,9 +428,9 @@ def _send(inputs: list[INPUT]) -> int:
 def _send_batch(inputs: list[INPUT]) -> int:
     if not inputs:
         return 0
-    if any(event.type == INPUT_KEYBOARD for event in inputs) and any(
-        key_down(vk) for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C)
-    ):
+    # A held modifier turns keys into chords and clicks or wheel turns into shift-click,
+    # ctrl-click, or zoom, so it blocks mouse batches as well as keyboard ones.
+    if any(key_down(vk) for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C)):
         from ...contracts import Pause, Reason
 
         raise Pause(Reason.USER_TAKEOVER, {"reason": "a modifier key is already held"})
@@ -487,7 +497,13 @@ def move_mouse(x: int, y: int) -> int:
 
 
 def click_at(x: int, y: int, *, double: bool = False, button: str = "left") -> int:
-    """Submit balanced mouse events together, with no held button between batches."""
+    """Submit balanced mouse events together, with no held button between batches.
+
+    `button` is logical: SendInput flags name physical buttons, so a swapped-button
+    configuration maps the primary (left) click onto the physical right button.
+    """
+    if button in {"left", "right"} and user32.GetSystemMetrics(SM_SWAPBUTTON):
+        button = "right" if button == "left" else "left"
     down, up = {
         "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
         "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
@@ -500,6 +516,7 @@ def click_at(x: int, y: int, *, double: bool = False, button: str = "left") -> i
 
 
 def scroll_wheel(x: int, y: int, *, notches: int, horizontal: bool = False) -> int:
+    """Wheel convention: positive notches scroll up (vertical) or right (horizontal)."""
     return _send(
         [
             _mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x, y),
@@ -581,12 +598,9 @@ def window_rect(hwnd: int) -> Rect:
 
 def is_cloaked(hwnd: int) -> bool:
     """UWP/ghost windows report visible but are cloaked."""
-    try:
-        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-    except OSError:  # pragma: no cover
+    if dwmapi is None:  # pragma: no cover
         return False
     value = ctypes.c_int(0)
-    dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
     result = dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(value), ctypes.sizeof(value))
     return result == 0 and value.value != 0
 
@@ -694,7 +708,8 @@ def enum_top_level_windows() -> list[int]:
 
 
 def is_top_level(hwnd: int) -> bool:
-    return int(user32.GetAncestor(hwnd, GA_ROOT)) == int(hwnd)
+    """False for a handle that has already been destroyed (GetAncestor returns NULL)."""
+    return int(user32.GetAncestor(hwnd, GA_ROOT) or 0) == int(hwnd)
 
 
 def is_owned_popup(hwnd: int) -> bool:

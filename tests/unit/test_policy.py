@@ -329,6 +329,32 @@ def test_choice_accepts_rounded_distribution_without_lowering_confidence_floor()
     assert failure.value.reason_value == "low_confidence"
 
 
+def test_near_tie_between_targets_pauses_even_above_the_confidence_floor():
+    options = [f"t{index}" for index in range(1, 150)] + [NONE]
+    tail = (1.0 - 0.46 - 0.44) / (len(options) - 2)
+    probabilities = dict.fromkeys(options, tail) | {"t1": 0.46, "t2": 0.44}
+    answer = {"type": "choice", "choice": "t1", "probabilities": probabilities, "confidence": 0.46}
+    assert valid_choice(answer, set(options), 0.45) == "t1"
+    with pytest.raises(Pause) as failure:
+        valid_choice(answer, set(options), 0.45, 0.1)
+    assert failure.value.reason_value == Reason.LOW_CONFIDENCE.value
+
+
+def test_diffuse_rounded_distribution_is_low_confidence_not_malformed():
+    # 200 options: the tail rounds to zero, so the reported sum falls well short of 1.
+    options = {f"t{index}" for index in range(200)}
+    probabilities = dict.fromkeys(options, 0.0) | {"t0": 0.3, "t1": 0.25, "t2": 0.2}
+    answer = {"type": "choice", "choice": "t0", "probabilities": probabilities, "confidence": 0.2}
+    with pytest.raises(Pause) as failure:
+        valid_choice(answer, options, 0.45)
+    assert failure.value.reason_value == Reason.LOW_CONFIDENCE.value
+
+
+def test_target_margin_must_be_a_probability():
+    with pytest.raises(PolicyError):
+        PolicyConfig(target_margin=1.5).validate()
+
+
 def test_wire_targets_resolve_to_original_control_without_truncating_text():
     from jev_desktop.policy import decision_state
 

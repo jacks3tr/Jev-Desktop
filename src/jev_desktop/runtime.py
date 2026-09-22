@@ -72,6 +72,7 @@ from .verification import (
     aggregate_verdict,
     evaluate,
     qualified_assertions,
+    validate_assertion,
 )
 
 RESERVED_DISPATCH_STATES = {DispatchState.DISPATCHING, DispatchState.UNCERTAIN}
@@ -108,6 +109,13 @@ class ResumeInputs:
     fixtures: Mapping[str, str] = field(default_factory=dict)
     visual_results: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     verifier_results: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(value, str) for value in self.fixtures.values()):
+            raise ContractError("resume fixture values must be strings")
+        results = {**self.visual_results, **self.verifier_results}
+        if any(not isinstance(value, Mapping) for value in results.values()):
+            raise ContractError("resume evaluator results must be objects")
 
 
 @dataclass
@@ -405,6 +413,7 @@ class Runtime:
                 ),
                 state.slice_deadline - self.config.clock(),
             )
+        actions = state.actions
         try:
             result = self._act(run_id=run_id, session_id=session_id, resume_token=resume_token, request=request)
             state.resume_token = new_id("resume")
@@ -415,6 +424,12 @@ class Runtime:
             state.uncertain = True
             self._persist(state)
             raise
+        except Pause as pause:
+            if state.actions == actions:
+                raise
+            # Input was sent, so the presented token must not authorize another action.
+            state.resume_token = new_id("resume")
+            raise Pause(pause.reason, {**pause.detail, "resume_token": state.resume_token}) from pause
         finally:
             self._persist(state)
             if hasattr(self.driver, "set_boundary"):
@@ -471,12 +486,14 @@ class Runtime:
         if request.point is not None:
             reference = self.evidence.get(request.point.evidence_id)
             request.point.resolve(reference, run_id, request.snapshot_id)
+        if not state.steps:
+            self._evaluate_due(state, snapshot, checkpoint="run_start")
         guarded = replace(request, run_id=run_id, lease_generation=lease.generation)
         guarded = replace(guarded, request_hash=self._request_hash(state, guarded))
 
         def guard() -> None:
             if self.config.clock() >= state.slice_deadline:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+                raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
             self.ownership.checkpoint(
                 run_id=run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=session_id
             )
@@ -531,7 +548,7 @@ class Runtime:
             )
             state.summary["task_observation"] = self._observation_summary(snapshot)
             if self.config.clock() >= deadline:
-                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "slice_deadline"})
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, self._deadline_budget(state))
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
@@ -548,7 +565,9 @@ class Runtime:
                             [("up", 3), ("down", -3)]
                             if operation is Operation.SCROLL
                             else [
-                                (name, value) for name, value in state.spec.fixtures.items() if name.startswith("text:")
+                                (name, value)
+                                for name, value in state.spec.fixtures.items()
+                                if name.startswith(("text:", "secret:"))
                             ]
                         )
                         if operation is not Operation.SCROLL and len(values) > 1:
@@ -604,7 +623,7 @@ class Runtime:
             if value_target is not None:
                 choices = []
                 for name, value in state.spec.fixtures.items():
-                    if not name.startswith("text:"):
+                    if not name.startswith(("text:", "secret:")):
                         continue
                     if (
                         value_target.operation is Operation.TYPE_TEXT
@@ -614,7 +633,11 @@ class Runtime:
                     candidate = replace(
                         value_target,
                         element_id=new_id("cfg"),
-                        description=f"Enter {value!r}, supplied as {name.removeprefix('text:')}",
+                        description=(
+                            f"Enter the secret value {name.removeprefix('secret:')} ({len(value)} characters)"
+                            if name.startswith("secret:")
+                            else f"Enter {value!r}, supplied as {name.removeprefix('text:')}"
+                        ),
                         fixture_ref=name,
                     )
                     choices.append(candidate)
@@ -661,17 +684,18 @@ class Runtime:
                 for name, value in state.spec.fixtures.items()
                 if name.startswith("text:")
             }
+            secret_text = {
+                name.removeprefix("secret:"): f"withheld, {len(value)} characters"
+                for name, value in state.spec.fixtures.items()
+                if name.startswith("secret:")
+            }
+            if secret_text:
+                model_state["secret_text"] = secret_text
             model_state["allowed_hotkeys"] = [
                 value for name, value in state.spec.fixtures.items() if name.startswith("key:")
             ]
             model_state["focused_window"] = focused.title if focused else None
             model_state = with_permitted_operations(model_state, [context.operation for context in contexts])
-            model_state["task_rules"] = (
-                "Work toward the goal. DONE means the requested result is visible in the current observation. "
-                "Do not assume a click succeeded. Use only supplied text and chords. "
-                "Text entry changes the field; a supplied hotkey may be needed to submit or activate it. "
-                "ESCALATE for missing input, judgment, or controls. Do not repeat successful actions."
-            )
             state.decisions += 1
             self._persist(state)
             try:
@@ -818,7 +842,7 @@ class Runtime:
             if self.ownership.flags(state.run_id).cancelled:
                 return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
             if self.config.clock() >= deadline:
-                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "slice_deadline"})
+                return self._pause(state, Reason.BUDGET_EXHAUSTED.value, self._deadline_budget(state))
 
             step = self._current_step(state)
             if (
@@ -965,7 +989,7 @@ class Runtime:
         attempts = 0
         while True:
             if self.config.clock() >= state.slice_deadline:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+                raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
             try:
                 scope = self._scope(state)
                 if completion:
@@ -1072,7 +1096,7 @@ class Runtime:
         )
         remaining = state.slice_deadline - self.config.clock()
         if remaining <= 0:
-            raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+            raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
         if state.decisions >= state.spec.limits.max_model_decisions:
             raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_model_decisions"})
         state.decisions += 1
@@ -1247,7 +1271,7 @@ class Runtime:
 
         def guard() -> None:
             if self.config.clock() >= state.slice_deadline:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+                raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
             self.ownership.checkpoint(
                 run_id=state.run_id,
                 lease_id=lease.lease_id,
@@ -1312,6 +1336,7 @@ class Runtime:
         state.steps[-1] = replace(state.steps[-1], observation_changed=changed)
         if changed:
             state.no_progress = 0
+            state.stale_retries = 0
         else:
             state.no_progress += 1
             if state.no_progress > spec.limits.no_progress_retries:
@@ -1368,6 +1393,7 @@ class Runtime:
         )
 
     def _scope(self, state: _RunState):
+        # A rebinding clears window references only when the spec had none or a launch replaced its process.
         app_ref = state.summary.get("bound_app_ref")
         return replace(state.spec.scope, app_ref=app_ref, window_refs=()) if app_ref else state.spec.scope
 
@@ -1403,7 +1429,7 @@ class Runtime:
 
         def guard() -> None:
             if self.config.clock() >= state.slice_deadline:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+                raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
             self.ownership.checkpoint(
                 run_id=state.run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=lease.session_id
             )
@@ -1440,6 +1466,16 @@ class Runtime:
     def _restore_binding(self, state: _RunState) -> None:
         if not state.summary.get("restore_binding"):
             return
+        launched = any(
+            step.operation is Operation.LAUNCH_APP and step.step_id in state.completed_steps
+            for step in state.spec.steps
+        )
+        if state.spec.scope.window_refs and not launched:
+            # Window references do not survive a restart; rebinding the app alone would widen the frozen scope.
+            raise Pause(
+                Reason.STALE_OBSERVATION,
+                {"detail": "window references expired with the broker restart; inspect again and create a new run"},
+            )
         previous = state.summary.get("identity", {}).get("observed", {})
         if not previous:
             raise Pause(
@@ -1552,7 +1588,7 @@ class Runtime:
         )
         while result.status is not AssertionStatus.PASSED and self.config.clock() < deadline:
             if self.config.clock() >= state.slice_deadline:
-                raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "slice_deadline"})
+                raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
             self.config.sleeper(min(0.25, deadline - self.config.clock(), state.slice_deadline - self.config.clock()))
             try:
                 snapshot = self._observe(state)
@@ -1585,12 +1621,17 @@ class Runtime:
         return evaluate(spec, context)
 
     def _merge_assertion(self, state: _RunState, result: AssertionResult) -> None:
+        # An `any` assertion must hold after every action, so it keeps its worst evaluation.
+        every_action = any(
+            spec.assertion_id == result.assertion_id and spec.checkpoint == "any" for spec in state.spec.assertions
+        )
+        rank = worst_rank if every_action else report_rank
         for index, existing in enumerate(state.assertions):
             if existing.assertion_id != result.assertion_id:
                 continue
             if existing.status is AssertionStatus.FAILED:
                 return  # a proven failure is never erased by a later evaluation
-            if report_rank(result) >= report_rank(existing):
+            if rank(result) >= rank(existing):
                 state.assertions[index] = result
             return
         state.assertions.append(result)
@@ -1660,14 +1701,16 @@ class Runtime:
             return self._pause(state, Reason.STEP_UNRESOLVED.value, {"remaining_steps": remaining})
         return self._complete(state, snapshot)
 
-    def _pause(self, state: _RunState, reason: str, detail: Mapping[str, Any]) -> RunResult:
+    def _pause(
+        self, state: _RunState, reason: str, detail: Mapping[str, Any], snapshot: Snapshot | None = None
+    ) -> RunResult:
         if self.ownership.flags(state.run_id).cancelled:
             return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
         state.status = RunStatus.PAUSED.value
         state.pause_reason = reason
         state.pause_detail = dict(detail)
         verdict, _ = self._verdict(state, Execution.PAUSED.value)
-        return self._result(state, Execution.PAUSED, verdict, reason, detail=detail)
+        return self._result(state, Execution.PAUSED, verdict, reason, snapshot=snapshot, detail=detail)
 
     def _stopped(self, state: _RunState, reason: str, message: str) -> RunResult:
         state.status = RunStatus.CANCELLED.value
@@ -1720,19 +1763,16 @@ class Runtime:
             keep=True,
         )
         if snapshot.coverage.value != "complete" or snapshot.truncation:
-            state.status = RunStatus.PAUSED.value
-            return self._result(
+            return self._pause(
                 state,
-                Execution.PAUSED,
-                Verdict.INCONCLUSIVE,
                 Reason.NEEDS_VISUAL_ASSISTANCE.value,
-                snapshot=snapshot,
-                detail={
+                {
                     "step": step.step_id,
                     "operation": step.operation.value,
                     "truncation": list(snapshot.truncation),
                     "evidence_ref": capture.evidence.evidence_id if capture else None,
                 },
+                snapshot,
             )
         return self._pause(
             state,
@@ -1756,13 +1796,10 @@ class Runtime:
             keep=True,
         )
         state.pending_assertion = spec.assertion_id if spec else None
-        return self._result(
+        return self._pause(
             state,
-            Execution.PAUSED,
-            Verdict.INCONCLUSIVE,
             Reason.NEEDS_VISUAL_ASSISTANCE.value,
-            snapshot=snapshot,
-            detail={
+            {
                 "assertion_id": spec.assertion_id if spec else None,
                 "checkpoint": checkpoint,
                 "snapshot_id": snapshot.snapshot_id,
@@ -1773,6 +1810,7 @@ class Runtime:
                     "geometry_epoch": snapshot.geometry.epoch,
                 },
             },
+            snapshot,
         )
 
     # ------------------------------------------------------------------------------
@@ -1881,6 +1919,11 @@ class Runtime:
             "elapsed_seconds": round(self.config.clock() - state.started_at, 3),
         }
 
+    def _deadline_budget(self, state: _RunState) -> dict[str, str]:
+        """Name the deadline that expired; only a slice deadline is worth resuming."""
+        run_deadline = state.started_at + state.spec.limits.deadline_seconds
+        return {"budget": "run_deadline" if self.config.clock() >= run_deadline else "slice_deadline"}
+
     def _load(self, run_id: str) -> _RunState:
         state = self._state.get(run_id)
         if state is not None:
@@ -1931,19 +1974,20 @@ class Runtime:
     # ------------------------------------------------------------------------------
 
     def _apply_inputs(self, state: _RunState, inputs: ResumeInputs) -> None:
+        # Validate every input before recording any of it, so a rejected resume changes nothing.
         allowed_fixtures = set(state.spec.fixtures) | set(state.spec.secret_refs)
-        fingerprints = state.summary.setdefault("fixture_fingerprints", {})
-        for name in inputs.fixtures:
+        recorded = state.summary.get("fixture_fingerprints", {})
+        fingerprints: dict[str, str] = {}
+        for name, value in inputs.fixtures.items():
             if name not in allowed_fixtures:
                 raise ContractError(f"resume may not introduce fixture {name!r}")
             current = self._fixture_value(state, name)
-            if current is not None and current != inputs.fixtures[name]:
+            if current is not None and current != value:
                 raise ContractError(f"resume may not rewrite fixture {name!r}")
-            fingerprint = keyed_fingerprint(self.config.fingerprint_secret, str(inputs.fixtures[name]))
-            if name in fingerprints and fingerprints[name] != fingerprint:
+            fingerprint = keyed_fingerprint(self.config.fingerprint_secret, value)
+            if name in recorded and recorded[name] != fingerprint:
                 raise ContractError(f"resume may not rewrite fixture {name!r} after restart")
             fingerprints[name] = fingerprint
-        state.supplied_fixtures.update({str(key): str(value) for key, value in inputs.fixtures.items()})
 
         assertion_ids = {
             spec.assertion_id for spec in state.spec.assertions if spec.evaluator is Evaluator.CALLER_RESULT
@@ -1959,9 +2003,13 @@ class Runtime:
         for assertion_id in inputs.verifier_results:
             if assertion_id not in assertion_ids:
                 raise ContractError(f"unknown assertion {assertion_id!r}")
-        for assertion_id, payload in {**inputs.visual_results, **inputs.verifier_results}.items():
-            if assertion_id != state.pending_assertion:
-                raise ContractError("evaluator result was not requested at this checkpoint")
+        results = {**inputs.visual_results, **inputs.verifier_results}
+        if any(assertion_id != state.pending_assertion for assertion_id in results):
+            raise ContractError("evaluator result was not requested at this checkpoint")
+
+        state.summary.setdefault("fixture_fingerprints", {}).update(fingerprints)
+        state.supplied_fixtures.update(inputs.fixtures)
+        for assertion_id, payload in results.items():
             entry = dict(payload)
             entry.setdefault("origin", ORIGIN_APPLICATION)
             state.supplied_visual[assertion_id] = entry
@@ -2008,6 +2056,11 @@ class Runtime:
                 value = self.config.resolve_secret(str(literal["secret_ref"]))
                 if value:
                     values.append(value)
+        values.extend(
+            literal
+            for name, literal in state.spec.fixtures.items()
+            if name.startswith("secret:") and isinstance(literal, str) and literal
+        )
         values.extend(value for value in state.supplied_fixtures.values() if value)
         return values
 
@@ -2048,7 +2101,9 @@ class Runtime:
             if not spec.scope.window_refs:
                 raise ContractError("tasks require explicit window references")
             if len(spec.fixtures) > 24 or any(
-                not isinstance(name, str) or not name.startswith(("text:", "key:")) or not isinstance(value, str)
+                not isinstance(name, str)
+                or not name.startswith(("text:", "secret:", "key:"))
+                or not isinstance(value, str)
                 for name, value in spec.fixtures.items()
             ):
                 raise ContractError("invalid task inputs")
@@ -2071,10 +2126,13 @@ class Runtime:
                 raise ContractError(
                     f"visual assertion {item.assertion_id} must name its oracle explicitly (caller or provider)"
                 )
-        for step in spec.steps:
+            validate_assertion(item)
+        for position, step in enumerate(spec.steps):
+            if step.operation in {Operation.TYPE_TEXT, Operation.SELECT} and not step.fixture_reference:
+                raise ContractError(f"step {step.step_id} needs a fixture_reference")
             for dependency in step.depends_on:
-                if dependency not in set(step_ids):
-                    raise ContractError(f"step {step.step_id} depends on unknown step {dependency}")
+                if dependency not in step_ids[:position]:
+                    raise ContractError(f"step {step.step_id} depends on unknown or later step {dependency}")
 
 
 def report_rank(result: AssertionResult) -> int:
@@ -2083,6 +2141,17 @@ def report_rank(result: AssertionResult) -> int:
         AssertionStatus.FAILED: 3,
         AssertionStatus.PASSED: 2,
         AssertionStatus.INCONCLUSIVE: 1,
+        AssertionStatus.NOT_EVALUATED: 0,
+    }
+    return order.get(result.status, 0)
+
+
+def worst_rank(result: AssertionResult) -> int:
+    """Ordering for assertions that must hold at every evaluation."""
+    order = {
+        AssertionStatus.FAILED: 3,
+        AssertionStatus.INCONCLUSIVE: 2,
+        AssertionStatus.PASSED: 1,
         AssertionStatus.NOT_EVALUATED: 0,
     }
     return order.get(result.status, 0)

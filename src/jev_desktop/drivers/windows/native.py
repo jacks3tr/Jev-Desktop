@@ -329,11 +329,13 @@ class NativeWindowsDriver:
         for candidate in win32.enum_top_level_windows():
             if candidate == hwnd:
                 return
-            if (
-                win32.user32.IsWindowVisible(candidate)
-                and not win32.is_cloaked(candidate)
-                and not win32.window_rect(candidate).intersect(region).is_empty
-            ):
+            if not win32.user32.IsWindowVisible(candidate) or win32.is_cloaked(candidate):
+                continue
+            try:
+                rect = win32.window_rect(candidate)
+            except DriverError:  # closed since enumeration; it covers nothing
+                continue
+            if not rect.intersect(region).is_empty:
                 raise DriverError("another window covers the approved capture region")
         raise DriverError("approved window is no longer visible")
 
@@ -391,19 +393,23 @@ class NativeWindowsDriver:
         if self._emergency:
             raise EmergencyStop("local emergency stop is set; no input dispatched")
 
-        def checked_guard() -> None:
+        def checked_guard(*, sends_input: bool = False) -> None:
             if snapshot is None:
                 raise ContractError("native input requires a bound snapshot")
+            # Authorization first: its IPC round-trip and ownership checkpoint are the slow
+            # part, so the live target checks run after it, immediately before dispatch.
+            guard()
             pid = self.process_id_for(snapshot.app_ref)
             hwnd = self.window_handle(request.window_ref)
             if win32.window_process_id(hwnd) != pid:
                 raise ContractError("target window no longer belongs to the bound process")
-            if request.mode is InputMode.USER_PATH and request.operation is not Operation.FOCUS_WINDOW:
+            # Synthetic input follows the foreground window whatever the requested mode, so a
+            # semantic HOTKEY is checked here too.
+            if sends_input or (request.mode is InputMode.USER_PATH and request.operation is not Operation.FOCUS_WINDOW):
                 input_module._guard_foreground_app(self, request, snapshot)
-            guard()
 
         previous_guard = win32._dispatch_guard
-        win32._dispatch_guard = checked_guard
+        win32._dispatch_guard = lambda: checked_guard(sends_input=True)
         try:
             return input_module.execute(self, request, checked_guard, snapshot)
         finally:
