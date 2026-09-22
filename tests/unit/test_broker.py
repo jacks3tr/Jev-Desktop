@@ -23,6 +23,18 @@ ELEMENTS = [
 ]
 
 
+def test_config_timeout_load_and_save(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text("{}", encoding="utf-8")
+    config = BrokerConfig.load(path)
+    assert config.policy.timeout_s is None
+    config.save(path)
+    assert BrokerConfig.load(path).policy.timeout_s is None
+    config.policy = PolicyConfig(timeout_s=12.5)
+    config.save(path)
+    assert BrokerConfig.load(path).policy.timeout_s == 12.5
+
+
 def spec_payload(*, goal: str = "regression: save the document") -> dict:
     return {
         "goal": goal,
@@ -155,3 +167,16 @@ def test_stop_releases_the_lease(broker_env):
     assert stopped["status"] == "cancelled"
     assert broker.ownership.active_lease() is None
     assert broker.ownership.flags(run_id).cancelled is True
+
+
+def test_optional_capture_failure_preserves_inspection(broker_env, monkeypatch):
+    from jev_desktop.contracts import DriverError
+
+    def unavailable(**kwargs):
+        raise DriverError("window is covered")
+
+    monkeypatch.setattr(broker_env["driver"], "capture", unavailable)
+    observed = broker_env["make"]().call("inspect", {"app_ref": APP_REF, "screenshot": True})
+    assert observed["elements"] and observed["access_token"]
+    assert observed["screenshot"] is None
+    assert observed["screenshot_error"]["reason"] == "DriverError"

@@ -46,7 +46,7 @@ from .evidence import EvidenceStore, RetentionPolicy
 from .ipc import ConnectionInfo, PipeServer, pipe_name
 from .journal import DispatchJournal, JournalUnhealthy
 from .ownership import Ownership, emergency_clear, emergency_is_set, emergency_signal, session_description
-from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError, build_contexts, fit_state_to_budget
+from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError, build_contexts
 from .runtime import ResumeInputs, Runtime, RuntimeConfig
 
 MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
@@ -107,12 +107,13 @@ class BrokerConfig:
             config.secrets = dict(payload.get("secrets", {}))
             config.capture_scale = float(payload.get("capture_scale", config.capture_scale))
             policy_payload = payload.get("policy", {})
+            timeout_s = policy_payload.get("timeout_s", config.policy.timeout_s)
             config.policy = PolicyConfig(
                 model_id=str(policy_payload.get("model_id", config.policy.model_id)),
                 endpoint=str(policy_payload.get("endpoint", config.policy.endpoint)),
                 operation_floor=float(policy_payload.get("operation_floor", config.policy.operation_floor)),
                 target_floor=float(policy_payload.get("target_floor", config.policy.target_floor)),
-                timeout_s=float(policy_payload.get("timeout_s", config.policy.timeout_s)),
+                timeout_s=None if timeout_s is None else float(timeout_s),
                 max_retries=int(policy_payload.get("max_retries", config.policy.max_retries)),
                 api_key_env=str(policy_payload.get("api_key_env", config.policy.api_key_env)),
             )
@@ -361,8 +362,11 @@ class Broker:
             self.runtime._restore_binding(state)
             params.setdefault("app_ref", self.runtime._scope(state).app_ref)
         query = str(params.get("query") or "")
-        apps = self.driver.list_apps()
-        discovered_windows = self.driver.list_windows()
+        if hasattr(self.driver, "discover"):
+            apps, discovered_windows = self.driver.discover(params.get("app_ref"))
+        else:
+            apps = self.driver.list_apps()
+            discovered_windows = self.driver.list_windows()
         if query:
             lowered = query.lower()
             apps = [
@@ -403,29 +407,33 @@ class Broker:
         screenshot: dict[str, Any] | None = None
         inspection_run_id = new_id("run")
         access_token = new_id("resume")
-        if include_screenshot:
-            run_id = str(params.get("run_id") or inspection_run_id)
-            capture = self.driver.capture(
-                scope=scope,
-                snapshot_id=snapshot.snapshot_id,
-                run_id=run_id,
-                checkpoint="inspect",
-                description="inspection screenshot",
-                max_scale=self.config.capture_scale,
-            )
-            self.evidence.register(capture.evidence)
-            self.journal.add_evidence(capture.evidence.evidence_id, run_id, capture.evidence.to_json())
-            screenshot = self._evidence_payload(capture.evidence, include_base64=bool(params.get("inline_image")))
-            if not params.get("run_id"):
-                token = new_id("resume")
-                self._inspection_tokens[capture.evidence.evidence_id] = token
-                screenshot["access_token"] = token
-            self.evidence.prune()
-            for evidence_id in list(self._inspection_tokens):
-                try:
-                    self.evidence.get(evidence_id)
-                except ContractError:
-                    self._inspection_tokens.pop(evidence_id, None)
+        screenshot_error = None
+        try:
+            if include_screenshot:
+                run_id = str(params.get("run_id") or inspection_run_id)
+                capture = self.driver.capture(
+                    scope=scope,
+                    snapshot_id=snapshot.snapshot_id,
+                    run_id=run_id,
+                    checkpoint="inspect",
+                    description="inspection screenshot",
+                    max_scale=self.config.capture_scale,
+                )
+                self.evidence.register(capture.evidence)
+                self.journal.add_evidence(capture.evidence.evidence_id, run_id, capture.evidence.to_json())
+                screenshot = self._evidence_payload(capture.evidence, include_base64=bool(params.get("inline_image")))
+                if not params.get("run_id"):
+                    token = new_id("resume")
+                    self._inspection_tokens[capture.evidence.evidence_id] = token
+                    screenshot["access_token"] = token
+                self.evidence.prune()
+                for evidence_id in list(self._inspection_tokens):
+                    try:
+                        self.evidence.get(evidence_id)
+                    except ContractError:
+                        self._inspection_tokens.pop(evidence_id, None)
+        except (DriverError, ContractError) as exc:
+            screenshot_error = {"reason": type(exc).__name__, "detail": str(exc)}
         payload = {
             "application": next((app.to_json() for app in apps if app.app_ref == params["app_ref"]), None),
             "windows": [window.to_json() for window in snapshot.windows],
@@ -437,6 +445,7 @@ class Broker:
             "geometry": snapshot.geometry.to_json(),
             "interval_ms": snapshot.interval_ms,
             "screenshot": screenshot,
+            "screenshot_error": screenshot_error,
         }
 
         if not params.get("run_id"):
@@ -495,14 +504,19 @@ class Broker:
             "interaction_mode": "user_path",
             "app_ref": task.get("app_ref"),
             "expected_identity": {"mode": "any"},
-            "scope": {"app_ref": task.get("app_ref"), "window_refs": windows, "max_elements": 180},
+            "scope": {
+                "app_ref": task.get("app_ref"),
+                "window_refs": windows,
+                "max_elements": task.get("max_elements", 180),
+                "max_depth": task.get("max_depth", 12),
+            },
             "fixtures": {
                 **{f"text:{name}": value for name, value in texts.items()},
                 **{f"key:{index}": value for index, value in enumerate(hotkeys)},
             },
             "limits": {
                 "max_actions": task.get("max_actions", 20),
-                "max_model_decisions": 40,
+                "max_model_decisions": task.get("max_model_decisions", 40),
                 "deadline_seconds": timeout,
                 "slice_seconds": min(timeout, 120),
                 "stale_retries": 2,
@@ -665,14 +679,9 @@ class Broker:
                 contexts = build_contexts(observation=policy_observation, operations=[request.operation])
                 if not contexts:
                     raise ContractError("no compatible observed controls; use an explicit window for focus or hotkeys")
-                model_state = fit_state_to_budget(
-                    policy_observation,
-                    keep_element_ids=[candidate.element_id for context in contexts for candidate in context.candidates],
-                    budget_bytes=self.runtime.config.state_budget_bytes,
-                )
                 decision = self.policy.decide(
                     goal=target_description,
-                    state=model_state,
+                    state=policy_observation,
                     contexts=contexts,
                     allow_done=False,
                     current_step={"operation": request.operation.value, "target_description": target_description},

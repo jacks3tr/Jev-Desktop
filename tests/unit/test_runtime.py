@@ -490,3 +490,38 @@ def test_task_checks_completion_after_low_confidence_without_more_input(tmp_path
         assert result.reason == "needs_visual_assistance"
     assert ownership.active_lease() is None
     journal.close()
+
+
+def test_task_selects_field_then_value_without_cartesian_candidates(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("edit", f"Field {i}", editable=True, operations=("TYPE_TEXT",)) for i in range(16)],
+        steps=[],
+        purpose="task",
+        fixtures={f"text:value{i}": f"Value {i}" for i in range(16)},
+        script=[
+            ScriptedDecision(Operation.TYPE_TEXT, "Field 15"),
+            ScriptedDecision(Operation.TYPE_TEXT),
+            ScriptedDecision(Operation.DONE),
+        ],
+    )
+    from dataclasses import replace
+
+    decide = runtime.policy.decide
+
+    def select_value(**kwargs):
+        decision = decide(**kwargs)
+        if decision.operation is Operation.TYPE_TEXT and decision.target is None:
+            target = next(
+                c for group in kwargs["contexts"] for c in group.candidates if c.fixture_ref == "text:value15"
+            )
+            return replace(decision, target=target)
+        return decision
+
+    runtime.policy.decide = select_value
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert app.find("Field 15").value == "Value 15"
+    assert len(driver.executed) == 1
+    assert all(len(context.candidates) <= 16 for call in runtime.policy.calls for context in call["contexts"])
+    journal.close()

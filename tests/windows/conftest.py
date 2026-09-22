@@ -18,13 +18,6 @@ if os.environ.get("JEV_DESKTOP_LIVE") != "1":
     collect_ignore_glob = ["*.py"]
 
 
-def pytest_collection_modifyitems(config, items):
-    if os.environ.get("JEV_DESKTOP_LIVE") != "1":
-        for item in items:
-            if str(item.fspath).startswith(str(config.rootdir)):
-                item.add_marker(pytest.mark.skip(reason="desktop access is not enabled (JEV_DESKTOP_LIVE=1)"))
-
-
 from pathlib import Path
 
 from jev_desktop.policy import HttpTransport, JevPolicy, PolicyConfig

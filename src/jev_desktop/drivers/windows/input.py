@@ -156,6 +156,8 @@ def live_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
         rect = uia._rect_of(element.GetCurrentPropertyValue(uia.PROP_BOUNDS))
         enabled = bool(element.GetCurrentPropertyValue(uia.PROP_ENABLED))
         offscreen = bool(element.GetCurrentPropertyValue(uia.PROP_OFFSCREEN))
+        if offscreen and handle.role in uia.ROW_ROLES and not rect.is_empty:
+            offscreen = not uia.point_hits_element(worker, element, *rect.center())
         focused = bool(element.GetCurrentPropertyValue(uia.PROP_FOCUSED))
         hwnd = handle.hwnd if win32.user32.IsWindow(handle.hwnd) else 0
         # A modal dialog disables the owner window: the child control keeps its own
@@ -536,9 +538,13 @@ def execute(
                 # Real fields arrive prefilled or with placeholder text selected. Typing over
                 # the selection is what a person does; appending silently produces values like
                 # "*.txtC:\\path\\file.txt" that no dialog accepts.
-                inserted += win32.key_chord([VK_BY_NAME["ctrl"], VK_BY_NAME["a"]])
+                inserted += win32.key_chord([VK_BY_NAME["ctrl"], VK_BY_NAME["home"]])
+                inserted += win32.key_chord([VK_BY_NAME["ctrl"], VK_BY_NAME["shift"], VK_BY_NAME["end"]])
             guard()
-            inserted += win32.type_unicode(request.text)
+            if request.replace_existing and not request.text:
+                inserted += win32.key_chord([VK_BY_NAME["delete"]])
+            else:
+                inserted += win32.type_unicode(request.text)
         except UncertainEffect:
             raise
         except BaseException as exc:
@@ -549,6 +555,19 @@ def execute(
             win32.set_cursor_position(*previous)
         type_notes = [f"chars={len(request.text)}"]
         observed = _live_value(worker, handle)
+        # SendInput can return while the application is still consuming the text.
+        # A strict prefix is evidence of pending input, not a reason to type again.
+        while (
+            request.replace_existing
+            and bool(observed)
+            and observed is not None
+            and observed != request.text
+            and request.text.startswith(observed)
+            and time.time() - started < request.deadline_s
+        ):
+            guard()
+            time.sleep(0.01)
+            observed = _live_value(worker, handle)
         if observed is not None and observed != request.text:
             type_notes.append("observed value differs from dispatched text")
         return _receipt(request, DispatchMechanism.SEND_INPUT_KEYBOARD, inserted, started, notes=tuple(type_notes))
@@ -619,18 +638,24 @@ def _focus_window(driver: Any, request: ActionRequest, guard: Any, started: floa
 def _observed_option(
     driver: Any, snapshot: Snapshot, handle: uia.ElementHandle, label: str
 ) -> tuple[str, LiveState] | None:
-    """Find an observed element for the option inside the same window (real click path)."""
+    """Select only an unambiguous option belonging to the requested container."""
     wanted = label.strip().lower()
     best: tuple[str, LiveState] | None = None
     for element in snapshot.elements:
-        if element.window_ref != handle.window_ref or not element.name:
+        if not element.name:
             continue
         if element.name.strip().lower() != wanted:
             continue
         candidate = driver.registry.elements.get(element.element_id)
-        if candidate is None or not candidate.visible:
+        if (
+            candidate is None
+            or not candidate.visible
+            or element.role not in {"listitem", "treeitem", "tabitem", "dataitem", "radiobutton"}
+        ):
             continue
         try:
+            if not uia.selection_belongs_to(driver.worker, candidate, handle):
+                continue
             state = live_state(driver.worker, candidate)
         except Exception:
             continue
@@ -638,8 +663,9 @@ def _observed_option(
             continue
         if not _geometry_ok(candidate.rect, state.rect) or not _hit_ok(driver.worker, candidate, *state.rect.center()):
             continue
+        if best is not None:
+            raise Pause(Reason.NO_APPROPRIATE_TARGET, {"detail": "ambiguous options in selection container"})
         best = (element.element_id, state)
-        break
     return best
 
 
@@ -658,6 +684,8 @@ def _live_value(worker: uia.UiaWorker, handle: uia.ElementHandle) -> str | None:
     def _read(_worker: uia.UiaWorker) -> str | None:
         try:
             value = handle.element.GetCurrentPropertyValue(uia.PROP_VALUE)
+            if not isinstance(value, str) or not value:
+                value = handle.element.GetCurrentPropertyValue(uia.PROP_LEGACY_VALUE)
         except Exception:
             return None
         return value if isinstance(value, str) else None

@@ -12,6 +12,7 @@ from jev_desktop.policy import (
     JevPolicy,
     OpContext,
     PolicyConfig,
+    build_contexts,
     build_questions,
     resolve_answers,
     sanitize_message,
@@ -165,20 +166,34 @@ def test_policy_retries_rate_limits_then_succeeds():
     body_answers = {
         "operation": choice_answer("WAIT", list(questions["operation"]["criteria"])),
     }
+    waits = []
     with LocalTypeSafeServer() as server:
+        server.response_headers["Retry-After"] = "2"
         server.queue(429, {"error": "slow down"})
         server.queue(200, fake_response("jev-1.13.0", body_answers))
         policy = JevPolicy(
             transport=HttpTransport(),
             config=PolicyConfig(endpoint=server.endpoint, max_retries=2),
             api_key="test-key",
-            sleep=lambda _s: None,
+            sleep=waits.append,
         )
         decision = policy.decide(goal="g", state={"elements": []}, contexts=contexts, allow_done=True)
     assert decision.operation is Operation.WAIT
     assert decision.model == "jev-1.13.0"
     assert len(server.requests) == 2, "the rate limit should have produced a second request"
     assert server.headers[0]["Authorization"] == "Bearer test-key"
+
+    assert waits == [2.0]
+    with LocalTypeSafeServer() as server:
+        server.queue(429, {"error": "slow down"})
+        policy = JevPolicy(
+            transport=HttpTransport(),
+            config=PolicyConfig(endpoint=server.endpoint, max_retries=0),
+            api_key="test-key",
+        )
+        with pytest.raises(PolicyError, match=r"unavailable.*429"):
+            policy.decide(goal="g", state={}, contexts=contexts, allow_done=True)
+        assert len(server.requests) == 1
 
 
 def test_policy_reports_rejected_key_without_dispatching():
@@ -254,3 +269,112 @@ def test_missing_api_key_is_reported_before_any_request():
         with pytest.raises(PolicyError):
             policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
     assert not server.requests, "no request may leave the process without a key"
+
+
+def test_rejected_answer_retains_usage_and_provider_errors_are_sanitized():
+    from types import SimpleNamespace
+
+    response = fake_response(
+        "jev-1.13.0",
+        {
+            "operation": {
+                "type": "choice",
+                "choice": "WAIT",
+                "probabilities": {"WAIT": 0.34, "DONE": 0.33, "ESCALATE": 0.33},
+                "confidence": 0.2,
+            }
+        },
+        {"input_tokens": 123, "output_tokens": 45},
+    )
+    transport = SimpleNamespace(post_json=lambda *args, **kwargs: (200, response))
+    policy = JevPolicy(transport=transport, api_key="test-key")
+    with pytest.raises(Pause):
+        policy.decide(goal="wait", state={}, contexts=[], allow_done=True)
+    assert policy.last_attempts[0]["usage"]["input_tokens"] == 123
+    assert policy.last_attempts[0]["outcome"] == "low_confidence"
+    transport.post_json = lambda *args, **kwargs: (422, {"detail": "test-key"})
+    with pytest.raises(PolicyError) as failure:
+        policy.decide(goal="wait", state={}, contexts=[], allow_done=True)
+    assert "test-key" not in str(failure.value)
+
+
+def test_provider_receives_full_context_without_local_byte_caps():
+    from dataclasses import replace
+
+    from jev_desktop.contracts import canonical_json
+
+    contexts = [
+        replace(
+            group, candidates=tuple(replace(c, description=c.description + " context" * 40) for c in group.candidates)
+        )
+        for group in [context(Operation.CLICK, 30), context(Operation.TOGGLE, 30), context(Operation.SELECT, 30)]
+    ]
+    questions = build_questions(goal="edit", contexts=contexts, allow_done=True, allow_escalate=True)
+    answer = choice_answer("WAIT", list(questions["operation"]["criteria"]))
+    with LocalTypeSafeServer() as server:
+        server.queue(200, fake_response("jev-1.13.0", {"operation": answer}))
+        policy = JevPolicy(transport=HttpTransport(), config=PolicyConfig(endpoint=server.endpoint), api_key="test-key")
+        state = {"reference": "long context " * 6000}
+        assert policy.decide(goal="edit", state=state, contexts=contexts, allow_done=True).operation is Operation.WAIT
+    body = server.requests[0]
+    assert len(canonical_json(body).encode()) > 60000
+    assert body["state"] == state
+
+
+def test_choice_accepts_rounded_distribution_without_lowering_confidence_floor():
+    answer = {"type": "choice", "choice": "a", "probabilities": {"a": 0.77, "b": 0.11, "c": 0.11}, "confidence": 0.75}
+    assert valid_choice(answer, {"a", "b", "c"}, 0.45) == "a"
+    with pytest.raises(Pause) as failure:
+        valid_choice(answer, {"a", "b", "c"}, 0.8)
+    assert failure.value.reason_value == "low_confidence"
+
+
+def test_wire_targets_resolve_to_original_control_without_truncating_text():
+    from jev_desktop.policy import decision_state
+
+    target = context(Operation.CLICK, 1)
+    native_id = target.candidates[0].element_id
+    state = {
+        "elements": [
+            {
+                "element_id": native_id,
+                "index": 1,
+                "role": "button",
+                "name": "Save",
+                "text": "evidence " * 1000,
+                "focused": True,
+            }
+        ]
+    }
+    with LocalTypeSafeServer() as server:
+        server.queue(
+            200,
+            fake_response(
+                "jev-1.13.0",
+                {
+                    "operation": choice_answer("CLICK", ["CLICK", "WAIT", "DONE", "ESCALATE"]),
+                    "CLICK_target": choice_answer("t1", ["t1", "NONE"]),
+                },
+            ),
+        )
+        policy = JevPolicy(transport=HttpTransport(), config=PolicyConfig(endpoint=server.endpoint), api_key="test-key")
+        result = policy.decide(goal="Save", state=state, contexts=[target], allow_done=True)
+    assert result.target == target.candidates[0]
+    sent = server.requests[0]["state"]["elements"][0]
+    assert sent["id"] == "t1" and sent["text"] == state["elements"][0]["text"]
+    assert sent["focused"] is True
+    assert len(decision_state(state, {})["elements"]) == 1
+
+
+def test_unavailable_controls_are_not_offered_as_action_candidates():
+    contexts = build_contexts(
+        observation={
+            "elements": [
+                {"element_id": "enabled", "operations": ["CLICK"], "enabled": True, "visible": True},
+                {"element_id": "disabled", "operations": ["CLICK"], "enabled": False, "visible": True},
+                {"element_id": "hidden", "operations": ["CLICK"], "enabled": True, "visible": False},
+            ]
+        },
+        operations=[Operation.CLICK],
+    )
+    assert [candidate.element_id for candidate in contexts[0].candidates] == ["enabled"]

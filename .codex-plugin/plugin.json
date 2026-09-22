@@ -1,0 +1,23 @@
+{
+  "name": "jev-desktop",
+  "version": "0.1.0",
+  "description": "Use Windows applications through MCP and the command line with Jev Desktop.",
+  "author": {
+    "name": "jacks3tr"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "license": "MIT",
+  "repository": "https://github.com/jacks3tr/Jev-Desktop",
+  "interface": {
+    "displayName": "Jev Desktop",
+    "shortDescription": "Use Windows applications through MCP and the command line with Jev Desktop.",
+    "longDescription": "Use Windows applications through MCP and the command line with Jev Desktop.",
+    "developerName": "jacks3tr",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Use Jev Desktop to operate a Windows application."
+    ]
+  }
+}

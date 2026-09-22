@@ -43,6 +43,9 @@ Configure your MCP client to use the Python environment where you installed Jev 
 ~~~
 
 The [desktop-use skill](skills/desktop-use/SKILL.md) gives agents the operating instructions.
+The checkout includes a [Codex plugin manifest](.codex-plugin/plugin.json) that bundles this
+skill and the MCP configuration. Install the Python package first; the plugin uses `python`
+from the MCP client's environment.
 For Jev target selection, supply `TYPESAFE_API_KEY` through the client's environment or
 secret settings. The broker does not automatically load dotenv files.
 
@@ -77,8 +80,7 @@ See the [Chrome task](examples/browser.json). Jev returns control when it finish
 judgment or missing input, or reaches a limit. Check the final observation before reporting
 success. Tasks report actions, elapsed time, model latency, and reported token usage.
 
-This avoids a calling-model turn per routine action. End-to-end speed and cost savings have
-not yet been benchmarked against a general computer-use agent.
+Jev handles routine actions locally, avoiding a calling-model turn for each click.
 
 | Tool | Purpose |
 | --- | --- |

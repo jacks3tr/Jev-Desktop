@@ -24,15 +24,18 @@ The CLI accepts the same object with `run --task file.json`. See the
 [Calculator](../examples/calculator.json) and [Chrome](../examples/browser.json) tasks.
 
 Defaults are 20 actions, 40 decisions, and 60 seconds; `timeout_seconds` may not exceed 120.
-The loop uses one Jev decision for operation and target selection together. Native dispatch
+Set `max_model_decisions` for longer tasks. `max_elements` and `max_depth` control observation
+coverage and default to 180 and 12. The loop batches operation and target questions together.
+With multiple supplied values, a second question selects the value for the chosen input control.
+Jev receives structured accessibility data and action history, not screenshots. Native dispatch
 rechecks the target and records input before the next observation. Supplied text and chords
 are closed choices. Jev cannot invent values or launch applications. Low confidence, missing
 input, cancellation, and limits return control to the caller.
 
 Results include final observations, actions, and cumulative metrics for the task. Token
-counts are provider-reported for successful decisions; they exclude unreported failed calls.
-`usage_complete` indicates whether every successful response included both token fields.
-`model_latency_ms` sums decision-call latency; `elapsed_seconds` includes observation, input,
+counts include provider-reported usage from accepted and rejected responses.
+`usage_complete` is false when any HTTP attempt lacks either token field.
+`model_latency_ms` includes rejected calls and retries; `elapsed_seconds` includes observation, input,
 and waits. No dollar estimate is inferred. Completion is model-reported and must be checked
 against the returned observation. A fresh observation is taken before accepting DONE.
 After a low-confidence decision following input, the broker waits briefly and checks completion
@@ -308,7 +311,10 @@ resume. Clearing it does not resume a run or replay input.
 CLI exit codes are `0` for success and a passing run, `1` for request errors, and `2` for a
 run that did not pass. MCP sends protocol messages to stdout and diagnostics to stderr.
 
-## Threshold evaluation
+## Tune decisions
+
+Jev tuning changes the request and decision policy, not model weights. TypeSafe does not offer
+customer fine-tuning or LoRA for Jev. Keep the model version fixed while comparing changes.
 
 `PolicyConfig` in `src/jev_desktop/policy.py` defines the pinned model and separate operation
 and target confidence gates. Evaluate changes using real application decisions and independently
@@ -318,5 +324,37 @@ verified outcomes. Keep datasets private and evaluate them offline with:
 python scripts/evaluate_thresholds.py .artifacts/decisions.json
 ```
 
-The defaults are not an accuracy guarantee across applications. Do not repeat desktop runs
+Start with the failed request and its observed outcome. Check whether the intended control
+and value were available, whether each question states its operation, and whether input names
+identify their destination. Remove duplicate or unavailable action candidates. Preserve the
+state needed to distinguish the remaining choices. Keep arithmetic and exact comparisons in code.
+
+Change one factor at a time. Use saved observations to compare question wording without
+repeating desktop input. Label acceptable decisions from the application state before evaluating
+thresholds, and reserve separate cases to check the chosen setting. The evaluator expects one
+accepted operation and target per record; do not label an equally valid alternative as wrong.
+Record wrong accepted actions and correct actions refused, alongside completion time, requests,
+and tokens. Offline
+replay measures decisions; confirm changed behavior with a relevant live workflow.
+
+Confidence describes the distribution across choices. It is not the probability that an entire
+task succeeded. Evaluate operation and selected-target gates separately; ignore unused branch
+answers. Choose thresholds for the consequences of the action, not to make a failed run continue.
+Do not copy numerical thresholds from a cookbook as universal defaults.
+
+Measure from task submission to the verified result. Report setup and screenshot time separately.
+Exclude interrupted runs from speed comparisons, but report their failures. Keep the same initial
+application state and completion check when comparing revisions. Do not repeat desktop runs
 without a specific reason or the operator's agreement.
+
+This follows TypeSafe's [confidence guidance](https://docs.typesafe.ai/confidence),
+[confidence cookbook](https://docs.typesafe.ai/cookbooks/classification_using_confidence), and
+[Jev 1.13 guidance](https://docs.typesafe.ai/model-jaggedness/jev-1.13).
+
+Batch questions that share the same evidence. Each question must state its own premise because
+questions cannot read one another's answers, and their IDs are not sent to the model. A second
+request is appropriate when the chosen control determines the value question. Extra questions
+consume tokens even when their answers are unused; compare request count and total input tokens.
+
+Use the current [TypeSafe model documentation](https://docs.typesafe.ai/models) for provider
+configuration. Jev Desktop honors provider `Retry-After` responses without adding a local rate limiter.
