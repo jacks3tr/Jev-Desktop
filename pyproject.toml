@@ -32,7 +32,6 @@ dev = [
     "build>=1.2,<2",
     "mypy>=2.3,<3",
     "pytest>=8,<10",
-    "pytest-cov>=6,<8",
     "ruff>=0.16,<0.17",
     "twine>=5,<7",
 ]
@@ -106,13 +105,3 @@ warn_unused_ignores = true
 strict_equality = true
 show_error_codes = true
 
-[tool.coverage.run]
-source = ["jev_desktop"]
-branch = true
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "if TYPE_CHECKING:",
-    "raise NotImplementedError",
-]
