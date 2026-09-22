@@ -433,9 +433,12 @@ def test_goal_task_runs_locally_and_never_replays_uncertain_input(tmp_path, unce
 
 
 def test_task_reobserves_after_stale_target_refusal(tmp_path):
-    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,
-        elements=SAVE_ELEMENTS,
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
         steps=[],
         purpose="task",
         script=[
@@ -452,6 +455,13 @@ def test_task_reobserves_after_stale_target_refusal(tmp_path):
     second = calls[1]["contexts"][0].candidates[0].element_id
     assert first != second, "a stale refusal must get fresh observed targets before retrying"
     assert result.budgets["actions"] == 1
+    assert len(calls) == 3
+    assert calls[0]["goal"] == calls[1]["goal"]
+    assert driver.executed[0].snapshot_id != driver.executed[1].snapshot_id
+    records = journal.actions_for_run(created["run_id"])
+    assert [record.state for record in records] == [DispatchState.NOT_DISPATCHED, DispatchState.DISPATCHED]
+    assert records[0].receipt is None
+    assert app.find("Saved").value == "yes"
     journal.close()
 
 
