@@ -435,7 +435,10 @@ def test_goal_task_runs_locally_and_never_replays_uncertain_input(tmp_path, unce
 def test_task_reobserves_after_stale_target_refusal(tmp_path):
     runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,
-        elements=SAVE_ELEMENTS,
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
         steps=[],
         purpose="task",
         script=[
