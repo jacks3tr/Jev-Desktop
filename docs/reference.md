@@ -298,6 +298,29 @@ replays an action whose outcome is uncertain. Resume tokens rotate after executi
 references do not survive a broker restart; a run scoped to them pauses with `stale_observation`
 and needs a new run.
 
+### Sharing the desktop
+
+While a run or direct action holds the desktop lease, a subtle blue glow marks the edges of
+every monitor. It never takes focus and passes clicks through. It stays visible to remote
+desktop and screen sharing, so screenshots that reach a monitor edge show a faint blue tint.
+Low-level input hooks run only while the lease is held. Jev tags its own input and the hooks
+ignore only tagged input, so input from remote desktop tools counts as a person.
+
+- Physical mouse movement is ignored.
+- A physical click, scroll, or key press means the current decision is based on a screen the
+  user has touched. Nothing more is sent. The run waits until there has been no physical input
+  for 3 seconds, observes again, and continues; a task can refocus its window. If input
+  arrives partway through typing, the action is `uncertain_effect` and is never retyped.
+- Waiting extends the run deadline, by at most 300 seconds per run in total, but not the
+  current call's `slice_seconds`. If the user is still active when the call or the allowance
+  ends, the run pauses with `user_takeover` and `resumable: true`.
+- A direct `desktop_act` that sees physical input returns `user_takeover`; inspect again.
+- Physical Esc cancels the run that holds the lease (`Esc pressed`). It does not set the
+  emergency stop.
+
+Hooks cannot observe input sent to elevated windows unless the broker is elevated, or input on
+the secure desktop.
+
 ## Troubleshooting
 
 Run `jev-desktop doctor` for diagnostics. Remove credentials, tokens, private paths, and
@@ -325,13 +348,27 @@ run that did not pass. MCP sends protocol messages to stdout and diagnostics to 
 Jev tuning changes the request and decision policy, not model weights. TypeSafe does not offer
 customer fine-tuning or LoRA for Jev. Keep the model version fixed while comparing changes.
 
-`PolicyConfig` in `src/jev_desktop/policy.py` defines the pinned model and separate operation
-and target confidence gates. Evaluate changes using real application decisions and independently
-verified outcomes. Keep datasets private and evaluate them offline with:
+`PolicyConfig` in `src/jev_desktop/policy.py` defines the pinned model and three gates: the
+operation confidence floor, the target confidence floor, and the target margin (how far the
+chosen target must lead the runner-up). The broker's `config.json` can override each one under
+`policy`. Evaluate changes using real application decisions and independently verified outcomes.
+
+Set `JEV_DESKTOP_RECORD` to a directory before the broker starts to append every Jev request and
+response body to `decisions-YYYYMMDD.jsonl` there. Headers are not recorded, and `secret_texts`
+values never appear in requests, but the files hold application content: keep them private.
+Turn recordings into rows to label, then sweep the gates offline:
 
 ```powershell
-python scripts/evaluate_thresholds.py .artifacts/decisions.json
+python scripts/export_decisions.py .artifacts/labeled.json .artifacts/recordings/*.jsonl
+python scripts/evaluate_thresholds.py .artifacts/labeled.json
 ```
+
+Label each row with `split`, `expected_operation`, and `expected_targets`: every acceptable target
+key from `candidates`, or an empty list when no action is appropriate. Hold out whole
+applications for `validation`. Re-running the export keeps existing labels. The sweep sends no
+requests. It reports the selected gates, the current defaults, a wrong-versus-correct frontier,
+and validation results by operation and candidate count. With zero wrong actions in *n*
+accepted validation decisions, the wrong-action rate is only bounded near 3/*n*.
 
 Start with the failed request and its observed outcome. Check whether the intended control
 and value were available, whether each question states its operation, and whether input names
@@ -340,8 +377,8 @@ state needed to distinguish the remaining choices. Keep arithmetic and exact com
 
 Change one factor at a time. Use saved observations to compare question wording without
 repeating desktop input. Label acceptable decisions from the application state before evaluating
-thresholds, and reserve separate cases to check the chosen setting. The evaluator expects one
-accepted operation and target per record; do not label an equally valid alternative as wrong.
+thresholds, and reserve separate cases to check the chosen setting. List every equally valid
+target; an unlisted alternative counts as a wrong action.
 Record wrong accepted actions and correct actions refused, alongside completion time, requests,
 and tokens. Offline
 replay measures decisions; confirm changed behavior with a relevant live workflow.

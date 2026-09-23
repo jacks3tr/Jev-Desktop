@@ -98,8 +98,14 @@ A threshold change requires outcomes that show which decisions were correct.
 
 If the observation is stale, inspect again. If a window is covered, disabled, or blocked by a
 modal dialog, resolve that condition within the user's requested task. Do not bypass privilege
-boundaries. Stop when the user takes control. Never repeat an action with an uncertain outcome.
-An acknowledged input is not proof that the application did what you intended; inspect its result.
+boundaries. Never repeat an action with an uncertain outcome. An acknowledged input is not
+proof that the application did what you intended; inspect its result.
+
+While Jev holds the desktop, a blue glow marks the screen edges. When the user clicks, scrolls,
+or types, Jev sends nothing, waits until they have been idle for 3 seconds, observes again, and
+continues, refocusing its window if needed. That wait does not use the task's time. If the user
+keeps working, the run pauses with `user_takeover` and `resumable: true`: ask before resuming.
+Pressing Esc cancels the run (`Esc pressed`); do not restart it unless the user asks.
 
 `desktop_stop(emergency=true)` blocks further input independently of the broker's current work.
 Only the user can clear it, with `jev-desktop stop --emergency --clear`. It cannot undo input

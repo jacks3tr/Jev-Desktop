@@ -151,6 +151,8 @@ class Ownership:
         self._desktop_handle: int | None = None
         self._quiesce = quiesce
         self._on_acquire: Callable[[int], None] | None = None
+        # Told when the desktop lease starts and ends (the on-screen presence follows it).
+        self._on_active: Callable[[bool], None] | None = None
 
     # -- sessions ------------------------------------------------------------------
 
@@ -236,6 +238,8 @@ class Ownership:
             )
             self._leases[lease.lease_id] = lease
             self._active_lease = lease.lease_id
+            if self._on_active is not None:
+                self._on_active(True)
             return lease
 
     def active_lease(self) -> Lease | None:
@@ -268,6 +272,8 @@ class Ownership:
                     kernel32.CloseHandle(self._desktop_handle)
                     self._desktop_handle = None
                 self._active_lease = None
+                if self._on_active is not None:
+                    self._on_active(False)
             lease.released_at = self._clock()
 
     def __del__(self) -> None:

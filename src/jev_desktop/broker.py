@@ -47,7 +47,15 @@ from .evidence import EvidenceStore, RetentionPolicy
 from .ipc import MAX_MESSAGE_BYTES, ConnectionInfo, PipeServer, pipe_name
 from .journal import DispatchJournal, JournalUnhealthy
 from .ownership import Ownership, emergency_clear, emergency_is_set, emergency_signal, session_description
-from .policy import HttpTransport, JevPolicy, PolicyConfig, PolicyError, build_contexts
+from .policy import (
+    HttpTransport,
+    JevPolicy,
+    PolicyConfig,
+    PolicyError,
+    RecordingTransport,
+    Transport,
+    build_contexts,
+)
 from .runtime import ResumeInputs, Runtime, RuntimeConfig
 
 MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
@@ -114,6 +122,7 @@ class BrokerConfig:
                 endpoint=str(policy_payload.get("endpoint", config.policy.endpoint)),
                 operation_floor=float(policy_payload.get("operation_floor", config.policy.operation_floor)),
                 target_floor=float(policy_payload.get("target_floor", config.policy.target_floor)),
+                target_margin=float(policy_payload.get("target_margin", config.policy.target_margin)),
                 timeout_s=None if timeout_s is None else float(timeout_s),
                 max_retries=int(policy_payload.get("max_retries", config.policy.max_retries)),
                 api_key_env=str(policy_payload.get("api_key_env", config.policy.api_key_env)),
@@ -138,6 +147,7 @@ class BrokerConfig:
                         "endpoint": self.policy.endpoint,
                         "operation_floor": self.policy.operation_floor,
                         "target_floor": self.policy.target_floor,
+                        "target_margin": self.policy.target_margin,
                         "timeout_s": self.policy.timeout_s,
                         "max_retries": self.policy.max_retries,
                         "api_key_env": self.policy.api_key_env,
@@ -203,7 +213,11 @@ class Broker:
             self.journal.append_trace(None, "recovered_uncertain_actions", {"actions": self._recovered})
         key = os.environ.get(self.config.policy.api_key_env)
         if key:
-            self.policy = JevPolicy(transport=HttpTransport(), config=self.config.policy, api_key=key)
+            transport: Transport = HttpTransport()
+            record_dir = os.environ.get("JEV_DESKTOP_RECORD")
+            if record_dir:
+                transport = RecordingTransport(transport, Path(record_dir))
+            self.policy = JevPolicy(transport=transport, config=self.config.policy, api_key=key)
             self.runtime.policy = self.policy
 
     def close(self) -> None:
@@ -650,10 +664,13 @@ class Broker:
         lease = self.ownership.acquire(session.session_id, action_run_id)
         self._standalone_run = action_run_id
         deadline = time.monotonic() + 45.0
+        epoch = self.runtime._human_epoch()
 
         def guard() -> None:
             if time.monotonic() >= deadline:
                 raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "action_deadline"})
+            if self.runtime._human_epoch() != epoch:
+                raise Pause(Reason.USER_TAKEOVER, {"reason": "physical input during the action; inspect again"})
             self.ownership.checkpoint(
                 run_id=action_run_id,
                 lease_id=lease.lease_id,
@@ -789,6 +806,7 @@ class Broker:
                 "model": self.config.policy.model_id,
                 "key_env": self.config.policy.api_key_env,
                 "resolved_models": list(self.policy.resolved_models[-5:]) if self.policy else [],
+                "recording": isinstance(getattr(self.policy, "transport", None), RecordingTransport),
             },
             "journal": {
                 "path": str(self.config.journal_path),

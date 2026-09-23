@@ -53,3 +53,17 @@ def test_live_tests_stay_gated():
     empty_markers = ("no tests collected", "no tests ran", "collected 0 items", "0 tests collected")
     assert any(marker in output for marker in empty_markers), output[-2000:]
     assert not re.search(r"collected [1-9]", output), "live tests were collected without JEV_DESKTOP_LIVE=1"
+
+
+def test_package_and_plugin_versions_agree():
+    """A release bumps every manifest; Claude Code and Codex cache plugins by version."""
+    import json
+    import tomllib
+
+    from jev_desktop import __version__
+
+    package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    assert __version__ == package, f"jev_desktop.__version__ is {__version__}, pyproject.toml is {package}"
+    for manifest in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json"):
+        version = json.loads((ROOT / manifest).read_text(encoding="utf-8"))["version"]
+        assert version == package, f"{manifest} is {version}, pyproject.toml is {package}"

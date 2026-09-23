@@ -29,7 +29,7 @@ jobs:
       - name: Check metadata
         run: python -m twine check dist/*
 
-      - name: Tag must match the packaged version
+      - name: Tag must match the packaged and plugin versions
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -38,6 +38,13 @@ jobs:
             echo "tag $tag does not match packaged version $version"
             exit 1
           fi
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            plugin=$(python -c "import json, sys; print(json.load(open(sys.argv[1]))['version'])" "$manifest")
+            if [ "$plugin" != "$version" ]; then
+              echo "$manifest version $plugin does not match packaged version $version"
+              exit 1
+            fi
+          done
 
       - uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/')

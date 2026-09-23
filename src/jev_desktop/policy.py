@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from .contracts import (
@@ -184,6 +185,45 @@ class HttpTransport:
             if math.isfinite(seconds):
                 self.retry_after_s = max(0.0, seconds)
         return response.status_code, body
+
+
+class RecordingTransport:
+    """Appends each request and response body to a daily JSONL file for offline tuning.
+
+    Headers are never recorded. The files hold application content: keep them private.
+    """
+
+    def __init__(self, inner: Transport, directory: Path) -> None:
+        self.inner = inner
+        self.directory = directory
+        directory.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def retry_after_s(self) -> float | None:
+        return getattr(self.inner, "retry_after_s", None)
+
+    def close(self) -> None:
+        close = getattr(self.inner, "close", None)
+        if close is not None:
+            close()
+
+    def post_json(
+        self, url: str, *, headers: Mapping[str, str], payload: Mapping[str, Any], timeout_s: float | None
+    ) -> tuple[int, Any]:
+        started = time.perf_counter()
+        status, body = self.inner.post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
+        now = datetime.now(UTC)
+        record = {
+            "recorded_at": now.isoformat(timespec="seconds"),
+            "status": status,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "request": dict(payload),
+            "response": body,
+        }
+        path = self.directory / f"decisions-{now:%Y%m%d}.jsonl"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return status, body
 
 
 # --------------------------------------------------------------------------------------

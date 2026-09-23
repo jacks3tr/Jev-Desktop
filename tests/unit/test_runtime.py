@@ -53,9 +53,12 @@ def build(
     mode: str = "user_path",
     script: list[ScriptedDecision] | None = None,
     identity_status: str | None = None,
+    presence=None,
 ):
     app = FakeApp(app_ref=APP_REF, window_ref="win:" + "b" * 24, elements=elements)
     driver = FakeDriver(app, evidence_dir=tmp_path / "evidence")
+    if presence is not None:
+        driver.presence = presence
     if identity_status:
         from jev_desktop.contracts import IdentityStatus
 
@@ -834,3 +837,124 @@ def test_malformed_specs_are_rejected_before_any_input(tmp_path, steps, assertio
             steps=steps,
             assertions=[{**_saved_check("save"), **assertion}] if assertion else None,
         )
+
+
+class FakePresence:
+    """Physical input, simulated: `touch` is a human click or key, `busy` a user who keeps going."""
+
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self.human_epoch = 0
+        self.last_input: float | None = None
+        self.busy = False
+        self.active: list[bool] = []
+        self.on_escape = None
+
+    def touch(self) -> None:
+        self.human_epoch += 1
+        self.last_input = self.clock()
+
+    def idle_seconds(self) -> float:
+        if self.busy:
+            return 0.0
+        return float("inf") if self.last_input is None else self.clock() - self.last_input
+
+    def set_active(self, active: bool) -> None:
+        self.active.append(active)
+
+
+def _before_first_decision(runtime, action) -> None:
+    decide = runtime.policy.decide
+    calls = 0
+
+    def wrapped(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            action()
+        return decide(**kwargs)
+
+    runtime.policy.decide = wrapped
+
+
+@pytest.mark.parametrize("purpose", ["task", "regression"])
+def test_user_input_before_dispatch_waits_then_reobserves_and_continues(tmp_path, purpose):
+    presence = FakePresence(Clock())
+    runtime, driver, app, clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=[] if purpose == "task" else SAVE_STEP,
+        purpose=purpose,
+        script=[ScriptedDecision(Operation.CLICK, "Save"), ScriptedDecision(Operation.CLICK, "Save")]
+        + ([ScriptedDecision(Operation.DONE)] if purpose == "task" else []),
+        presence=presence,
+    )
+    presence.clock = clock
+    _before_first_decision(runtime, presence.touch)  # the user clicks while Jev is deciding
+    result = slice_once(runtime, ownership, session, created, seconds=30.0)
+    assert result.execution is Execution.COMPLETED
+    assert len(driver.executed) == 1, "the stale decision must not be sent"
+    assert app.find("Saved").value == "yes"
+    records = journal.actions_for_run(created["run_id"])
+    assert [record.state for record in records] == [DispatchState.NOT_DISPATCHED, DispatchState.DISPATCHED]
+    state = runtime._load(created["run_id"])
+    held = state.summary["hold_seconds"]
+    assert held >= runtime.config.human_grace_seconds
+    assert runtime._run_deadline(state) == state.started_at + state.spec.limits.deadline_seconds + held
+    assert presence.active == [True, False]
+    journal.close()
+
+
+def test_user_who_keeps_working_gets_the_desktop_back_as_a_resumable_takeover(tmp_path):
+    presence = FakePresence(Clock())
+    runtime, driver, _app, clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.CLICK, "Save")],
+        presence=presence,
+    )
+    presence.clock = clock
+    presence.busy = True
+    result = slice_once(runtime, ownership, session, created, seconds=5.0)
+    assert result.execution is Execution.PAUSED
+    assert result.reason == Reason.USER_TAKEOVER.value
+    assert result.detail["resumable"] is True
+    assert driver.executed == []
+    assert runtime._load(created["run_id"]).summary["hold_seconds"] == pytest.approx(5.0, abs=0.3)
+    journal.close()
+
+
+def test_hold_credit_is_capped(tmp_path):
+    presence = FakePresence(Clock())
+    runtime, _driver, _app, clock, journal, ownership, session, created = build(
+        tmp_path, elements=fresh_save_elements(), steps=[], purpose="task", presence=presence
+    )
+    presence.clock = clock
+    presence.busy = True
+    runtime.config.max_hold_seconds = 2.0
+    result = slice_once(runtime, ownership, session, created, seconds=30.0)
+    assert result.reason == Reason.USER_TAKEOVER.value
+    assert runtime._load(created["run_id"]).summary["hold_seconds"] == 2.0
+    journal.close()
+
+
+def test_escape_stops_the_run_before_any_input(tmp_path):
+    presence = FakePresence(Clock())
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=fresh_save_elements(),
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.CLICK, "Save")],
+        presence=presence,
+    )
+    assert presence.on_escape == runtime._on_escape
+    _before_first_decision(runtime, presence.on_escape)
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.CANCELLED
+    assert result.detail["message"] == "Esc pressed"
+    assert driver.executed == []
+    assert ownership.active_lease() is None
+    journal.close()
