@@ -1,6 +1,6 @@
 {
   "name": "jev-desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Use Windows applications through MCP and the command line with Jev Desktop.",
   "author": {
     "name": "jacks3tr"

@@ -13,7 +13,9 @@ and the information needed to carry it out. Use `desktop_run(task=...)` for rout
 Discover the intended application and window with `desktop_inspect`. Then call `desktop_run`
 once with a `task` containing the goal, `app_ref`, and explicit `window_refs`. Jev observes,
 selects controls, and performs the routine actions inside the broker. Do not orchestrate each
-click yourself when the task can run locally.
+click yourself when the task can run locally. With an `app_ref`, `query` narrows inspection to
+elements whose name, value, text, or path contains it. Returned observations omit unnamed rows
+that offer no action. If the task's only window is not focused, Jev focuses it first.
 
 ```json
 {
@@ -61,8 +63,10 @@ Defaults are 20 actions, 40 model decisions, and 60 seconds. Set `max_actions`,
 its goal, scope, or inputs. Total budgets do not reset on resume.
 
 The result contains the final observation, action summary, timing, and reported Jev tokens.
-`completion: model_reported` means Jev believes the goal is visible in the current state.
-Check the returned observation before reporting success. This is not an independently verified
+`completion: model_reported` means Jev believes the goal is visible in the current state; a
+separate check on the final observation, without the action history, must confirm it. When that
+check is unsure, the task pauses with `needs_visual_assistance` instead. Check the returned
+observation before reporting success. This is not an independently verified
 result. Do not turn an uncertain or budget-limited result into a success claim.
 
 ## Use direct actions when needed
@@ -85,6 +89,9 @@ Explicit targets need no TypeSafe key. Task handoffs and `target_description` re
 For screenshot-based clicks, toggles, or scrolling, supply `point` instead of `element_id`.
 Copy the evidence ID, crop, scale, image dimensions, and geometry epoch from the screenshot;
 set `x` and `y` to image pixels. Request screenshots only when you need visual context.
+Screenshots need a scoped window in the foreground; inspection never focuses one, so use
+`FOCUS_WINDOW` first. A coordinate action fails only when pixels near the point changed after
+the screenshot, so animation elsewhere in the window does not block it.
 
 ## Handle interruptions
 
