@@ -196,6 +196,33 @@ def test_policy_retries_rate_limits_then_succeeds():
         assert len(server.requests) == 1
 
 
+@pytest.mark.parametrize(
+    ("answer", "confidence", "expected"),
+    [("YES", 0.9, True), ("NO", 0.9, False), ("YES", 0.55, None)],
+    ids=["visible", "absent", "unsure"],
+)
+def test_completion_is_confirmed_on_the_observation_without_action_history(answer, confidence, expected):
+    sent = []
+
+    class Transport:
+        def post_json(self, url, *, headers, payload, timeout_s):
+            sent.append(payload)
+            return 200, fake_response(
+                "jev-1.13.0", {"done": choice_answer(answer, ["YES", "NO"], confidence=confidence)}
+            )
+
+    policy = JevPolicy(transport=Transport(), api_key="test-key")
+    state = {"elements": [], "recent_actions": [{"operation": "CLICK", "target": "Open", "changed": True}]}
+    if expected is None:
+        with pytest.raises(Pause) as paused:
+            policy.confirm_done(goal="g", state=state)
+        assert paused.value.reason is Reason.LOW_CONFIDENCE
+    else:
+        assert policy.confirm_done(goal="g", state=state) is expected
+    assert sent[0]["state"]["recent_actions"] == []
+    assert list(sent[0]["questions"]) == ["done"]
+
+
 def test_policy_reports_rejected_key_without_dispatching():
     with LocalTypeSafeServer() as server:
         server.queue(401, {"error": "unauthorized"})

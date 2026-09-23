@@ -53,6 +53,19 @@ def test_discarded_target_is_a_stale_observation_not_a_driver_error():
     assert paused.value.reason is Reason.STALE_OBSERVATION
 
 
+@pytest.mark.parametrize("settles", [True, False], ids=["async-hit-settles", "covered"])
+def test_hit_check_resamples_before_calling_a_target_covered(monkeypatch, settles):
+    target, text, dialog, backdrop = object(), object(), object(), object()
+    parents = {text: target, target: dialog}
+    # Chromium's first answer is the stale dialog hit; the exact one lands a moment later.
+    hits = [dialog, text if settles else backdrop, text if settles else backdrop]
+    automation = NS(CompareElements=lambda a, b: a is b, RawViewWalker=NS(GetParentElement=parents.get))
+    worker = NS(automation=automation, submit=lambda fn, **_: fn(worker), element_at_point=lambda *_: hits.pop(0))
+    monkeypatch.setattr(uia.time, "sleep", lambda _: None)
+    assert uia.hit_is_descendant_or_self(worker, NS(element=target), 10, 10) is settles
+    assert len(hits) == (1 if settles else 0), "sampling stops at the first proven hit and gives up after three"
+
+
 def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     rect = Rect(0, 0, 20, 20)
     handle = NS(operations=("TYPE_TEXT",), rect=rect)

@@ -768,6 +768,30 @@ class Runtime:
                 if fresh.fingerprint != snapshot.fingerprint:
                     snapshot = fresh
                     continue
+                confirm_state = {key: value for key, value in model_state.items() if key != "permitted_operations"}
+                try:
+                    confirmed = self.policy.confirm_done(
+                        goal=state.spec.goal,
+                        state=confirm_state,
+                        **(
+                            {"deadline": time.monotonic() + max(0.0, state.slice_deadline - self.config.clock())}
+                            if isinstance(self.policy, JevPolicy)
+                            else {}
+                        ),
+                    )
+                except Pause as pause:
+                    if pause.reason is not Reason.LOW_CONFIDENCE:
+                        raise
+                    confirmed = False
+                finally:
+                    if isinstance(self.policy, JevPolicy):
+                        self._record_model_attempts(state)
+                if not confirmed:
+                    return self._pause(
+                        state,
+                        Reason.NEEDS_VISUAL_ASSISTANCE.value,
+                        {"detail": "completion is not visible in the final observation; inspect the final window"},
+                    )
                 state.status = RunStatus.COMPLETED.value
                 return self._result(
                     state,
