@@ -50,6 +50,7 @@ KEYEVENTF_SCANCODE = 0x0008
 
 GA_PARENT, GA_ROOT, GA_ROOTOWNER = 1, 2, 3
 
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = ctypes.c_void_p(-2)
@@ -601,6 +602,22 @@ def window_rect(hwnd: int) -> Rect:
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         raise DriverError(f"GetWindowRect failed ({ctypes.get_last_error()})")
     return rect.as_rect()
+
+
+def frame_rect(hwnd: int) -> Rect:
+    """Visible bounds, without the invisible resize borders GetWindowRect includes.
+
+    A maximized window's GetWindowRect extends about 8 px past the monitor on each side,
+    under the taskbar and onto neighbouring monitors.
+    """
+    if dwmapi is not None:
+        rect = RECT()
+        if (
+            dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
+            == 0
+        ):
+            return rect.as_rect()
+    return window_rect(hwnd)
 
 
 def is_cloaked(hwnd: int) -> bool:

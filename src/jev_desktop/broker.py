@@ -23,6 +23,7 @@ from typing import Any
 
 from .contracts import (
     SCHEMA_VERSION,
+    SCOPE_LIMITS,
     ActionRequest,
     AuthorizationError,
     ContractError,
@@ -56,7 +57,7 @@ from .policy import (
     Transport,
     build_contexts,
 )
-from .runtime import ResumeInputs, Runtime, RuntimeConfig
+from .runtime import ResumeInputs, Runtime, RuntimeConfig, caller_view
 
 MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
 
@@ -374,7 +375,7 @@ class Broker:
         else:
             apps = self.driver.list_apps()
             discovered_windows = self.driver.list_windows()
-        if query:
+        if query and not params.get("app_ref"):
             lowered = query.lower()
             apps = [
                 app
@@ -406,6 +407,10 @@ class Broker:
             if scope.app_ref != self.runtime._scope(state).app_ref:
                 raise AuthorizationError("inspection application differs from the run binding")
             scope = self.runtime._scope(state)
+        limit = scope.max_elements
+        if query:
+            # Match against the widest observation; tree order would otherwise fill the cap with window chrome.
+            scope = replace(scope, max_elements=SCOPE_LIMITS["max_elements"])
         snapshot = self.driver.observe(scope)
         include_screenshot = bool(params.get("screenshot", True))
         secrets = self.runtime._secret_values(state) if params.get("run_id") else []
@@ -444,10 +449,8 @@ class Broker:
         payload = {
             "application": next((app.to_json() for app in apps if app.app_ref == params["app_ref"]), None),
             "windows": [window.to_json() for window in snapshot.windows],
-            "elements": [element.to_json() for element in snapshot.elements],
+            **caller_view(snapshot, limit=limit, query=query),
             "coverage": snapshot.coverage.value,
-            "truncation": list(snapshot.truncation),
-            "context": dict(snapshot.context),
             "snapshot_id": snapshot.snapshot_id,
             "geometry": snapshot.geometry.to_json(),
             "interval_ms": snapshot.interval_ms,

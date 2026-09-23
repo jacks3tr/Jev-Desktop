@@ -79,6 +79,31 @@ RESERVED_DISPATCH_STATES = {DispatchState.DISPATCHING, DispatchState.UNCERTAIN}
 CONTROL_OPERATIONS = {Operation.HOTKEY}
 
 
+def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str, Any]:
+    """Elements, context, and truncation as callers see them; the model and verification read the snapshot.
+
+    Rows without a name, value, text, operation, or focus are layout structure: bulk, not meaning.
+    Context texts already carried by a returned element are dropped for the same reason.
+    """
+    elements = [e for e in snapshot.elements if e.name or e.value or e.text or e.operations or e.focused]
+    truncation = list(snapshot.truncation)
+    if query:
+        lowered = query.casefold()
+        elements = [
+            e
+            for e in elements
+            if any(lowered in part.casefold() for part in (e.name, e.value or "", e.text or "", *e.path))
+        ]
+        if len(elements) > limit:
+            truncation.append(f"{len(elements)} elements match the query; showing the first {limit}")
+    shown = elements[:limit]
+    context = dict(snapshot.context)
+    if "texts" in context:
+        represented = {part for e in shown for part in (e.name, e.value, e.text) if part}
+        context["texts"] = [item for item in context["texts"] or [] if item.get("text") not in represented]
+    return {"elements": [e.to_json() for e in shown], "context": context, "truncation": truncation}
+
+
 @dataclass
 class RuntimeConfig:
     evidence_dir: Path
@@ -547,6 +572,7 @@ class Runtime:
         completion_probe_used = False
         value_target: TargetCandidate | None = None
         inputs_without_value: set[str] = set()
+        auto_focused = False
         while True:
             self.ownership.checkpoint(
                 run_id=state.run_id,
@@ -631,6 +657,31 @@ class Runtime:
                             note=f"Send one of {chords!r} to the focused window.",
                         )
                     )
+            if focused is not None:
+                auto_focused = False
+            elif len(unfocused) == 1 and not auto_focused and state.actions < state.spec.limits.max_actions:
+                # Focusing the one approved window is routine, not a judgment. Left to the model,
+                # every other control is withheld and escalation looks like the only choice.
+                auto_focused = True
+                window = unfocused[0]
+                target = TargetCandidate(window.window_ref, f"Focus window {window.title!r}", Operation.FOCUS_WINDOW)
+                step = RequiredStep(
+                    step_id=f"action-{state.actions + 1}",
+                    operation=Operation.FOCUS_WINDOW,
+                    target_description=target.description,
+                )
+                state.current_step_id = step.step_id
+                dispatched = self._dispatch(
+                    state,
+                    lease,
+                    Decision(Operation.FOCUS_WINDOW, target, 1.0, 1.0, "broker", {}, 0, "", ""),
+                    snapshot,
+                    step,
+                )
+                if isinstance(dispatched, RunResult):
+                    return dispatched
+                snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
+                continue
             if focused is None:
                 contexts = [context for context in contexts if context.operation is Operation.FOCUS_WINDOW]
             if value_target is not None:
@@ -1950,11 +2001,9 @@ class Runtime:
             "snapshot_id": snapshot.snapshot_id,
             "fingerprint": snapshot.fingerprint,
             "coverage": snapshot.coverage.value,
-            "truncation": list(snapshot.truncation),
             "interval_ms": snapshot.interval_ms,
             "windows": [window.to_json() for window in snapshot.windows],
-            "elements": [element.to_json() for element in snapshot.elements[:120]],
-            "context": dict(snapshot.context),
+            **caller_view(snapshot, limit=120),
         }
 
     def _budget_view(self, state: _RunState) -> dict[str, Any]:

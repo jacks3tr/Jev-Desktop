@@ -440,6 +440,30 @@ def test_goal_task_runs_locally_and_never_replays_uncertain_input(tmp_path, unce
     journal.close()
 
 
+@pytest.mark.parametrize("focusable", [True, False], ids=["focuses-then-clicks", "focus-refused-once"])
+def test_task_focuses_the_one_approved_window_before_asking_the_model(tmp_path, focusable):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=SAVE_ELEMENTS,
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.CLICK, "Save"), ScriptedDecision(Operation.DONE)]
+        if focusable
+        else [ScriptedDecision(Operation.ESCALATE)],
+    )
+    app.focused, app.focusable = False, focusable
+    result = slice_once(runtime, ownership, session, created)
+    operations = [request.operation for request in driver.executed]
+    if focusable:
+        assert result.execution is Execution.COMPLETED
+        assert operations == [Operation.FOCUS_WINDOW, Operation.CLICK]
+        assert any(context.operation is Operation.CLICK for context in runtime.policy.calls[0]["contexts"])
+    else:
+        assert result.reason == "needs_visual_assistance"
+        assert operations == [Operation.FOCUS_WINDOW], "a refused focus is not retried in a loop"
+    journal.close()
+
+
 def test_task_done_pauses_when_goal_is_not_visible_in_final_observation(tmp_path):
     runtime, driver, _app, _clock, journal, ownership, session, created = build(
         tmp_path,
@@ -974,4 +998,18 @@ def test_escape_stops_the_run_before_any_input(tmp_path):
     assert result.detail["message"] == "Esc pressed"
     assert driver.executed == []
     assert ownership.active_lease() is None
+    journal.close()
+
+
+def test_caller_view_drops_structural_rows_but_the_model_still_sees_them(tmp_path):
+    runtime, driver, _app, _clock, journal, _ownership, _session, created = build(
+        tmp_path, elements=[FakeElement("pane", "", operations=()), *SAVE_ELEMENTS], steps=[], purpose="task"
+    )
+    state = runtime._load(created["run_id"])
+    snapshot = driver.observe(runtime._scope(state))
+    model = runtime._observation_for_policy(state, snapshot)
+    caller = runtime._observation_summary(snapshot)
+    assert [element["role"] for element in model["elements"]] == ["pane", "button", "text"]
+    assert [element["role"] for element in caller["elements"]] == ["button", "text"]
+    assert model["context"]["texts"] and caller["context"]["texts"] == []
     journal.close()

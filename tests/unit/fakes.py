@@ -78,6 +78,8 @@ class FakeApp:
     status: str = "ready"
     dialog_open: bool = False
     modal: bool = False
+    focused: bool = True
+    focusable: bool = True
 
     def fingerprint(self) -> str:
         payload = "|".join(
@@ -147,7 +149,7 @@ class FakeDriver:
             process_id=4242,
             modal=self.app.modal,
             owner_window_ref=None,
-            focused=True,
+            focused=self.app.focused,
             visible=True,
             enabled=not self.app.modal,
             rect=Rect(100, 100, 700, 500),
@@ -163,7 +165,7 @@ class FakeDriver:
             raise DriverError("observation failed (injected)")
         self.observations += 1
         elements: list[ElementInfo] = []
-        for index, element in enumerate(self.app.elements, start=1):
+        for index, element in enumerate(self.app.elements[: scope.max_elements], start=1):
             value = element.value
             if element.role == "edit" and element.value is None:
                 value = ""
@@ -200,8 +202,10 @@ class FakeDriver:
             interval_ms=1,
             geometry=self.geometry(),
             fingerprint=self.app.fingerprint(),
-            coverage=Coverage.COMPLETE,
-            truncation=(),
+            coverage=Coverage.COMPLETE if len(self.app.elements) <= scope.max_elements else Coverage.TRUNCATED,
+            truncation=()
+            if len(self.app.elements) <= scope.max_elements
+            else (f"element cap reached ({scope.max_elements})",),
             windows=(self._window(),),
             elements=tuple(elements),
             context={"texts": texts, "focused_element_id": None, "modal_windows": [], "foreground_window_ref": None},
@@ -304,6 +308,7 @@ class FakeDriver:
 
     def _apply(self, request, snapshot: Snapshot | None) -> None:
         if request.operation is Operation.FOCUS_WINDOW:
+            self.app.focused = self.app.focusable
             return
         element = self._element_for(request, snapshot)
         if element is None:
