@@ -285,3 +285,13 @@ def test_oversized_response_drops_inline_images_but_keeps_the_resume_token():
     assert fallback.ok is False and fallback.error is not None
     assert fallback.error["code"] == "response_too_large"
     assert fallback.error["detail"] == {"run_id": "run:x", "resume_token": "resume:y"}
+
+
+def test_inspect_query_filters_elements_not_the_application(broker_env):
+    broker_env["app"].elements[:0] = [FakeElement("button", name) for name in ("Minimize", "Maximize", "Close")]
+    observed = broker_env["make"]().call(
+        "inspect", {"app_ref": APP_REF, "query": "save", "screenshot": False, "scope": {"max_elements": 1}}
+    )
+    assert [element["name"] for element in observed["elements"]] == ["Save"]
+    assert observed["application"]["app_ref"] == APP_REF
+    assert any("query" in note for note in observed["truncation"])

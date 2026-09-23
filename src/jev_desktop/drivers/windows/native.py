@@ -286,7 +286,7 @@ class NativeWindowsDriver:
                 )
                 if region is not None and region.intersect(approved) != region:
                     raise ContractError("capture crop is outside the approved foreground window")
-                region = region or approved
+                region = region or approved.intersect(win32.frame_rect(foreground))
                 observed = next(
                     (w for w in snapshot.windows if win32.root_window(self.window_handle(w.window_ref)) == foreground),
                     None,
@@ -332,7 +332,7 @@ class NativeWindowsDriver:
             if not win32.user32.IsWindowVisible(candidate) or win32.is_cloaked(candidate):
                 continue
             try:
-                rect = win32.window_rect(candidate)
+                rect = win32.frame_rect(candidate)
             except DriverError:  # closed since enumeration; it covers nothing
                 continue
             if not rect.intersect(region).is_empty:

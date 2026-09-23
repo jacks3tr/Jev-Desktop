@@ -53,7 +53,11 @@ lease, native guards, cancellation, and no-replay journal without requiring a te
 ## Direct desktop use
 
 Call `desktop_inspect` to discover an application, then inspect its `app_ref` and explicit
-`window_refs`. Call `desktop_act` with the returned `snapshot_id`, `access_token`, `window_ref`,
+`window_refs`. Without `app_ref`, `query` filters applications by executable path or window
+title. With `app_ref`, `query` returns up to `max_elements` elements whose name, value, text, or
+path contains it, searched across the full observation cap. Returned observations omit rows
+with no name, value, text, operation, or focus, and context texts already shown by an element;
+Jev still receives them. Call `desktop_act` with the returned `snapshot_id`, `access_token`, `window_ref`,
 operation, and control reference or screenshot point. Alternatively, use `target_description`
 for Jev to choose a compatible control. That option requires a TypeSafe key. Supply `text`, `option_label`, `hotkey`,
 or `scroll` as appropriate. No run, specification, assertions, or build hash is required.

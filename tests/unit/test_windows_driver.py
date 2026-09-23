@@ -147,6 +147,40 @@ def test_vanished_subtree_and_window_leave_a_partial_snapshot(monkeypatch):
     assert any("became unavailable" in note for note in snapshot.truncation)
 
 
+@pytest.mark.parametrize("overlap", [False, True], ids=["taskbar-under-invisible-border", "real-cover"])
+def test_maximized_window_capture_ignores_invisible_resize_borders(monkeypatch, tmp_path, overlap):
+    edge, tray = 1, 2
+    geometry = Geometry(1, 0, 0, 2560, 1440, 96, 1.0)
+    maximized = Rect(-8, -8, 2568, 1408)  # GetWindowRect of a maximized window
+    frames = {edge: Rect(0, 0, 2560, 1400), tray: Rect(0, 1390 if overlap else 1400, 2560, 1440)}
+    window = NS(window_ref="win:1", rect=maximized)
+    captured = []
+    driver = NativeWindowsDriver(evidence_dir=tmp_path)
+    driver._started = True
+    driver.screen = NS(
+        geometry=lambda: geometry,
+        capture_to=lambda _path, **kwargs: captured.append(kwargs["region"]) or NS(evidence=NS(evidence_id="ev:1")),
+    )
+    monkeypatch.setattr(driver, "snapshot", lambda *_: NS(elements=[], geometry=geometry, windows=[window]))
+    monkeypatch.setattr(driver, "_observe_windows", lambda _app: [window])
+    monkeypatch.setattr(driver, "_scoped_windows", lambda _scope, windows: windows)
+    monkeypatch.setattr(driver, "window_handle", lambda _ref: edge)
+    monkeypatch.setattr(win32, "root_window", lambda hwnd: hwnd)
+    monkeypatch.setattr(win32, "foreground_window", lambda: edge)
+    monkeypatch.setattr(win32, "window_rect", lambda hwnd: maximized if hwnd == edge else frames[tray])
+    monkeypatch.setattr(win32, "frame_rect", frames.__getitem__, raising=False)
+    monkeypatch.setattr(win32, "enum_top_level_windows", lambda: [tray, edge])  # the taskbar is topmost
+    monkeypatch.setattr(win32, "is_cloaked", lambda _hwnd: False)
+    monkeypatch.setattr(win32.user32, "IsWindowVisible", lambda _hwnd: True)
+    scope = NS(app_ref="app:1")
+    if overlap:
+        with pytest.raises(DriverError, match="covers the approved capture region"):
+            driver.capture(scope=scope, snapshot_id="snap:1", run_id="run:1")
+    else:
+        driver.capture(scope=scope, snapshot_id="snap:1", run_id="run:1")
+        assert captured == [frames[edge]]
+
+
 @pytest.mark.parametrize(
     ("mode", "operation"),
     [(InputMode.USER_PATH, Operation.CLICK), (InputMode.SEMANTIC, Operation.HOTKEY)],

@@ -21,6 +21,11 @@ def test_mcp_image_is_not_duplicated_in_text():
     assert payload["screenshot"]["base64"] == encoded
 
 
+def test_mcp_text_is_compact_json():
+    text = _content({"elements": [{"name": "Save", "operations": ["CLICK"]}]})[0].text
+    assert text == '{"elements":[{"name":"Save","operations":["CLICK"]}]}'
+
+
 def test_mismatched_reply_invalidates_pipe(monkeypatch):
     client = PipeClient()
     request = Envelope.request("status", {})

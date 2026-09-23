@@ -49,7 +49,7 @@ def _json_text(payload: Any) -> str:
             return [metadata(item) for item in value]
         return value
 
-    return json.dumps(metadata(payload), ensure_ascii=False, indent=2, default=str)
+    return json.dumps(metadata(payload), ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def _images_from(payload: Mapping[str, Any]) -> list[ImageContent]:
