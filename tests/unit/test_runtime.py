@@ -464,6 +464,23 @@ def test_task_focuses_the_one_approved_window_before_asking_the_model(tmp_path, 
     journal.close()
 
 
+def test_task_done_pauses_when_goal_is_not_visible_in_final_observation(tmp_path):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("button", "Waiting for you", operations=("CLICK",))],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.CLICK, "Waiting for you"), ScriptedDecision(Operation.DONE)],
+    )
+    runtime.policy.done_visible = False
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.PAUSED
+    assert result.reason == "needs_visual_assistance"
+    assert len(driver.executed) == 1
+    assert len(runtime.policy.done_checks) == 1
+    journal.close()
+
+
 def test_task_reobserves_after_stale_target_refusal(tmp_path):
     runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,

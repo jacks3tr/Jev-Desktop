@@ -9,17 +9,21 @@ from types import SimpleNamespace as NS
 import pytest
 
 from jev_desktop.contracts import (
+    Capture,
+    ContractError,
     Coverage,
     DriverError,
+    EvidenceRef,
     Geometry,
     InputMode,
     Operation,
     Pause,
     Reason,
     Rect,
+    ScreenshotPoint,
 )
 from jev_desktop.drivers import windows as windows_driver
-from jev_desktop.drivers.windows import identity, uia, win32
+from jev_desktop.drivers.windows import capture, identity, uia, win32
 from jev_desktop.drivers.windows import input as native_input
 from jev_desktop.drivers.windows.native import NativeWindowsDriver
 
@@ -159,7 +163,10 @@ def test_maximized_window_capture_ignores_invisible_resize_borders(monkeypatch, 
     driver._started = True
     driver.screen = NS(
         geometry=lambda: geometry,
-        capture_to=lambda _path, **kwargs: captured.append(kwargs["region"]) or NS(evidence=NS(evidence_id="ev:1")),
+        capture_to=lambda _path, **kwargs: (
+            captured.append(kwargs["region"])
+            or (NS(evidence=NS(evidence_id="ev:1"), source_rect=kwargs["region"]), bytes(2560 * 1400 * 4))
+        ),
     )
     monkeypatch.setattr(driver, "snapshot", lambda *_: NS(elements=[], geometry=geometry, windows=[window]))
     monkeypatch.setattr(driver, "_observe_windows", lambda _app: [window])
@@ -205,6 +212,54 @@ def test_live_target_checks_follow_authorization_immediately_before_input(monkey
     assert driver.execute(request, lambda: events.append("authorize"), NS(app_ref="app")) == "receipt"
     explicit = ["authorize", "process", "foreground"] if mode is InputMode.USER_PATH else ["authorize", "process"]
     assert events == [*explicit, "|", "authorize", "process", "foreground"]
+
+
+def test_coordinate_input_tolerates_change_away_from_the_point(monkeypatch):
+    geometry = Geometry(1, 0, 0, 1920, 1080, 96, 1.0)
+    source = Rect(0, 0, 320, 160)
+    evidence = EvidenceRef(
+        "ev:" + "1" * 24,
+        "run:" + "2" * 24,
+        "screenshot",
+        "unused.png",
+        "image/png",
+        "unused",
+        0,
+        1.0,
+        snapshot_id="snap:" + "3" * 24,
+        geometry=geometry,
+        source_rect=source,
+        scale=1.0,
+        image_width=320,
+        image_height=160,
+    )
+    frame = bytearray(source.width * source.height * 4)
+
+    def grab_bgra(rect):
+        return b"".join(
+            frame[(y * 320 + rect.left) * 4 : (y * 320 + rect.right) * 4] for y in range(rect.top, rect.bottom)
+        )
+
+    driver = NativeWindowsDriver()
+    driver._started = True
+    driver.screen = NS(geometry=lambda: geometry, grab_bgra=grab_bgra)
+    driver._captures[evidence.evidence_id] = Capture(evidence, geometry, source, 1.0)
+    driver._tiles[evidence.evidence_id] = capture.tile_checksums(320, 160, bytes(frame))
+    monkeypatch.setattr(driver, "window_handle", lambda _ref: 1)
+    monkeypatch.setattr(win32, "window_rect", lambda _hwnd: source)
+    monkeypatch.setattr(win32, "dpi_for_window", lambda _hwnd: 96)
+    monkeypatch.setattr(win32, "root_window", lambda hwnd: hwnd)
+    monkeypatch.setattr(win32, "window_from_point", lambda _x, _y: 1)
+    monkeypatch.setattr(win32, "enum_top_level_windows", lambda: [1])
+    point = ScreenshotPoint(evidence.evidence_id, 20, 20, source, 1.0, 320, 160, 1)
+    request = NS(point=point, run_id=evidence.run_id, snapshot_id=evidence.snapshot_id, window_ref="win:1")
+    snapshot = NS(windows=[NS(window_ref="win:1", rect=source, dpi=96)])
+
+    frame[(150 * 320 + 300) * 4] = 255  # a spinner in the far corner
+    assert driver.resolve_point(request, snapshot) == (20, 20)
+    frame[(25 * 320 + 25) * 4] = 255  # under the point
+    with pytest.raises(ContractError, match="content changed"):
+        driver.resolve_point(request, snapshot)
 
 
 def test_worker_is_the_tracked_process_inside_a_venv(monkeypatch, tmp_path):

@@ -176,6 +176,12 @@ def test_coordinate_transform_binds_snapshot_crop_and_actual_image_dimensions():
         point.resolve(evidence, "run:" + "4" * 24, evidence.snapshot_id)
 
 
+def test_point_schema_error_names_the_missing_source_rect():
+    point = {"evidence_id": "ev:" + "1" * 24, "x": 1, "y": 1, "crop": {"rect": Rect(0, 0, 10, 10).to_json()}}
+    with pytest.raises(ContractError, match=r"^point\.source_rect must be an object$"):
+        ScreenshotPoint.from_json(point)
+
+
 def _returned_uncertain_worker(connection):
     connection.recv()
     connection.send(("error", ("UncertainEffect", "input outcome unknown", {"poisoned": False})))

@@ -1042,8 +1042,18 @@ def point_hits_element(worker: UiaWorker, element: Any, x: int, y: int) -> bool:
     return False
 
 
-def hit_is_descendant_or_self(worker: UiaWorker, target: ElementHandle, x: int, y: int) -> bool:
-    return worker.submit(lambda _: point_hits_element(worker, target.element, x, y), timeout=10.0)
+def hit_is_descendant_or_self(
+    worker: UiaWorker, target: ElementHandle, x: int, y: int, attempts: int = 3, settle_s: float = 0.1
+) -> bool:
+    # Chromium answers a point query from its previous hit or a z-order-blind approximation
+    # while the exact hit test runs asynchronously, so the first answer over a modal, menu, or
+    # palette can be an ancestor. Sample again before refusing; a real cover never passes.
+    for attempt in range(attempts):
+        if worker.submit(lambda _: point_hits_element(worker, target.element, x, y), timeout=10.0):
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(settle_s)
+    return False
 
 
 def selection_belongs_to(worker: UiaWorker, option: ElementHandle, container: ElementHandle) -> bool:

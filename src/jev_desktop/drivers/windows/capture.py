@@ -52,12 +52,34 @@ def encode_png(width: int, height: int, bgra: bytes) -> bytes:
     )
 
 
+TILE = 32
+
+
+def tile_checksums(
+    width: int, height: int, bgra: bytes, *, origin: tuple[int, int] = (0, 0)
+) -> dict[tuple[int, int], int]:
+    """CRC32 of each TILE x TILE block of a BGRA buffer, keyed by (column, row) offset by `origin`."""
+    pixels = bytearray(bgra)
+    pixels[3::4] = bytes(width * height)  # GDI's unused alpha byte is not image content.
+    view = memoryview(pixels)
+    stride = width * 4
+    sums = {}
+    for top in range(0, height, TILE):
+        for left in range(0, width, TILE):
+            crc = 0
+            for y in range(top, min(top + TILE, height)):
+                crc = zlib.crc32(view[y * stride + left * 4 : y * stride + min(left + TILE, width) * 4], crc)
+            sums[(origin[0] + left // TILE, origin[1] + top // TILE)] = crc
+    return sums
+
+
 @dataclass
 class RawCapture:
     png: bytes
     source_rect: Rect
     scale: float
     geometry: Geometry
+    bgra: bytes  # full-resolution pixels of source_rect, whatever scale the PNG uses
 
 
 class ScreenCapture:
@@ -91,7 +113,23 @@ class ScreenCapture:
         if source.is_empty:
             raise DriverError("capture region is off-screen")
         scale = min(1.0, max_dimension / max(source.width, source.height))
+        buffer = self.grab_bgra(source)
+        full = encode_png(source.width, source.height, buffer)
+        if scale >= 1.0:
+            return RawCapture(png=full, source_rect=source, scale=1.0, geometry=self.geometry(), bgra=buffer)
 
+        # Downscaling through GDI applies dithering, which sometimes compresses worse than the
+        # original. Measured on a 720x520 window: 9.2 kB full, 23.9 kB at 0.4. Keep whichever
+        # encoding is actually smaller, and report the scale that produced it.
+        target_width = max(1, int(source.width * scale))
+        target_height = max(1, int(source.height * scale))
+        scaled = _downscale(source.width, source.height, buffer, target_width, target_height)
+        if scaled and len(scaled) < len(full):
+            return RawCapture(png=scaled, source_rect=source, scale=scale, geometry=self.geometry(), bgra=buffer)
+        return RawCapture(png=full, source_rect=source, scale=1.0, geometry=self.geometry(), bgra=buffer)
+
+    def grab_bgra(self, source: Rect) -> bytes:
+        """Full-resolution top-down BGRA pixels of an on-screen rectangle."""
         screen_dc = win32.user32.GetDC(0)
         if not screen_dc:
             raise DriverError(f"GetDC(desktop) failed ({ctypes.get_last_error()})")
@@ -131,20 +169,7 @@ class ScreenCapture:
                 win32.gdi32.DeleteObject(bitmap)
             win32.gdi32.DeleteDC(memory_dc)
             win32.user32.ReleaseDC(0, screen_dc)
-
-        full = encode_png(source.width, source.height, buffer)
-        if scale >= 1.0:
-            return RawCapture(png=full, source_rect=source, scale=1.0, geometry=self.geometry())
-
-        # Downscaling through GDI applies dithering, which sometimes compresses worse than the
-        # original. Measured on a 720x520 window: 9.2 kB full, 23.9 kB at 0.4. Keep whichever
-        # encoding is actually smaller, and report the scale that produced it.
-        target_width = max(1, int(source.width * scale))
-        target_height = max(1, int(source.height * scale))
-        scaled = _downscale(source.width, source.height, buffer, target_width, target_height)
-        if scaled and len(scaled) < len(full):
-            return RawCapture(png=scaled, source_rect=source, scale=scale, geometry=self.geometry())
-        return RawCapture(png=full, source_rect=source, scale=1.0, geometry=self.geometry())
+        return buffer
 
     def capture_to(
         self,
@@ -156,7 +181,8 @@ class ScreenCapture:
         region: Rect | None = None,
         snapshot_id: str | None = None,
         max_dimension: int = 1600,
-    ) -> Capture:
+    ) -> tuple[Capture, bytes]:
+        """Write the PNG evidence; also return the full-resolution BGRA pixels it was made from."""
         raw = self.grab(region, max_dimension=max_dimension)
         with open(path, "wb") as handle:
             handle.write(raw.png)
@@ -178,7 +204,8 @@ class ScreenCapture:
             image_width=struct.unpack(">I", raw.png[16:20])[0],
             image_height=struct.unpack(">I", raw.png[20:24])[0],
         )
-        return Capture(evidence=evidence, geometry=raw.geometry, source_rect=raw.source_rect, scale=raw.scale)
+        capture = Capture(evidence=evidence, geometry=raw.geometry, source_rect=raw.source_rect, scale=raw.scale)
+        return capture, raw.bgra
 
 
 def _downscale(width: int, height: int, bgra: bytes, target_width: int, target_height: int) -> bytes | None:

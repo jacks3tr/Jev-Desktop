@@ -7,7 +7,6 @@ identifiers and must re-observe after any state change.
 
 from __future__ import annotations
 
-import hashlib
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -45,6 +44,7 @@ class NativeWindowsDriver:
         self._apps: dict[str, AppRef] = {}
         self._snapshots: dict[str, Snapshot] = {}
         self._captures: dict[str, Capture] = {}
+        self._tiles: dict[str, dict[tuple[int, int], int]] = {}  # evidence_id -> source_rect tile checksums
         self._app_by_key: dict[tuple[int, float], str] = {}
         self._pid_by_app: dict[str, int] = {}
         self._scope: dict[str, tuple[int, str]] = {}  # window_ref -> (hwnd, app_ref)
@@ -232,6 +232,7 @@ class NativeWindowsDriver:
                 break
         self._snapshots[scope.app_ref] = snapshot
         self._captures.clear()
+        self._tiles.clear()
         return snapshot
 
     def snapshot(self, snapshot_id: str | None, scope: ScopeSpec) -> Snapshot:
@@ -301,7 +302,7 @@ class NativeWindowsDriver:
         directory.mkdir(parents=True, exist_ok=True)
         label = (checkpoint or "capture").replace("/", "-")[:40]
         path = directory / f"{label}-{int(time.time() * 1000)}-{new_id('ev').split(':')[1][:8]}.png"
-        capture = self.screen.capture_to(
+        capture, pixels = self.screen.capture_to(
             str(path),
             run_id=run_id,
             checkpoint=checkpoint,
@@ -323,6 +324,8 @@ class NativeWindowsDriver:
             path.unlink(missing_ok=True)
             raise
         self._captures[capture.evidence.evidence_id] = capture
+        source = capture.source_rect
+        self._tiles[capture.evidence.evidence_id] = capture_module.tile_checksums(source.width, source.height, pixels)
         return capture
 
     def _require_uncovered(self, hwnd: int, region: Rect) -> None:
@@ -358,8 +361,21 @@ class NativeWindowsDriver:
         self._require_uncovered(win32.root_window(hwnd), capture.source_rect)
         if win32.root_window(win32.window_from_point(x, y)) != win32.root_window(hwnd):
             raise ContractError("coordinate is covered by another window")
-        fresh = self.screen.grab(capture.source_rect, max_dimension=max(point.image_width, point.image_height))
-        if hashlib.sha256(fresh.png).hexdigest() != capture.evidence.sha256:
+        # Only the point's tile and its neighbours must match: a spinner elsewhere in the
+        # window should not invalidate the screenshot, but a change under the point must.
+        source, tile = capture.source_rect, capture_module.TILE
+        column, row = max((x - source.left) // tile - 1, 0), max((y - source.top) // tile - 1, 0)
+        near = Rect(
+            source.left + column * tile,
+            source.top + row * tile,
+            min(source.left + (column + 3) * tile, source.right),
+            min(source.top + (row + 3) * tile, source.bottom),
+        )
+        fresh = capture_module.tile_checksums(
+            near.width, near.height, self.screen.grab_bgra(near), origin=(column, row)
+        )
+        expected = self._tiles.get(point.evidence_id, {})
+        if any(expected.get(key) != checksum for key, checksum in fresh.items()):
             raise ContractError("screenshot content changed; inspect again before coordinate input")
         return x, y
 
