@@ -118,3 +118,12 @@ run is in progress, then tell the user to restart their Claude Code sessions.
   or call time limits.
 - 0.1.0 to 0.2.0 changed the logon ID used in pipe, event, and lock names: an old broker is
   invisible to new clients, so it had to be stopped by process ID.
+- Read the draft's generated "What's Changed" before writing the summary: it lists every PR
+  merged since the previous tag, which can include features you did not work on.
+- `gh pr merge <n> --merge --delete-branch` deletes the remote and local branch and leaves you
+  on an updated `main`.
+- Confirm the local update with `C:\Python314\python.exe -m jev_desktop.transports.cli doctor`:
+  it starts a broker from the checkout if none is running and reports its pipe and policy.
+- The release workflow's draft already has both distributions attached; publishing only needs
+  `gh release edit`. The full 0.2.0 release took one CI run (about 5 minutes) and one release
+  run (about 1 minute).
