@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import comtypes
+
 from ...contracts import (
     ActionRequest,
     DispatchMechanism,
@@ -150,6 +152,11 @@ class LiveState:
         return win32.root_window(self.window_hwnd)
 
 
+# 0x80040201. Windows formats it as an unrelated COM+ event error ("unable to invoke any of the
+# subscribers"); from UI Automation it means the provider discarded the element.
+UIA_E_ELEMENTNOTAVAILABLE = -2147220991
+
+
 def live_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
     def _read(_worker: uia.UiaWorker) -> LiveState:
         element = handle.element
@@ -174,7 +181,16 @@ def live_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
             foreground_root=win32.root_window(win32.foreground_window()) if win32.foreground_window() else 0,
         )
 
-    return worker.submit(_read, timeout=10.0)
+    try:
+        return worker.submit(_read, timeout=10.0)
+    except comtypes.COMError as exc:
+        # Browsers rebuild accessibility nodes on re-render. Nothing has been sent yet, so the
+        # caller can observe again instead of failing the run.
+        if exc.hresult != UIA_E_ELEMENTNOTAVAILABLE:
+            raise
+        raise Pause(
+            Reason.STALE_OBSERVATION, {"reason": "the target element no longer exists", "element": handle.element_id}
+        ) from exc
 
 
 def _geometry_ok(cached: Rect, live: Rect, tolerance: int = 4) -> bool:
