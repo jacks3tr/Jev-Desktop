@@ -346,13 +346,13 @@ class Rect:
         return {"left": self.left, "top": self.top, "right": self.right, "bottom": self.bottom}
 
     @classmethod
-    def from_json(cls, data: Any) -> Rect:
-        data = _require_mapping(data, "rect")
+    def from_json(cls, data: Any, what: str = "rect") -> Rect:
+        data = _require_mapping(data, what)
         return cls(
-            left=_require_int(data.get("left"), "rect.left"),
-            top=_require_int(data.get("top"), "rect.top"),
-            right=_require_int(data.get("right"), "rect.right"),
-            bottom=_require_int(data.get("bottom"), "rect.bottom"),
+            left=_require_int(data.get("left"), f"{what}.left"),
+            top=_require_int(data.get("top"), f"{what}.top"),
+            right=_require_int(data.get("right"), f"{what}.right"),
+            bottom=_require_int(data.get("bottom"), f"{what}.bottom"),
         )
 
     @property
@@ -827,7 +827,9 @@ class EvidenceRef:
             checkpoint=_opt_str(data.get("checkpoint"), "evidence.checkpoint"),
             snapshot_id=None if snapshot_id is None else validate_id("snap", snapshot_id),
             geometry=None if data.get("geometry") is None else Geometry.from_json(data.get("geometry")),
-            source_rect=None if data.get("source_rect") is None else Rect.from_json(data.get("source_rect")),
+            source_rect=None
+            if data.get("source_rect") is None
+            else Rect.from_json(data.get("source_rect"), "evidence.source_rect"),
             scale=None if data.get("scale") is None else _require_number(data.get("scale"), "evidence.scale"),
             description=_require_str(data.get("description", ""), "evidence.description"),
             image_width=None
@@ -874,7 +876,7 @@ class ScreenshotPoint:
             validate_id("ev", data.get("evidence_id")),
             _require_int(data.get("x"), "point.x", minimum=0),
             _require_int(data.get("y"), "point.y", minimum=0),
-            Rect.from_json(data.get("source_rect")),
+            Rect.from_json(data.get("source_rect"), "point.source_rect"),
             _require_number(data.get("scale"), "point.scale"),
             _require_int(data.get("image_width"), "point.image_width", minimum=1),
             _require_int(data.get("image_height"), "point.image_height", minimum=1),

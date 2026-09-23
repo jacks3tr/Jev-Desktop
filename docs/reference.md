@@ -40,7 +40,9 @@ counts include provider-reported usage from accepted and rejected responses.
 `usage_complete` is false when any HTTP attempt lacks either token field.
 `model_latency_ms` includes rejected calls and retries; `elapsed_seconds` includes observation, input,
 and waits. No dollar estimate is inferred. Completion is model-reported and must be checked
-against the returned observation. A fresh observation is taken before accepting DONE.
+against the returned observation. A fresh observation is taken before accepting DONE, and a
+separate question asks whether the goal's end state is visible in it without the action history;
+anything short of a confident yes pauses with `needs_visual_assistance`.
 After a low-confidence decision following input, the broker waits briefly and checks completion
 once more with a deeper observation of the same windows. This check cannot send input.
 If the result remains unclear, inspect the final window or request a screenshot.
@@ -277,8 +279,8 @@ For screenshot-based `CLICK`, `TOGGLE`, or `SCROLL`, omit `element_id` and suppl
 
 Copy the transform fields from the screenshot evidence exactly. Coordinates are zero-based
 image pixels. The driver maps them using the actual image dimensions, including rounding
-and negative desktop origins. Changed pixels, DPI, window position, geometry, scope, or
-snapshot invalidate the action. Coordinate actions use `user_path`; they do not substitute
+and negative desktop origins. Changed pixels near the point, DPI, window position, geometry,
+scope, or snapshot invalidate the action. Coordinate actions use `user_path`; they do not substitute
 semantic invocation. Text and selection still require observed controls and declared fixtures.
 
 Fresh-launch and executable-hash checks cannot certify an interpreter or shared host as the application.

@@ -342,10 +342,16 @@ class ScriptedDecision:
 class ScriptedPolicy:
     """Returns queued decisions, resolving target names against the offered candidates."""
 
-    def __init__(self, script: Sequence[ScriptedDecision]) -> None:
+    def __init__(self, script: Sequence[ScriptedDecision], *, done_visible: bool = True) -> None:
         self.script = list(script)
         self.calls: list[dict[str, Any]] = []
         self.resolved_models = ["scripted-1"]
+        self.done_visible = done_visible
+        self.done_checks: list[dict[str, Any]] = []
+
+    def confirm_done(self, *, goal: str, state: Mapping[str, Any]) -> bool:
+        self.done_checks.append({"goal": goal, "state": state})
+        return self.done_visible
 
     def decide(
         self,
