@@ -38,6 +38,21 @@ def test_same_label_option_must_belong_to_selected_container(monkeypatch):
     assert result[0] == "right-list"
 
 
+def test_discarded_target_is_a_stale_observation_not_a_driver_error():
+    import comtypes
+
+    from jev_desktop.contracts import Pause, Reason
+
+    def discarded(_prop):
+        raise comtypes.COMError(-2147220991, "An event was unable to invoke any of the subscribers", None)
+
+    handle = NS(element=NS(GetCurrentPropertyValue=discarded), element_id="el:1", role="button")
+    worker = NS(submit=lambda fn, **_: fn(worker))
+    with pytest.raises(Pause) as paused:
+        native_input.live_state(worker, handle)
+    assert paused.value.reason is Reason.STALE_OBSERVATION
+
+
 def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     rect = Rect(0, 0, 20, 20)
     handle = NS(operations=("TYPE_TEXT",), rect=rect)
