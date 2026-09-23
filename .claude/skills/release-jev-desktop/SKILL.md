@@ -128,6 +128,15 @@ run is in progress, then tell the user to restart their Claude Code sessions.
   on an updated `main`.
 - Confirm the local update with `C:\Python314\python.exe -m jev_desktop.transports.cli doctor`:
   it starts a broker from the checkout if none is running and reports its pipe and policy.
+- Merging to `main` runs CI again. Find that run with
+  `gh run list --branch main --limit 1 --json headSha,status,conclusion`, wait for success, then
+  tag that exact commit: `git tag -a vX.Y.Z -m "..." <sha>`.
+- PowerShell mangles `git rev-parse vX.Y.Z^{commit}`; use `git rev-list -n 1 vX.Y.Z`.
+- Before stopping the broker, confirm no run is active: the `runs` table in
+  `%LOCALAPPDATA%\JevDesktop\journal.sqlite` shows each run's `status` and `updated_at`. Paused
+  runs are stored and survive the restart; the next client call autostarts a new broker.
+- Auto mode may refuse `gh pr merge` for a PR the user did not approve by name, for example one
+  opened after they said "merge". Ask rather than work around it.
 - The release workflow's draft already has both distributions attached; publishing only needs
   `gh release edit`. The full 0.2.0 release took one CI run (about 5 minutes) and one release
   run (about 1 minute).
