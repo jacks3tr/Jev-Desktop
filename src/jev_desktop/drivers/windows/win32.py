@@ -72,6 +72,10 @@ SWP_NOMOVE = 0x0002
 SWP_SHOWWINDOW = 0x0040
 WS_EX_TOPMOST = 0x00000008
 
+# The broker's own edge-glow windows (see presence.py). They are never an application, a
+# capture occluder, or a hit-test target, so window enumeration leaves them out.
+PRESENCE_CLASS = "JevDesktopPresence"
+
 # ---------------------------------------------------------------------------
 # Structures
 # ---------------------------------------------------------------------------
@@ -95,7 +99,7 @@ class MOUSEINPUT(ctypes.Structure):
         ("mouseData", wintypes.DWORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
     ]
 
 
@@ -105,7 +109,7 @@ class KEYBDINPUT(ctypes.Structure):
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
     ]
 
 
@@ -356,8 +360,11 @@ CAPTUREBLT = 0x40000000
 # Helpers
 # ---------------------------------------------------------------------------
 
-_ULONG_PTR = ctypes.POINTER(ctypes.c_ulong)
-_NULL_EXTRA = _ULONG_PTR()
+# dwExtraInfo on every event this plugin sends. Remote-desktop tools (Chrome Remote Desktop,
+# AnyDesk, TeamViewer, Parsec) also inject their user's input, so the injected flag alone
+# cannot tell the plugin's input from a person's; injected *and* tagged can. Fits a 32-bit
+# ULONG_PTR ("JEV1").
+JEV_INPUT_TAG = 0x4A455631
 
 
 def set_dpi_awareness() -> str:
@@ -484,12 +491,12 @@ def _mouse_input(flags: int, x: int = 0, y: int = 0, data: int = 0) -> INPUT:
     nx, ny = normalize_absolute(x, y)
     return INPUT(
         type=INPUT_MOUSE,
-        mi=MOUSEINPUT(nx, ny, ctypes.c_ulong(data & 0xFFFFFFFF).value, flags, 0, _NULL_EXTRA),
+        mi=MOUSEINPUT(nx, ny, ctypes.c_ulong(data & 0xFFFFFFFF).value, flags, 0, JEV_INPUT_TAG),
     )
 
 
 def _key_input(vk: int, flags: int, scan: int = 0) -> INPUT:
-    return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, scan, flags, 0, _NULL_EXTRA))
+    return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, scan, flags, 0, JEV_INPUT_TAG))
 
 
 def move_mouse(x: int, y: int) -> int:
@@ -695,11 +702,13 @@ def monitor_work_area(hwnd: int) -> Rect:
 
 
 def enum_top_level_windows() -> list[int]:
+    """Top-level windows in z-order, without the desktop-presence overlay."""
     handles: list[int] = []
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     def _callback(hwnd: int, _param: int) -> bool:
-        handles.append(int(hwnd))
+        if window_class(hwnd) != PRESENCE_CLASS:
+            handles.append(int(hwnd))
         return True
 
     callback = callback_type(_callback)

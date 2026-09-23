@@ -664,10 +664,13 @@ class Broker:
         lease = self.ownership.acquire(session.session_id, action_run_id)
         self._standalone_run = action_run_id
         deadline = time.monotonic() + 45.0
+        epoch = self.runtime._human_epoch()
 
         def guard() -> None:
             if time.monotonic() >= deadline:
                 raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "action_deadline"})
+            if self.runtime._human_epoch() != epoch:
+                raise Pause(Reason.USER_TAKEOVER, {"reason": "physical input during the action; inspect again"})
             self.ownership.checkpoint(
                 run_id=action_run_id,
                 lease_id=lease.lease_id,

@@ -204,3 +204,76 @@ def test_exe_hash_is_not_served_from_a_stale_cache(tmp_path):
     exe.write_bytes(b"build-2")
     os.utime(exe, ns=(stamp, stamp))
     assert identity.sha256_file(str(exe)) != first
+
+
+def _user_path_click(monkeypatch, cursor_after):
+    rect = Rect(0, 0, 20, 20)
+    handle = NS(operations=("CLICK",), rect=rect)
+    state = NS(rect=rect)
+    monkeypatch.setattr(uia, "resolve_element", lambda *_: handle)
+    monkeypatch.setattr(native_input, "live_state", lambda *_: state)
+    monkeypatch.setattr(native_input, "require_user_path_ready", lambda *_: (10, 10))
+    monkeypatch.setattr(native_input, "_hit_ok", lambda *_: True)
+    monkeypatch.setattr(win32, "click_at", lambda *_: 3)
+    positions = iter([(500, 400), cursor_after])
+    monkeypatch.setattr(win32, "cursor_position", lambda: next(positions))
+    restored = []
+    monkeypatch.setattr(win32, "set_cursor_position", lambda *point: restored.append(point))
+    request = NS(
+        operation=Operation.CLICK,
+        point=None,
+        element_id="button",
+        snapshot_id="snapshot",
+        mode=InputMode.USER_PATH,
+        action_id="action",
+        window_ref="window",
+    )
+    native_input.execute(NS(worker=None, registry=None), request, lambda: None, NS(app_ref="app"))
+    return restored
+
+
+def test_cursor_returns_only_if_still_where_the_click_left_it(monkeypatch, no_send_input):
+    assert _user_path_click(monkeypatch, (10, 10)) == [(500, 400)]
+    # The person moved the mouse during the action: their position wins.
+    assert _user_path_click(monkeypatch, (730, 90)) == []
+
+
+def test_unreadable_cursor_is_left_alone(monkeypatch):
+    def unreadable():
+        raise DriverError("GetCursorPos failed (5)")
+
+    monkeypatch.setattr(win32, "cursor_position", unreadable)
+    monkeypatch.setattr(win32, "set_cursor_position", lambda *_: pytest.fail("cursor must not move"))
+    native_input._restore_cursor((1, 2), (3, 4))
+
+
+def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
+    sent = []
+
+    def record(count, events, _size):
+        sent.extend((events[i].type, events[i].mi.dwExtraInfo, events[i].ki.dwExtraInfo) for i in range(count))
+        return count
+
+    monkeypatch.setattr(win32.user32, "SendInput", record)  # never the real SendInput
+    monkeypatch.setattr(win32, "key_down", lambda _vk: False)
+    monkeypatch.setattr(win32, "_dispatch_guard", None)
+    context = multiprocessing.get_context("spawn")
+    buffer, count = context.RawArray("B", 8192), context.RawValue("i", 0)
+    monkeypatch.setattr(win32, "_pending_inputs", buffer)
+    monkeypatch.setattr(win32, "_pending_count", count)
+    win32.move_mouse(5, 5)
+    win32.click_at(5, 5, double=True, button="right")
+    win32.scroll_wheel(5, 5, notches=-2, horizontal=True)
+    win32.type_unicode("a\U0001f600")
+    win32.key_chord([0x11, 0x10, 0x53])
+    produced = len(sent)
+    # The cleanup batch replays recorded releases, which were built by the same helpers.
+    pending = [win32._key_input(0x11, win32.KEYEVENTF_KEYUP), win32._mouse_input(win32.MOUSEEVENTF_LEFTUP, 1, 1)]
+    payload = bytes((win32.INPUT * 2)(*pending))
+    buffer[: len(payload)] = payload
+    count.value = 2
+    win32.release_pending(buffer, count)
+    assert produced == 1 + 5 + 2 + 6 + 6 and len(sent) == produced + 2
+    for kind, mouse_extra, key_extra in sent:
+        extra = mouse_extra if kind == win32.INPUT_MOUSE else key_extra
+        assert extra == win32.JEV_INPUT_TAG

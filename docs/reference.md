@@ -298,6 +298,29 @@ replays an action whose outcome is uncertain. Resume tokens rotate after executi
 references do not survive a broker restart; a run scoped to them pauses with `stale_observation`
 and needs a new run.
 
+### Sharing the desktop
+
+While a run or direct action holds the desktop lease, a subtle blue glow marks the edges of
+every monitor. It never takes focus and passes clicks through. It stays visible to remote
+desktop and screen sharing, so screenshots that reach a monitor edge show a faint blue tint.
+Low-level input hooks run only while the lease is held. Jev tags its own input and the hooks
+ignore only tagged input, so input from remote desktop tools counts as a person.
+
+- Physical mouse movement is ignored.
+- A physical click, scroll, or key press means the current decision is based on a screen the
+  user has touched. Nothing more is sent. The run waits until there has been no physical input
+  for 3 seconds, observes again, and continues; a task can refocus its window. If input
+  arrives partway through typing, the action is `uncertain_effect` and is never retyped.
+- Waiting extends the run deadline, by at most 300 seconds per run in total, but not the
+  current call's `slice_seconds`. If the user is still active when the call or the allowance
+  ends, the run pauses with `user_takeover` and `resumable: true`.
+- A direct `desktop_act` that sees physical input returns `user_takeover`; inspect again.
+- Physical Esc cancels the run that holds the lease (`Esc pressed`). It does not set the
+  emergency stop.
+
+Hooks cannot observe input sent to elevated windows unless the broker is elevated, or input on
+the secure desktop.
+
 ## Troubleshooting
 
 Run `jev-desktop doctor` for diagnostics. Remove credentials, tokens, private paths, and

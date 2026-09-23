@@ -398,7 +398,7 @@ def execute(
             else:
                 inserted = win32.click_at(x, y)
         finally:
-            win32.set_cursor_position(*previous)
+            _restore_cursor(previous, (x, y))
         return _receipt(
             request,
             DispatchMechanism.SEND_INPUT_MOUSE,
@@ -467,7 +467,7 @@ def execute(
                 f"mouse dispatch failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE
             ) from exc
         finally:
-            win32.set_cursor_position(*previous)
+            _restore_cursor(previous, (x, y))
         return _receipt(request, DispatchMechanism.SEND_INPUT_MOUSE, inserted, started, notes=(f"point={x},{y}",))
 
     if request.operation is Operation.SCROLL:
@@ -482,7 +482,7 @@ def execute(
                 f"wheel dispatch failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE
             ) from exc
         finally:
-            win32.set_cursor_position(*previous)
+            _restore_cursor(previous, (x, y))
         return _receipt(
             request,
             DispatchMechanism.SEND_INPUT_MOUSE,
@@ -498,13 +498,13 @@ def execute(
         if option is None:
             raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "SELECT requires a visible observed option"})
         select_notes: tuple[str, ...]
+        option_state = option[1]
+        ox, oy = option_state.rect.center()
         guard()
         previous = win32.cursor_position()
         try:
-            option_state = option[1]
             if not option_state.enabled or option_state.offscreen:
                 raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "option is not selectable"})
-            ox, oy = option_state.rect.center()
             inserted = win32.click_at(ox, oy)
             select_notes = ("observed option selected", f"point={ox},{oy}")
         except DriverError as exc:
@@ -512,7 +512,7 @@ def execute(
                 f"selection dispatch failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE
             ) from exc
         finally:
-            win32.set_cursor_position(*previous)
+            _restore_cursor(previous, (ox, oy))
         _verify_selection(worker, handle, request.option_label)
         return _receipt(request, DispatchMechanism.SEND_INPUT_MOUSE, inserted, started, notes=select_notes)
 
@@ -562,7 +562,7 @@ def execute(
                 f"keyboard dispatch failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD
             ) from exc
         finally:
-            win32.set_cursor_position(*previous)
+            _restore_cursor(previous, (x, y))
         type_notes = [f"chars={len(request.text)}"]
         # Multi-line Win32 edits read back CRLF for every typed "\n".
         expected = _newlines(request.text)
@@ -589,6 +589,18 @@ def execute(
         return _receipt(request, DispatchMechanism.SEND_INPUT_KEYBOARD, inserted, started, notes=tuple(type_notes))
 
     raise Pause(Reason.UNSUPPORTED_CONTROL, {"operation": request.operation.value})
+
+
+def _restore_cursor(previous: tuple[int, int], placed: tuple[int, int]) -> None:
+    """Put the pointer back only if it is still where the injected input left it.
+
+    A person who moved the mouse meanwhile keeps the pointer where they put it.
+    """
+    try:
+        if win32.cursor_position() == placed:
+            win32.set_cursor_position(*previous)
+    except DriverError:  # no readable cursor (another desktop has the input): leave it
+        pass
 
 
 def _newlines(text: str) -> str:

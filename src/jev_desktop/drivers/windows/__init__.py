@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ...contracts import ContractError, DriverError, EmergencyStop, Pause, Reason, UncertainEffect
+from .presence import DesktopPresence
 from .worker import serve
 
 _VENV_LAUNCHER = "__PYVENV_LAUNCHER__"
@@ -61,6 +62,8 @@ class WindowsDriver:
         context = multiprocessing.get_context("spawn")
         self._pending_inputs = context.RawArray("B", 8192)
         self._pending_count = context.RawValue("i", 0)
+        # Broker-side: the edge glow and physical-input watch live here, not in the worker.
+        self.presence = DesktopPresence()
 
     def start(self) -> None:
         with self._lock, self._lifecycle:
@@ -78,9 +81,11 @@ class WindowsDriver:
             self._connection = parent
             child.close()
         self._call("start")
+        self.presence.start()
 
     def close(self) -> None:
         self.abort()
+        self.presence.close()
         if self._connection is not None:
             self._connection.close()
 

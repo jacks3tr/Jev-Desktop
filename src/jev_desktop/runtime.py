@@ -93,6 +93,10 @@ class RuntimeConfig:
     fingerprint_secret: bytes = field(default_factory=lambda: os.urandom(32))
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = now
+    # After physical input, wait this long without any before observing again and continuing.
+    human_grace_seconds: float = 3.0
+    # Waiting for the user extends the run deadline by at most this much in total.
+    max_hold_seconds: float = 300.0
 
     def resolve_secret(self, name: str) -> str | None:
         if self.secret_provider is not None:
@@ -149,6 +153,9 @@ class _RunState:
     pending_assertion: str | None = None
     uncertain: bool = False
     slice_deadline: float = float("inf")
+    # In memory only: the per-call limit, and the physical-input count at the last observation.
+    slice_limit: float = float("inf")
+    observed_epoch: int = 0
 
     # -- persistence ---------------------------------------------------------------
 
@@ -244,6 +251,11 @@ class Runtime:
         if hasattr(driver, "quiesce"):
             self.ownership._quiesce = driver.quiesce
             self.ownership._on_acquire = driver.retain_lease
+        # Physical input while Jev holds the desktop: Esc stops the run, anything else makes it wait.
+        self.presence = getattr(driver, "presence", None)
+        if self.presence is not None:
+            self.ownership._on_active = self.presence.set_active
+            self.presence.on_escape = self._on_escape
         self._state: dict[str, _RunState] = {}
 
     # ------------------------------------------------------------------------------
@@ -307,10 +319,8 @@ class Runtime:
         if not math.isfinite(requested) or requested <= 0:
             raise ContractError("slice_seconds must be finite and positive")
         requested = min(requested, state.spec.limits.slice_seconds)
-        deadline = self.config.clock() + requested
-        run_deadline = state.started_at + state.spec.limits.deadline_seconds
-        deadline = min(deadline, run_deadline)
-        state.slice_deadline = deadline
+        state.slice_limit = self.config.clock() + requested
+        deadline = state.slice_deadline = min(state.slice_limit, self._run_deadline(state))
         if hasattr(self.driver, "set_boundary"):
             self.driver.set_boundary(
                 lambda: self.ownership.checkpoint(
@@ -323,11 +333,7 @@ class Runtime:
         )
         try:
             self._reconcile_unfinished(state)
-            result = (
-                self._task_loop(state, lease, deadline)
-                if state.spec.purpose is Purpose.TASK
-                else self._loop(state, lease, deadline)
-            )
+            result = self._task_loop(state, lease) if state.spec.purpose is Purpose.TASK else self._loop(state, lease)
         except Pause as pause:
             result = self._pause(state, pause.reason_value, pause.detail)
         except EmergencyStop as stop:
@@ -400,9 +406,8 @@ class Runtime:
         request: ActionRequest,
     ) -> dict[str, Any]:
         state = self._load(run_id)
-        state.slice_deadline = min(
-            self.config.clock() + state.spec.limits.slice_seconds, state.started_at + state.spec.limits.deadline_seconds
-        )
+        state.slice_limit = self.config.clock() + state.spec.limits.slice_seconds
+        state.slice_deadline = min(state.slice_limit, self._run_deadline(state))
         lease = self.ownership.active_lease()
         if lease is None:
             raise ContractError("this run does not hold the desktop lease")
@@ -461,7 +466,7 @@ class Runtime:
             raise ContractError("action must match the current required step")
         if state.actions >= state.spec.limits.max_actions:
             raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "max_actions"})
-        if self.config.clock() >= state.started_at + state.spec.limits.deadline_seconds:
+        if self.config.clock() >= self._run_deadline(state):
             raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "run_deadline"})
         if request.operation in {Operation.TYPE_TEXT, Operation.SELECT}:
             value = self._fixture_value(state, step.fixture_reference) if step.fixture_reference else None
@@ -490,10 +495,13 @@ class Runtime:
             self._evaluate_due(state, snapshot, checkpoint="run_start")
         guarded = replace(request, run_id=run_id, lease_generation=lease.generation)
         guarded = replace(guarded, request_hash=self._request_hash(state, guarded))
+        epoch = self._human_epoch()
 
         def guard() -> None:
             if self.config.clock() >= state.slice_deadline:
                 raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
+            if self._human_epoch() != epoch:
+                raise Pause(Reason.USER_TAKEOVER, {"reason": "physical input during the action; inspect again"})
             self.ownership.checkpoint(
                 run_id=run_id, lease_id=lease.lease_id, generation=lease.generation, session_id=session_id
             )
@@ -528,7 +536,7 @@ class Runtime:
     # Main loop
     # ------------------------------------------------------------------------------
 
-    def _task_loop(self, state: _RunState, lease: Lease, deadline: float) -> RunResult:
+    def _task_loop(self, state: _RunState, lease: Lease) -> RunResult:
         """Keep routine decisions inside the broker until completion or escalation."""
         if self.policy is None:
             raise PolicyError("desktop tasks require a TypeSafe API key")
@@ -546,8 +554,13 @@ class Runtime:
                 generation=lease.generation,
                 session_id=lease.session_id,
             )
+            if self._hold_for_user(state, lease):
+                # The screen may have changed under the user; a refocus is among the next choices.
+                value_target = None
+                snapshot = self._observe(state)
+                continue
             state.summary["task_observation"] = self._observation_summary(snapshot)
-            if self.config.clock() >= deadline:
+            if self.config.clock() >= state.slice_deadline:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, self._deadline_budget(state))
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
@@ -707,7 +720,7 @@ class Runtime:
                     allow_escalate=True,
                     current_step=None,
                     **(
-                        {"deadline": time.monotonic() + max(0.0, deadline - self.config.clock())}
+                        {"deadline": time.monotonic() + max(0.0, state.slice_deadline - self.config.clock())}
                         if isinstance(self.policy, JevPolicy)
                         else {}
                     ),
@@ -721,7 +734,7 @@ class Runtime:
                     raise
                 # A transition can hide the result. Recheck once without offering more input.
                 completion_probe = completion_probe_used = True
-                self.config.sleeper(min(1.0, max(0.0, deadline - self.config.clock())))
+                self.config.sleeper(min(1.0, max(0.0, state.slice_deadline - self.config.clock())))
                 value_target = None
                 snapshot = self._observe(state, completion=True)
                 continue
@@ -781,7 +794,7 @@ class Runtime:
             if decision.operation is Operation.WAIT:
                 value_target = None
                 inputs_without_value.clear()
-                self.config.sleeper(min(0.2, max(0.0, deadline - self.config.clock())))
+                self.config.sleeper(min(0.2, max(0.0, state.slice_deadline - self.config.clock())))
                 snapshot = self._observe(state)
                 continue
             if decision.target is None:
@@ -833,7 +846,7 @@ class Runtime:
         self.policy.last_attempts = []
         self._persist(state)
 
-    def _loop(self, state: _RunState, lease: Lease, deadline: float) -> RunResult:
+    def _loop(self, state: _RunState, lease: Lease) -> RunResult:
         spec = state.spec
         if self.ownership.emergency_active():
             return self._stopped(state, Reason.PERMISSION_BOUNDARY.value, "local emergency stop is set")
@@ -841,8 +854,9 @@ class Runtime:
         while True:
             if self.ownership.flags(state.run_id).cancelled:
                 return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
-            if self.config.clock() >= deadline:
+            if self.config.clock() >= state.slice_deadline:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, self._deadline_budget(state))
+            self._hold_for_user(state, lease)  # this loop observes afresh below either way
 
             step = self._current_step(state)
             if (
@@ -916,7 +930,7 @@ class Runtime:
 
             if decision.operation is Operation.WAIT:
                 self.journal.append_trace(state.run_id, "decision", decision.to_json())
-                self.config.sleeper(min(1.5, max(0.2, deadline - self.config.clock())))
+                self.config.sleeper(min(1.5, max(0.2, state.slice_deadline - self.config.clock())))
                 continue
             if decision.operation is Operation.ESCALATE:
                 return self._pause(
@@ -994,7 +1008,10 @@ class Runtime:
                 scope = self._scope(state)
                 if completion:
                     scope = replace(scope, max_depth=max(scope.max_depth, 24))
-                return self.driver.observe(scope)
+                epoch = self._human_epoch()
+                snapshot = self.driver.observe(scope)
+                state.observed_epoch = epoch
+                return snapshot
             except (DriverError, ContractError) as exc:
                 attempts += 1
                 if attempts > state.spec.limits.stale_retries:
@@ -1272,6 +1289,9 @@ class Runtime:
         def guard() -> None:
             if self.config.clock() >= state.slice_deadline:
                 raise Pause(Reason.BUDGET_EXHAUSTED, self._deadline_budget(state))
+            if self._human_epoch() != state.observed_epoch:
+                # The decision rests on a screen the user has since touched.
+                raise Pause(Reason.USER_TAKEOVER, {"reason": "physical input since observation", "human_input": True})
             self.ownership.checkpoint(
                 run_id=state.run_id,
                 lease_id=lease.lease_id,
@@ -1298,6 +1318,10 @@ class Runtime:
                 send=lambda: self.driver.execute(request, guard, snapshot),
             )
         except Pause as pause:
+            if pause.detail.get("human_input"):
+                # Nothing was sent; the loop waits for the user, observes again, and continues.
+                self.journal.append_trace(state.run_id, "human_input_before_dispatch", {"action_id": action_id})
+                return snapshot
             if pause.reason_value in {Reason.STALE_OBSERVATION.value, Reason.LOW_CONFIDENCE.value}:
                 state.stale_retries += 1
                 if state.stale_retries > spec.limits.stale_retries:
@@ -1704,8 +1728,9 @@ class Runtime:
     def _pause(
         self, state: _RunState, reason: str, detail: Mapping[str, Any], snapshot: Snapshot | None = None
     ) -> RunResult:
-        if self.ownership.flags(state.run_id).cancelled:
-            return self._stopped(state, Reason.USER_TAKEOVER.value, "run cancelled")
+        flags = self.ownership.flags(state.run_id)
+        if flags.cancelled:
+            return self._stopped(state, Reason.USER_TAKEOVER.value, flags.cancel_reason or "run cancelled")
         state.status = RunStatus.PAUSED.value
         state.pause_reason = reason
         state.pause_detail = dict(detail)
@@ -1921,8 +1946,54 @@ class Runtime:
 
     def _deadline_budget(self, state: _RunState) -> dict[str, str]:
         """Name the deadline that expired; only a slice deadline is worth resuming."""
-        run_deadline = state.started_at + state.spec.limits.deadline_seconds
-        return {"budget": "run_deadline" if self.config.clock() >= run_deadline else "slice_deadline"}
+        return {"budget": "run_deadline" if self.config.clock() >= self._run_deadline(state) else "slice_deadline"}
+
+    def _run_deadline(self, state: _RunState) -> float:
+        """The frozen run deadline, extended by the time spent waiting for the user."""
+        return state.started_at + state.spec.limits.deadline_seconds + float(state.summary.get("hold_seconds", 0.0))
+
+    def _human_epoch(self) -> int:
+        return int(self.presence.human_epoch) if self.presence is not None else 0
+
+    def _hold_for_user(self, state: _RunState, lease: Lease) -> bool:
+        """Wait while the user is using the desktop; True means observe again before acting.
+
+        Waiting extends the run deadline (up to max_hold_seconds in total) but never the
+        per-call limit, which must stay under the client's tool timeout.
+        """
+        if self.presence is None:
+            return False
+        grace = self.config.human_grace_seconds
+        if self._human_epoch() == state.observed_epoch and self.presence.idle_seconds() >= grace:
+            return False
+        self.journal.append_trace(state.run_id, "holding_for_user", {"grace_s": grace})
+        started = self.config.clock()
+        held = float(state.summary.get("hold_seconds", 0.0))
+        try:
+            while (idle := self.presence.idle_seconds()) < grace:
+                now = self.config.clock()
+                if now >= state.slice_limit or held + (now - started) >= self.config.max_hold_seconds:
+                    raise Pause(Reason.USER_TAKEOVER, {"reason": "the desktop is in use", "resumable": True})
+                self.ownership.checkpoint(
+                    run_id=state.run_id,
+                    lease_id=lease.lease_id,
+                    generation=lease.generation,
+                    session_id=lease.session_id,
+                )
+                self.config.sleeper(min(0.25, grace - idle))
+        finally:
+            state.summary["hold_seconds"] = min(self.config.max_hold_seconds, held + self.config.clock() - started)
+            state.slice_deadline = min(state.slice_limit, self._run_deadline(state))
+            self._persist(state)
+        return True
+
+    def _on_escape(self) -> None:
+        """Physical Esc stops the run that holds the desktop. Called off the input hook thread."""
+        lease = self.ownership.active_lease()
+        if lease is None:
+            return
+        self.ownership.request_cancel(lease.run_id, "Esc pressed")
+        self.journal.append_trace(lease.run_id, "escape", {})
 
     def _load(self, run_id: str) -> _RunState:
         state = self._state.get(run_id)
