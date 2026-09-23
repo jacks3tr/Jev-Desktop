@@ -42,6 +42,9 @@ python -m pytest tests/unit/test_broker.py::test_name -q   # single test
 - CI (`.github/workflows/ci.yml`) runs on `windows-latest` for Python 3.12/3.13: ruff
   format/check + mypy (3.12 only) + `pytest tests/unit -q`, plus a separate Linux packaging job
   (`python -m build` + `twine check`).
+- Releases: follow `.claude/skills/release-jev-desktop/SKILL.md` (version bump in four places,
+  PR, tag, publish, update the local Claude Code plugin), and add what you had to look up to
+  its Tips.
 - `.artifacts/` is ignored scratch/local-record storage (verification transcripts, decision
   logs, private application content) — never commit anything from it.
 
