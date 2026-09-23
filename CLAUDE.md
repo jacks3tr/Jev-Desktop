@@ -130,6 +130,10 @@ full field-level contract:
 - `src/jev_desktop/` is the only importable package (`packages = ["src/jev_desktop"]` in
   `pyproject.toml`); `tests/`, `scripts/`, `skills/`, `docs/`, `examples/` ship in the sdist too
   (see `[tool.hatch.build.targets.sdist]`).
+- Keep `skills/desktop-use/SKILL.md` current in the same change as any behavior agents rely on:
+  tool arguments, returned fields or reasons, pause and recovery behavior, limits, focus and
+  capture rules. It is the only guide agents using Jev read; describe what they must do
+  differently, briefly, in its existing sections, and drop guidance the change made wrong.
 - `skills/desktop-use/SKILL.md` is the agent-facing operating skill bundled into the
   `.codex-plugin/` and `.claude-plugin/` plugin manifests alongside `.mcp.json` — this repo is
   itself distributed as a Codex/Claude Code plugin (see README's "Install the plugin" section).

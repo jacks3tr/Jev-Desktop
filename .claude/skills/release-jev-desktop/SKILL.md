@@ -34,6 +34,9 @@ These must match; `tests/unit/test_repo_hygiene.py` fails otherwise:
 Claude Code caches plugins by version: without a bump, `claude plugin update` keeps the old
 skills and manifest.
 
+Check that `skills/desktop-use/SKILL.md` covers every behavior change in the release that
+agents using Jev must know about, and update it in the release PR if not.
+
 ## 3. Verify
 
 ```powershell
