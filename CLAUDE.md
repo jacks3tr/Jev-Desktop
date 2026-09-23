@@ -35,8 +35,10 @@ python -m pytest tests/unit/test_broker.py::test_name -q   # single test
   pipe, drives it through real CLI subprocesses, and asserts a doctor handshake. No key needed,
   injects no input. See `.cursor/skills/verify-jev-desktop/SKILL.md` and its `features/*.md`
   for targeted coverage (discovery, direct input, tasks, recovery) when verifying a change by hand.
-- `python scripts/evaluate_thresholds.py .artifacts/decisions.json` — offline replay for tuning
-  `PolicyConfig` confidence floors against a private labeled dataset.
+- `JEV_DESKTOP_RECORD=<dir>` makes the broker record Jev request/response bodies;
+  `python scripts/export_decisions.py <labeled.json> <recordings...>` turns them into rows to
+  label, and `python scripts/evaluate_thresholds.py <labeled.json>` sweeps `PolicyConfig`'s
+  operation floor, target floor, and target margin offline (no requests, no input).
 - CI (`.github/workflows/ci.yml`) runs on `windows-latest` for Python 3.12/3.13: ruff
   format/check + mypy (3.12 only) + `pytest tests/unit -q`, plus a separate Linux packaging job
   (`python -m build` + `twine check`).
