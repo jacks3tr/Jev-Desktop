@@ -568,6 +568,9 @@ class Runtime:
         doubt: Pause | None = None
         value_target: TargetCandidate | None = None
         inputs_without_value: set[str] = set()
+        # Operations whose target answer was NONE, withdrawn until the snapshot changes.
+        operations_without_target: set[Operation] = set()
+        operations_checked_on = snapshot.snapshot_id
         auto_focused = False
         while True:
             self.ownership.checkpoint(
@@ -714,6 +717,10 @@ class Runtime:
                     if choices
                     else []
                 )
+            if operations_checked_on != snapshot.snapshot_id:
+                operations_without_target.clear()
+                operations_checked_on = snapshot.snapshot_id
+            contexts = [context for context in contexts if context.operation not in operations_without_target]
             # At the action limit, a final decision may report completion but cannot dispatch.
             if completion_probe or state.actions >= state.spec.limits.max_actions:
                 contexts = []
@@ -776,6 +783,11 @@ class Runtime:
                 if pause.reason is Reason.NO_APPROPRIATE_TARGET and value_target is not None:
                     inputs_without_value.add(value_target.element_id)
                     value_target = None
+                    continue
+                offered = {context.operation.value: context.operation for context in contexts}
+                if pause.reason is Reason.NO_APPROPRIATE_TARGET and pause.detail.get("operation") in offered:
+                    # The operation choice cannot see every target; another operation may reach it.
+                    operations_without_target.add(offered[pause.detail["operation"]])
                     continue
                 if pause.reason is not Reason.LOW_CONFIDENCE or not state.actions:
                     raise
