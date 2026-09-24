@@ -12,6 +12,7 @@ from jev_desktop.contracts import (
     Capture,
     ContractError,
     Coverage,
+    DispatchMechanism,
     DriverError,
     EvidenceRef,
     Geometry,
@@ -552,3 +553,52 @@ def test_combobox_types_while_focus_reports_its_active_option(monkeypatch, deskt
             native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
         assert typed == []
     assert desktop == [(950, 220)]
+
+
+@pytest.mark.parametrize("option_bounds", ["select", "popup"])
+def test_native_select_chooses_an_unreachable_option_through_its_pattern(monkeypatch, desktop, option_bounds):
+    # Chromium's native <select>: options report the select's own bounds, or sit in a separate
+    # popup window, so a pointer route to them can never be proven.
+    combo = _Uia("Shell commands policy", _Uia("Document"), rect=Rect(1400, 330, 1560, 364))
+    popup = Rect(1400, 364, 1560, 440)
+    option = _Uia(
+        "Always allow",
+        _Uia("menulist popup", combo),
+        rect=combo.rect if option_bounds == "select" else Rect(1400, 400, 1560, 420),
+        props={uia.AVAILABILITY["selectionitem"]: True, 30080: combo},
+    )
+    selected = []
+
+    def select():
+        selected.append(option.name)
+        combo.props[uia.PROP_VALUE] = option.name
+
+    option.GetCurrentPattern = lambda _id: NS(QueryInterface=lambda _interface: NS(Select=select))
+    popup_page = _Uia("popup page", _Uia("popup window"))
+    worker = _uia_worker(lambda x, y: popup_page if popup.contains(x, y) else combo)
+    handles = {
+        "el:combo": _element_handle(combo, "el:combo", "combobox", ("CLICK", "SELECT")),
+        "el:option": _element_handle(option, "el:option", "listitem", ("CLICK", "SELECT")),
+    }
+    monkeypatch.setattr(uia, "resolve_element", lambda _registry, element_id, *_: handles[element_id])
+    driver = NS(worker=worker, registry=NS(elements=handles))
+    snapshot = NS(
+        app_ref="app",
+        elements=[
+            NS(element_id="el:combo", name=combo.name, role="combobox"),
+            NS(element_id="el:option", name=option.name, role="listitem"),
+        ],
+    )
+
+    receipt = native_input.execute(
+        driver, _element_request(Operation.SELECT, "el:combo", option_label="Always allow"), lambda: None, snapshot
+    )
+    assert receipt.mechanism is DispatchMechanism.UIA_PATTERN
+    assert receipt.notes == ("pattern=selection_item", "option pointer route unproven")
+    assert selected == ["Always allow"]
+
+    # Clicking the option itself is still refused: its pointer route is unproven.
+    with pytest.raises(Pause) as paused:
+        native_input.execute(driver, _element_request(Operation.CLICK, "el:option"), lambda: None, snapshot)
+    assert paused.value.reason is Reason.STALE_OBSERVATION
+    assert desktop == []
