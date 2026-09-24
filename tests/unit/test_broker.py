@@ -313,6 +313,22 @@ def test_refused_action_leaves_the_inspection_usable(broker_env):
     assert used.value.message == "the inspection is unknown or already used; inspect the application again"
 
 
+def test_uncertain_direct_action_reports_uncertain_effect_and_consumes_the_inspection(broker_env):
+    client = broker_env["make"]()
+    driver = broker_env["driver"]
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+
+    driver.fail_next = "uncertain"
+    with pytest.raises(BrokerError) as uncertain:
+        _act(client, observed, "CLICK", "Save")
+    assert uncertain.value.code == "uncertain_effect"
+    assert uncertain.value.message == "injected partial dispatch"
+    with pytest.raises(BrokerError) as used:
+        _act(client, observed, "FOCUS_WINDOW")
+    assert used.value.code == "invalid_request"
+    assert len(driver.executed) == 1
+
+
 def test_physical_input_during_a_refused_action_consumes_the_inspection(broker_env, monkeypatch):
     client = broker_env["make"]()
     broker, driver = broker_env["broker"], broker_env["driver"]
