@@ -30,6 +30,8 @@ Defaults are 20 actions, 40 decisions, and 60 seconds; `timeout_seconds` may not
 Set `max_model_decisions` for longer tasks. `max_elements` and `max_depth` control observation
 coverage and default to 180 and 12. The loop batches operation and target questions together.
 With multiple supplied values, a second question selects the value for the chosen input control.
+Each control lists the offered operations it supports. When Jev finds no target for its chosen
+operation, the loop withdraws that operation and decides again on the same observation.
 Jev receives structured accessibility data and action history, not screenshots. Native dispatch
 rechecks the target and records input before the next observation. Supplied text and chords
 are closed choices. Jev cannot invent values or launch applications. Low confidence, missing
@@ -43,9 +45,12 @@ and waits. No dollar estimate is inferred. Completion is model-reported and must
 against the returned observation. A fresh observation is taken before accepting DONE, and a
 separate question asks whether the goal's end state is visible in it without the action history;
 anything short of a confident yes pauses with `needs_visual_assistance`.
-After a low-confidence decision following input, the broker waits briefly and checks completion
-once more with a deeper observation of the same windows. This check cannot send input.
-If the result remains unclear, inspect the final window or request a screenshot.
+After a low-confidence decision following input, the broker waits briefly, observes again, and
+decides once more. Actions stay available unless the doubted answer was DONE or WAIT; then the
+recheck asks only about completion, cannot send input, and a `needs_visual_assistance` pause
+carries the doubted answer under `low_confidence`. A second low-confidence answer before the
+next action pauses with the first one's detail. If the result remains unclear, inspect the final
+window or request a screenshot.
 
 Paused tasks resume with `run_id` and `resume_token` within their original total budgets.
 A broker restart requires a new task and fresh references. Use direct actions for recovery;
@@ -57,14 +62,20 @@ lease, native guards, cancellation, and no-replay journal without requiring a te
 Call `desktop_inspect` to discover an application, then inspect its `app_ref` and explicit
 `window_refs`. Without `app_ref`, `query` filters applications by executable path or window
 title. With `app_ref`, `query` returns up to `max_elements` elements whose name, value, text, or
-path contains it, searched across the full observation cap. Returned observations omit rows
+path contains it. The search walks up to 10,000 nodes or 8 seconds and keeps up to 500 matches;
+the truncation notes `traversal node budget reached` and `query search time limit reached` mean
+it was incomplete, so an empty result does not prove absence. A query result holds only the
+matches, so inspect without `query` to act on controls around them. Returned observations omit rows
 with no name, value, text, operation, or focus, and context texts already shown by an element;
 Jev still receives them. Call `desktop_act` with the returned `snapshot_id`, `access_token`, `window_ref`,
 operation, and control reference or screenshot point. Alternatively, use `target_description`
 for Jev to choose a compatible control. That option requires a TypeSafe key. Supply `text`, `option_label`, `hotkey`,
 or `scroll` as appropriate. No run, specification, assertions, or build hash is required.
 
-Each inspection authorizes at most one dispatch attempt. Inspect again after an action.
+Each inspection authorizes at most one dispatch attempt. Inspect again after an action. An
+action refused before any input was sent (for example `stale_observation` or a refused
+`FOCUS_WINDOW`) leaves the inspection usable, unless physical input arrived meanwhile. A used
+inspection returns `invalid_request`: "the inspection is unknown or already used".
 Input uses the native scope, freshness, desktop ownership, cancellation, and journal checks.
 A receipt acknowledges input; inspect the application to establish the result. Do not replay
 uncertain input. Screenshots are optional.
@@ -112,7 +123,7 @@ cannot change the test's acceptance criteria.
 | --- | --- |
 | `goal` | One sentence the policy reads. Say what the test proves, not how to click. |
 | `purpose` | `regression` binds required steps and their mechanisms. `exploratory` allows alternative routes and records them. |
-| `interaction_mode` | `user_path` drives mouse and keyboard. `semantic` uses control patterns. The runtime preserves the selected mode. |
+| `interaction_mode` | `user_path` drives mouse and keyboard, except that `SELECT` chooses an option the pointer cannot be proven to reach, such as a Chromium native select's, through its selection pattern. `semantic` uses control patterns. The runtime preserves the selected mode. |
 | `app_ref` | Opaque application reference from `desktop_inspect`. |
 | `expected_identity` | How the running build is bound to the artifact under test. See below. |
 | `launch_config_id` | Name of an approved launch configuration. Only used by a `LAUNCH_APP` step. |
@@ -239,14 +250,14 @@ verdict:   passed | failed | inconclusive
 | --- | --- |
 | `needs_text` | A declared fixture has no value. Resume with it. |
 | `needs_visual_assistance` | Structured observation cannot resolve the step. Use the attached screenshot, then resume or act on that snapshot. |
-| `low_confidence` | The policy answer was below the local floor. Narrow the observation or re-observe. |
+| `low_confidence` | The policy answer was below the local floor or margin. Detail names the doubted `operation`, `selected`, `confidence`, `margin`, and `floor` or `required`. Narrow the observation or re-observe. |
 | `invalid_model_response` | The answer failed validation. Do not retry blindly; look at the request. |
 | `unexpected_model_version` | The pinned model id changed. Recalibrate before running again. |
 | `stale_observation` | The observation no longer matches live state. Re-observe. |
 | `unsupported_control` | The driver cannot perform the required operation on this control. |
 | `permission_boundary` | A modal dialog, a disabled window, or a privilege boundary stopped input. |
-| `user_takeover` | A person or another process owns the desktop. Stop and ask. |
-| `uncertain_effect` | Input may have landed without a receipt. Remains paused; never assume and never replay. |
+| `user_takeover` | A person or another process owns the desktop, or Windows kept another application (`foreground_process`) in the foreground. Stop and ask; the run stays resumable. |
+| `uncertain_effect` | Input may have landed without a receipt. A direct action returns it as its error code. Remains paused; never assume and never replay. |
 | `incorrect_build` | The running build is not the expected one. Fix the build first. |
 | `budget_exhausted` | Check `budget`. A new slice can extend `slice_deadline`, but cannot reset the frozen run's total budgets, such as `run_deadline`. |
 | `step_unresolved` | No progress after bounded retries, or the model asked to finish with required steps left. |

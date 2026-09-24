@@ -13,9 +13,11 @@ chooses controls, and acts inside the broker without a turn from you per click. 
 ## 1. Find the application and window
 
 Call `desktop_inspect` to discover the intended application and window, and keep the returned
-`app_ref` and `window_ref`. With an `app_ref`, `query` narrows the result to elements whose
-name, value, text, or path contains it. Returned observations omit unnamed rows that offer no
-action.
+`app_ref` and `window_ref`. With an `app_ref`, `query` searches the whole window, beyond
+`max_elements`, for elements whose name, value, text, or path contains it, and returns only
+those. A `traversal node budget reached` or `query search time limit reached` note means the
+search stopped early, so an empty result does not prove the control is absent. Returned
+observations omit unnamed rows that offer no action.
 
 Jev receives structured accessibility data: control labels, values, focus, selection, and
 recent actions. It never sees screenshots. Read `coverage` and `truncation` before assuming a
@@ -40,8 +42,10 @@ Call `desktop_run` once with a `task` holding the goal, `app_ref`, and explicit 
 }
 ```
 
-**Goal.** Describe the desired result and how to recognize completion. Resolve missing
-information before starting; Jev selects supplied values and never generates text.
+**Goal.** Describe the desired result and how to recognize completion. Jev judges completion
+from the final window's accessibility text alone, so name an end state that text shows, such as
+"stop when the message appears in the conversation transcript", not "as a sent message". Resolve
+missing information before starting; Jev selects supplied values and never generates text.
 
 **Inputs.** Put exact strings in `texts`, named for their destination, such as
 `email_for_contact_field`, and state which value belongs in which field. Put passwords and
@@ -72,7 +76,9 @@ Do not translate a routine goal into individual `desktop_act` calls or a test sp
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
 `completion: model_reported` means Jev chose DONE and a separate check of the final
 observation, made without the action history, confirmed the goal is visible. When that check
-is unsure, the task pauses with `needs_visual_assistance` instead. Neither is an independent
+is unsure, the task pauses with `needs_visual_assistance` instead; a `low_confidence` entry in
+its detail means Jev itself doubted finishing. A `low_confidence` pause comes only after Jev
+observed again and was still unsure; its detail names the doubted `operation` and the numbers. Neither is an independent
 verification: check the returned observation before reporting success, and never turn an
 uncertain or budget-limited result into a success claim.
 
@@ -80,14 +86,16 @@ uncertain or budget-limited result into a success claim.
 
 Inspect with explicit `window_refs`, then pass the returned `snapshot_id`, top-level
 `access_token`, and `window_ref`. Choose an observed `element_id`, or let Jev select one from a
-`target_description`. Each inspection authorizes one action: inspect again after it.
+`target_description`. Each inspection authorizes one action: inspect again after it. An action
+refused before any input was sent, such as `stale_observation`, leaves the inspection usable,
+so you can `FOCUS_WINDOW` and retry with the same `snapshot_id`.
 
 | Operation | Inputs |
 | --- | --- |
 | `FOCUS_WINDOW` | `window_ref` |
 | `CLICK` or `TOGGLE` | `window_ref`, `element_id` |
 | `TYPE_TEXT` | `window_ref`, `element_id`, `text`; `replace_existing` defaults to true |
-| `SELECT` | `window_ref`, `element_id`, `option_label` |
+| `SELECT` | `window_ref`, `element_id` of the dropdown, `option_label`; use it rather than clicking options of a browser's native select |
 | `HOTKEY` | `window_ref`, `hotkey`, for example `["ctrl", "l"]` |
 | `SCROLL` | `window_ref`, `element_id`, `scroll`; positive `notches` scroll up, negative down, for example `{"notches": -3}` |
 
@@ -111,7 +119,10 @@ or resolve the blocked state, then hand back the remaining goal.
   rebuilt or covered for a moment.
 - **Covered, disabled, or modal window:** resolve that condition within the user's task. Do not
   bypass privilege boundaries.
-- **Uncertain effect:** never repeat the action. An acknowledged input is not proof that the
+- **Another application kept the foreground:** `user_takeover` with `foreground_process` means
+  Windows refused to bring the window forward and no input was sent. Ask the user to switch to
+  the application, then resume or act again.
+- **Uncertain effect:** a direct action returns `uncertain_effect`. Never repeat the action. An acknowledged input is not proof that the
   application did what you intended; inspect its result.
 - **Low confidence:** check competing candidates before touching thresholds. Duplicate
   controls, missing values, or ambiguous field relationships need corrected state or
