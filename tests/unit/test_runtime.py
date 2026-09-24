@@ -658,6 +658,48 @@ def test_task_completion_doubt_probe_keeps_the_low_confidence_detail(tmp_path):
     journal.close()
 
 
+SIDEBAR_ELEMENTS = [
+    FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
+    FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),
+    FakeElement("listitem", "Plugins", operations=("CLICK", "SELECT")),
+    FakeElement("button", "Archived", enabled=False, operations=("CLICK",)),
+    FakeElement("document", "Unbound", operations=("SCROLL",)),
+    FakeElement("text", "Agents", operations=()),
+]
+
+
+def test_task_operation_choice_sees_which_offered_operations_each_control_supports(tmp_path):
+    _runtime, _driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+        elements=SIDEBAR_ELEMENTS,
+        fixtures={},
+    )
+    assert result.execution is Execution.COMPLETED
+
+    names = [item.name for item in SIDEBAR_ELEMENTS]
+
+    def operations(request):
+        return {
+            name: element.get("operations")
+            for element in request["state"]["elements"]
+            for name in names
+            if f'name="{name}"' in element["description"]
+        }
+
+    assert operations(transport.sent[0]) == {
+        "PSTACK Development Team 7": ["CLICK"],
+        "Dispatch": ["CLICK", "TOGGLE"],
+        "Plugins": ["CLICK"],
+        "Archived": None,
+        "Unbound": ["SCROLL"],
+        "Agents": None,
+    }
+    assert set(operations(transport.sent[1]).values()) == {None}, "the completion question offers no operations"
+    journal.close()
+
+
 def test_task_selects_field_then_value_without_cartesian_candidates(tmp_path):
     runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,
