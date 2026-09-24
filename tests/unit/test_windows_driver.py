@@ -602,3 +602,61 @@ def test_native_select_chooses_an_unreachable_option_through_its_pattern(monkeyp
         native_input.execute(driver, _element_request(Operation.CLICK, "el:option"), lambda: None, snapshot)
     assert paused.value.reason is Reason.STALE_OBSERVATION
     assert desktop == []
+
+
+class _LaggingValue(dict):
+    """A control whose reported value catches up with a selection only after a few reads."""
+
+    def __init__(self, old, new, stale_reads):
+        super().__init__()
+        self.old, self.new, self.stale_reads = old, new, stale_reads
+
+    def get(self, prop, default=None):
+        if prop != uia.PROP_VALUE:
+            return default
+        if self.stale_reads:
+            self.stale_reads -= 1
+            return self.old
+        return self.new
+
+
+@pytest.mark.parametrize(("stale_reads", "confirmed"), [(3, True), (10_000, False)], ids=["lagging", "unchanged"])
+def test_select_waits_for_the_control_to_report_the_chosen_option(monkeypatch, desktop, stale_reads, confirmed):
+    # Unbound's native select committed "Ask every time" but still reported the old value on the
+    # first read after the selection.
+    combo = _Uia("Shell commands policy", _Uia("Document"), rect=Rect(1400, 330, 1560, 364))
+    combo.props = {uia.PROP_VALUE: "Always allow"}
+    option = _Uia(
+        "Ask every time",
+        _Uia("menulist popup", combo),
+        rect=combo.rect,
+        props={uia.AVAILABILITY["selectionitem"]: True, 30080: combo},
+    )
+
+    def select():
+        combo.props = _LaggingValue("Always allow", option.name, stale_reads)
+
+    option.GetCurrentPattern = lambda _id: NS(QueryInterface=lambda _interface: NS(Select=select))
+    handles = {
+        "el:combo": _element_handle(combo, "el:combo", "combobox", ("CLICK", "SELECT")),
+        "el:option": _element_handle(option, "el:option", "listitem", ("CLICK", "SELECT")),
+    }
+    monkeypatch.setattr(uia, "resolve_element", lambda _registry, element_id, *_: handles[element_id])
+    clock = iter(range(1_000_000))
+    monkeypatch.setattr(native_input.time, "monotonic", lambda: next(clock) * 0.01)
+    driver = NS(worker=_uia_worker(lambda _x, _y: combo), registry=NS(elements=handles))
+    snapshot = NS(
+        app_ref="app",
+        elements=[
+            NS(element_id="el:combo", name=combo.name, role="combobox"),
+            NS(element_id="el:option", name=option.name, role="listitem"),
+        ],
+    )
+    request = _element_request(Operation.SELECT, "el:combo", option_label="Ask every time")
+
+    if confirmed:
+        receipt = native_input.execute(driver, request, lambda: None, snapshot)
+        assert receipt.mechanism is DispatchMechanism.UIA_PATTERN
+    else:
+        with pytest.raises(UncertainEffect, match="observed value does not match"):
+            native_input.execute(driver, request, lambda: None, snapshot)
