@@ -700,6 +700,51 @@ def test_task_operation_choice_sees_which_offered_operations_each_control_suppor
     journal.close()
 
 
+def test_task_retries_without_an_operation_that_has_no_target(tmp_path):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("TOGGLE", 0.8), "TOGGLE_target": ("NONE", 0.8)},
+        {"operation": ("CLICK", 0.8), "CLICK_target": ("PSTACK Development Team 7", 0.8)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+        elements=SIDEBAR_ELEMENTS,
+        fixtures={},
+    )
+    retry = transport.sent[1]
+    assert "TOGGLE" not in retry["questions"]["operation"]["criteria"]
+    assert "TOGGLE_target" not in retry["questions"]
+    assert "TOGGLE" not in retry["state"]["permitted_operations"]
+    assert [request.operation for request in driver.executed] == [Operation.CLICK]
+    assert "TOGGLE" in transport.sent[2]["questions"]["operation"]["criteria"], "a dispatch offers it again"
+    assert result.execution is Execution.COMPLETED
+    journal.close()
+
+
+def test_task_excluded_operations_last_until_the_next_observation(tmp_path):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("TOGGLE", 0.8), "TOGGLE_target": ("NONE", 0.8)},
+        {"operation": ("SCROLL", 0.8), "SCROLL_target": ("NONE", 0.8)},
+        {"operation": ("CLICK", 0.8), "CLICK_target": ("NONE", 0.8)},
+        {"operation": ("WAIT", 0.8)},
+        {"operation": ("ESCALATE", 0.8)},
+        elements=SIDEBAR_ELEMENTS,
+        fixtures={},
+    )
+    offered = [set(request["questions"]["operation"]["criteria"]) for request in transport.sent]
+    finishing = {"WAIT", "DONE", "ESCALATE"}
+    assert offered == [
+        {"CLICK", "TOGGLE", "SCROLL"} | finishing,
+        {"CLICK", "SCROLL"} | finishing,
+        {"CLICK"} | finishing,
+        finishing,
+        {"CLICK", "TOGGLE", "SCROLL"} | finishing,
+    ]
+    assert result.reason == "needs_visual_assistance"
+    assert driver.executed == []
+    journal.close()
+
+
 def test_task_selects_field_then_value_without_cartesian_candidates(tmp_path):
     runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,
