@@ -92,6 +92,7 @@ SUPPORTED_CHORDS = {
     "ctrl+l",
     "ctrl+shift+s",
     "ctrl+p",
+    "ctrl+w",
     "alt+f4",
     "alt+tab",
     "shift+tab",
