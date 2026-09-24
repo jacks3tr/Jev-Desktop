@@ -137,6 +137,11 @@ run is in progress, then tell the user to restart their Claude Code sessions.
   runs are stored and survive the restart; the next client call autostarts a new broker.
 - Auto mode may refuse `gh pr merge` for a PR the user did not approve by name, for example one
   opened after they said "merge". Ask rather than work around it.
+- In the Claude desktop app, read the release PR's CI with the `ccd_pr` `get_status` tool rather
+  than polling `gh pr checks`. For `main`'s run after the merge, run
+  `gh run watch <run-id> --exit-status` in the background.
+- A broker started after the fixes merged already runs the released code. A bump-only release
+  needs no broker restart then: compare the broker's start time with the fix's merge time.
 - The release workflow's draft already has both distributions attached; publishing only needs
   `gh release edit`. The full 0.2.0 release took one CI run (about 5 minutes) and one release
   run (about 1 minute).
