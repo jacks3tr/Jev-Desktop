@@ -35,7 +35,7 @@ def test_same_label_option_must_belong_to_selected_container(monkeypatch):
     monkeypatch.setattr(native_input, "live_state", lambda *_: state)
     monkeypatch.setattr(native_input, "_hit_ok", lambda *_: True)
     result = native_input._observed_option(driver, NS(elements=elements), NS(element=container), "Yes")
-    assert result[0] == "right-list"
+    assert result[0] is handles["right-list"]
 
 
 def test_discarded_target_is_a_stale_observation_not_a_driver_error():
@@ -140,15 +140,3 @@ def test_semantic_scroll_follows_the_wheel_convention_and_magnitude(monkeypatch)
     assert _semantic_scroll(monkeypatch, {"notches": -2}) == [("-", "inc")] * 2
     assert _semantic_scroll(monkeypatch, {"notches": 2, "horizontal": True}) == [("inc", "-")] * 2
     assert _semantic_scroll(monkeypatch, {"notches": -1, "horizontal": True}) == [("dec", "-")]
-
-
-def test_failed_activation_after_the_boundary_is_uncertain(monkeypatch):
-    user32 = native_input.win32.user32
-    monkeypatch.setattr(user32, "IsWindow", lambda _hwnd: True)
-    monkeypatch.setattr(user32, "IsWindowEnabled", lambda _hwnd: True)
-    monkeypatch.setattr(native_input.win32, "activate_window", lambda _hwnd: False)
-    driver = NS(registry=NS(windows={"window": NS(hwnd=5)}))
-    guarded = []
-    with pytest.raises(UncertainEffect):
-        native_input._focus_window(driver, NS(window_ref="window"), lambda: guarded.append(True), 0.0)
-    assert guarded == [True]

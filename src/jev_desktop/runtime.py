@@ -88,12 +88,7 @@ def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str,
     elements = [e for e in snapshot.elements if e.name or e.value or e.text or e.operations or e.focused]
     truncation = list(snapshot.truncation)
     if query:
-        lowered = query.casefold()
-        elements = [
-            e
-            for e in elements
-            if any(lowered in part.casefold() for part in (e.name, e.value or "", e.text or "", *e.path))
-        ]
+        elements = [e for e in elements if e.matches(query)]
         if len(elements) > limit:
             truncation.append(f"{len(elements)} elements match the query; showing the first {limit}")
     shown = elements[:limit]
@@ -569,9 +564,13 @@ class Runtime:
             raise ContractError("inspect again and start a new task after restarting the broker")
         snapshot = self._observe(state)
         completion_probe = False
-        completion_probe_used = False
+        # The first low-confidence refusal since the last dispatch; a second one reports it.
+        doubt: Pause | None = None
         value_target: TargetCandidate | None = None
         inputs_without_value: set[str] = set()
+        # Operations whose target answer was NONE, withdrawn until the snapshot changes.
+        operations_without_target: set[Operation] = set()
+        operations_checked_on = snapshot.snapshot_id
         auto_focused = False
         while True:
             self.ownership.checkpoint(
@@ -718,6 +717,10 @@ class Runtime:
                     if choices
                     else []
                 )
+            if operations_checked_on != snapshot.snapshot_id:
+                operations_without_target.clear()
+                operations_checked_on = snapshot.snapshot_id
+            contexts = [context for context in contexts if context.operation not in operations_without_target]
             # At the action limit, a final decision may report completion but cannot dispatch.
             if completion_probe or state.actions >= state.spec.limits.max_actions:
                 contexts = []
@@ -781,13 +784,22 @@ class Runtime:
                     inputs_without_value.add(value_target.element_id)
                     value_target = None
                     continue
-                if pause.reason is not Reason.LOW_CONFIDENCE or completion_probe_used or not state.actions:
+                offered = {context.operation.value: context.operation for context in contexts}
+                if pause.reason is Reason.NO_APPROPRIATE_TARGET and pause.detail.get("operation") in offered:
+                    # The operation choice cannot see every target; another operation may reach it.
+                    operations_without_target.add(offered[pause.detail["operation"]])
+                    continue
+                if pause.reason is not Reason.LOW_CONFIDENCE or not state.actions:
                     raise
-                # A transition can hide the result. Recheck once without offering more input.
-                completion_probe = completion_probe_used = True
+                if doubt is not None:
+                    raise doubt from None
+                # A transition can hide the next control or the result, so observe once more. Only
+                # doubt about finishing is rechecked without offering more input.
+                doubt = pause
+                completion_probe = pause.detail.get("operation") in {Operation.DONE.value, Operation.WAIT.value}
                 self.config.sleeper(min(1.0, max(0.0, state.slice_deadline - self.config.clock())))
                 value_target = None
-                snapshot = self._observe(state, completion=True)
+                snapshot = self._observe(state, completion=completion_probe)
                 continue
             finally:
                 if isinstance(self.policy, JevPolicy):
@@ -813,6 +825,7 @@ class Runtime:
                         metrics["usage_complete"] = False
             self.journal.append_trace(state.run_id, "decision", decision.to_json())
             self._persist(state)
+            unsettled = {"low_confidence": doubt.detail} if completion_probe and doubt is not None else {}
             if decision.operation is Operation.DONE:
                 # Refresh independently of the model's observation; a changed screen needs another decision.
                 fresh = self._observe(state, completion=completion_probe)
@@ -841,7 +854,10 @@ class Runtime:
                     return self._pause(
                         state,
                         Reason.NEEDS_VISUAL_ASSISTANCE.value,
-                        {"detail": "completion is not visible in the final observation; inspect the final window"},
+                        {
+                            "detail": "completion is not visible in the final observation; inspect the final window",
+                            **unsettled,
+                        },
                     )
                 state.status = RunStatus.COMPLETED.value
                 return self._result(
@@ -856,7 +872,7 @@ class Runtime:
                 return self._pause(
                     state,
                     Reason.NEEDS_VISUAL_ASSISTANCE.value,
-                    {"detail": "completion could not be established; inspect the final window"},
+                    {"detail": "completion could not be established; inspect the final window", **unsettled},
                 )
             if state.actions >= state.spec.limits.max_actions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_actions"})
@@ -893,6 +909,7 @@ class Runtime:
                 return dispatched
             snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
             inputs_without_value.clear()
+            doubt = None
 
     def _record_model_attempts(self, state: _RunState) -> None:
         if not isinstance(self.policy, JevPolicy):

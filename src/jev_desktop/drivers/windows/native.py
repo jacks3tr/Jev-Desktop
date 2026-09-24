@@ -202,7 +202,7 @@ class NativeWindowsDriver:
             self._scope[window.window_ref] = (self.registry.windows[window.window_ref].hwnd, app_ref)
         return windows
 
-    def observe(self, scope: ScopeSpec) -> Snapshot:
+    def observe(self, scope: ScopeSpec, query: str = "") -> Snapshot:
         self._require_started()
         app = self._apps.get(scope.app_ref)
         if app and Path(app.executable_path).name.lower() == "applicationframehost.exe" and not scope.window_refs:
@@ -227,6 +227,7 @@ class NativeWindowsDriver:
                 text_limit=scope.text_limit,
                 include_invisible=scope.include_invisible,
                 geometry=self.screen.geometry(),
+                query=query,
             )
             if win32.foreground_window() == foreground_before:
                 break

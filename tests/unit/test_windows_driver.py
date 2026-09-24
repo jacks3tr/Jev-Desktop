@@ -12,6 +12,7 @@ from jev_desktop.contracts import (
     Capture,
     ContractError,
     Coverage,
+    DispatchMechanism,
     DriverError,
     EvidenceRef,
     Geometry,
@@ -21,6 +22,7 @@ from jev_desktop.contracts import (
     Reason,
     Rect,
     ScreenshotPoint,
+    UncertainEffect,
 )
 from jev_desktop.drivers import windows as windows_driver
 from jev_desktop.drivers.windows import capture, identity, uia, win32
@@ -336,6 +338,34 @@ def test_unreadable_cursor_is_left_alone(monkeypatch):
     native_input._restore_cursor((1, 2), (3, 4))
 
 
+def test_refused_activation_pauses_resumably_naming_the_foreground_app(monkeypatch, no_send_input):
+    target, other = 101, 202
+    monkeypatch.setattr(win32.user32, "IsWindow", lambda _h: True)
+    monkeypatch.setattr(win32.user32, "IsWindowEnabled", lambda _h: True)
+    monkeypatch.setattr(win32, "activate_window", lambda _h: False)
+    monkeypatch.setattr(win32, "foreground_window", lambda: other)
+    monkeypatch.setattr(win32, "window_process_id", lambda hwnd: {other: 4242}[hwnd])
+    monkeypatch.setattr(win32, "process_image_path", lambda pid: {4242: r"C:\Windows\ApplicationFrameHost.exe"}[pid])
+    driver = NS(worker=None, registry=NS(windows={"win:1": NS(hwnd=target)}))
+    request = NS(operation=Operation.FOCUS_WINDOW, window_ref="win:1", action_id="act", element_id=None)
+    guarded = []
+
+    with pytest.raises(Pause) as paused:
+        native_input.execute(driver, request, lambda: guarded.append(True), NS(app_ref="app"))
+
+    assert guarded == [True]
+    assert paused.value.reason is Reason.USER_TAKEOVER
+    assert paused.value.detail == {
+        "reason": "Windows kept another window in the foreground; no input was sent",
+        "foreground_process": "ApplicationFrameHost.exe",
+        "resumable": True,
+    }
+
+
+def test_ctrl_w_is_a_supported_chord():
+    assert native_input.parse_chord(["Ctrl", "W"]) == [0x11, 0x57]
+
+
 def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
     sent = []
 
@@ -366,3 +396,267 @@ def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
     for kind, mouse_extra, key_extra in sent:
         extra = mouse_extra if kind == win32.INPUT_MOUSE else key_extra
         assert extra == win32.JEV_INPUT_TAG
+
+
+# --------------------------------------------------------------------------------------
+# Element dispatch against fake UI Automation trees
+# --------------------------------------------------------------------------------------
+
+HWND = 786718
+
+
+class _Uia:
+    """A live UIA element: compared by identity, with a parent link and current properties."""
+
+    def __init__(self, name, parent=None, rect=None, focused=lambda: False, props=None):
+        self.name, self.parent, self._focused, self.props = name, parent, focused, props or {}
+        self.rect = rect or Rect(0, 0, 0, 0)
+
+    def GetCurrentPropertyValue(self, prop):
+        if prop == uia.PROP_BOUNDS:
+            return [self.rect.left, self.rect.top, self.rect.width, self.rect.height]
+        if prop == uia.PROP_ENABLED:
+            return True
+        if prop == uia.PROP_OFFSCREEN:
+            return False
+        if prop == uia.PROP_FOCUSED:
+            return self._focused()
+        return self.props.get(prop)
+
+
+def _uia_worker(element_at_point, **automation):
+    worker = NS(
+        automation=NS(
+            CompareElements=lambda a, b: a is b,
+            RawViewWalker=NS(GetParentElement=lambda element: element.parent),
+            **automation,
+        ),
+        element_at_point=element_at_point,
+    )
+    worker.submit = lambda fn, **_: fn(worker)
+    return worker
+
+
+def _element_handle(element, element_id, role, operations):
+    return NS(
+        element=element,
+        element_id=element_id,
+        role=role,
+        operations=operations,
+        rect=element.rect,
+        hwnd=HWND,
+        name=element.name,
+        visible=True,
+        snapshot_id="snap",
+    )
+
+
+def _element_request(operation, element_id, text=None, option_label=None):
+    return NS(
+        operation=operation,
+        point=None,
+        element_id=element_id,
+        snapshot_id="snap",
+        mode=InputMode.USER_PATH,
+        text=text,
+        option_label=option_label,
+        replace_existing=True,
+        deadline_s=1.0,
+        action_id="act",
+        window_ref="win",
+    )
+
+
+@pytest.fixture
+def desktop(monkeypatch, no_send_input):
+    """An enabled foreground window. Returns the points clicked; typing fails the test."""
+    monkeypatch.setattr(win32.user32, "IsWindow", lambda _h: True)
+    monkeypatch.setattr(win32.user32, "IsWindowEnabled", lambda _h: True)
+    monkeypatch.setattr(win32, "root_window", lambda hwnd: hwnd)
+    monkeypatch.setattr(win32, "foreground_window", lambda: HWND)
+    monkeypatch.setattr(win32, "virtual_screen", lambda: Rect(0, 0, 2560, 1440))
+    monkeypatch.setattr(win32, "cursor_position", lambda: (0, 0))
+    monkeypatch.setattr(win32, "set_cursor_position", lambda *_: None)
+    clicks = []
+    monkeypatch.setattr(win32, "click_at", lambda x, y: clicks.append((x, y)) or 3)
+    monkeypatch.setattr(win32, "type_unicode", lambda _text: pytest.fail("text was typed"))
+    monkeypatch.setattr(win32, "key_chord", lambda _codes: 2)
+    monkeypatch.setattr(native_input.time, "sleep", lambda _s: None)
+    return clicks
+
+
+@pytest.mark.parametrize(("nc_hit", "clicked"), [(20, True), (1, False)], ids=["htclose", "htclient"])
+def test_caption_button_click_is_proven_by_the_window_hit_test(monkeypatch, desktop, nc_hit, clicked):
+    # Electron titleBarOverlay: the caption buttons are native views, and a UIA point query over
+    # them resolves into the web document beneath the overlay.
+    window = _Uia("window")
+    frame = _Uia("WinFrameView", window)
+    buttons = _Uia("WinCaptionButtonContainer", frame)
+    close = _Uia("Close", buttons, rect=Rect(1928, 1, 1986, 45), props={uia.PROP_CLASSNAME: "WinCaptionButton"})
+    page = _Uia("header group", _Uia("Document", _Uia("Chrome Legacy Window", frame)))
+    render_widget = 900
+    monkeypatch.setattr(win32, "root_window", lambda hwnd: HWND if hwnd == render_widget else hwnd)
+    monkeypatch.setattr(win32, "window_from_point", lambda x, y: render_widget)
+    queried = []
+
+    def send_message_timeout(hwnd, message, wparam, lparam, flags, timeout_ms, result):
+        queried.append((hwnd, message, lparam))
+        result._obj.value = nc_hit
+        return 1
+
+    monkeypatch.setattr(win32.user32, "SendMessageTimeoutW", send_message_timeout)
+    monkeypatch.setattr(uia, "resolve_element", lambda *_: _element_handle(close, "el:close", "button", ("CLICK",)))
+    driver = NS(worker=_uia_worker(lambda _x, _y: page), registry=None)
+    request = _element_request(Operation.CLICK, "el:close")
+
+    if clicked:
+        receipt = native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert receipt.notes == ("point=1957,23",)
+    else:
+        with pytest.raises(Pause) as paused:
+            native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert paused.value.reason is Reason.STALE_OBSERVATION
+    assert queried == [(HWND, 0x84, (23 << 16) | 1957)]
+    assert desktop == ([(1957, 23)] if clicked else [])
+
+
+@pytest.mark.parametrize("controls_list", [True, False], ids=["aria-controls", "unrelated-focus"])
+def test_combobox_types_while_focus_reports_its_active_option(monkeypatch, desktop, controls_list):
+    # Chromium reports UIA focus on a combobox's aria-activedescendant option, while DOM focus,
+    # and the keys, stay in the input.
+    dialog = _Uia("Command palette")
+    field = _Uia("Command palette search", dialog, rect=Rect(700, 200, 1200, 240))
+    results = _Uia("Commands and search results", dialog)
+    option = _Uia("New agent", results, rect=Rect(700, 260, 1200, 290))
+    controlled = [results] if controls_list else []
+    field.CurrentControllerFor = NS(Length=len(controlled), GetElement=controlled.__getitem__)
+    typed = []
+
+    def type_unicode(text):
+        typed.append(text)
+        field.props[uia.PROP_VALUE] = text
+        return 2 * len(text)
+
+    monkeypatch.setattr(win32, "type_unicode", type_unicode)
+    monkeypatch.setattr(
+        uia, "resolve_element", lambda *_: _element_handle(field, "el:field", "combobox", ("TYPE_TEXT",))
+    )
+    driver = NS(worker=_uia_worker(lambda _x, _y: field, GetFocusedElement=lambda: option), registry=None)
+    request = _element_request(Operation.TYPE_TEXT, "el:field", text="UI Navigator")
+
+    if controls_list:
+        receipt = native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert receipt.mechanism.value == "send_input_keyboard"
+        assert typed == ["UI Navigator"]
+    else:
+        with pytest.raises(UncertainEffect, match="did not take focus"):
+            native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert typed == []
+    assert desktop == [(950, 220)]
+
+
+@pytest.mark.parametrize("option_bounds", ["select", "popup"])
+def test_native_select_chooses_an_unreachable_option_through_its_pattern(monkeypatch, desktop, option_bounds):
+    # Chromium's native <select>: options report the select's own bounds, or sit in a separate
+    # popup window, so a pointer route to them can never be proven.
+    combo = _Uia("Shell commands policy", _Uia("Document"), rect=Rect(1400, 330, 1560, 364))
+    popup = Rect(1400, 364, 1560, 440)
+    option = _Uia(
+        "Always allow",
+        _Uia("menulist popup", combo),
+        rect=combo.rect if option_bounds == "select" else Rect(1400, 400, 1560, 420),
+        props={uia.AVAILABILITY["selectionitem"]: True, 30080: combo},
+    )
+    selected = []
+
+    def select():
+        selected.append(option.name)
+        combo.props[uia.PROP_VALUE] = option.name
+
+    option.GetCurrentPattern = lambda _id: NS(QueryInterface=lambda _interface: NS(Select=select))
+    popup_page = _Uia("popup page", _Uia("popup window"))
+    worker = _uia_worker(lambda x, y: popup_page if popup.contains(x, y) else combo)
+    handles = {
+        "el:combo": _element_handle(combo, "el:combo", "combobox", ("CLICK", "SELECT")),
+        "el:option": _element_handle(option, "el:option", "listitem", ("CLICK", "SELECT")),
+    }
+    monkeypatch.setattr(uia, "resolve_element", lambda _registry, element_id, *_: handles[element_id])
+    driver = NS(worker=worker, registry=NS(elements=handles))
+    snapshot = NS(
+        app_ref="app",
+        elements=[
+            NS(element_id="el:combo", name=combo.name, role="combobox"),
+            NS(element_id="el:option", name=option.name, role="listitem"),
+        ],
+    )
+
+    receipt = native_input.execute(
+        driver, _element_request(Operation.SELECT, "el:combo", option_label="Always allow"), lambda: None, snapshot
+    )
+    assert receipt.mechanism is DispatchMechanism.UIA_PATTERN
+    assert receipt.notes == ("pattern=selection_item", "option pointer route unproven")
+    assert selected == ["Always allow"]
+
+    # Clicking the option itself is still refused: its pointer route is unproven.
+    with pytest.raises(Pause) as paused:
+        native_input.execute(driver, _element_request(Operation.CLICK, "el:option"), lambda: None, snapshot)
+    assert paused.value.reason is Reason.STALE_OBSERVATION
+    assert desktop == []
+
+
+class _LaggingValue(dict):
+    """A control whose reported value catches up with a selection only after a few reads."""
+
+    def __init__(self, old, new, stale_reads):
+        super().__init__()
+        self.old, self.new, self.stale_reads = old, new, stale_reads
+
+    def get(self, prop, default=None):
+        if prop != uia.PROP_VALUE:
+            return default
+        if self.stale_reads:
+            self.stale_reads -= 1
+            return self.old
+        return self.new
+
+
+@pytest.mark.parametrize(("stale_reads", "confirmed"), [(3, True), (10_000, False)], ids=["lagging", "unchanged"])
+def test_select_waits_for_the_control_to_report_the_chosen_option(monkeypatch, desktop, stale_reads, confirmed):
+    # Unbound's native select committed "Ask every time" but still reported the old value on the
+    # first read after the selection.
+    combo = _Uia("Shell commands policy", _Uia("Document"), rect=Rect(1400, 330, 1560, 364))
+    combo.props = {uia.PROP_VALUE: "Always allow"}
+    option = _Uia(
+        "Ask every time",
+        _Uia("menulist popup", combo),
+        rect=combo.rect,
+        props={uia.AVAILABILITY["selectionitem"]: True, 30080: combo},
+    )
+
+    def select():
+        combo.props = _LaggingValue("Always allow", option.name, stale_reads)
+
+    option.GetCurrentPattern = lambda _id: NS(QueryInterface=lambda _interface: NS(Select=select))
+    handles = {
+        "el:combo": _element_handle(combo, "el:combo", "combobox", ("CLICK", "SELECT")),
+        "el:option": _element_handle(option, "el:option", "listitem", ("CLICK", "SELECT")),
+    }
+    monkeypatch.setattr(uia, "resolve_element", lambda _registry, element_id, *_: handles[element_id])
+    clock = iter(range(1_000_000))
+    monkeypatch.setattr(native_input.time, "monotonic", lambda: next(clock) * 0.01)
+    driver = NS(worker=_uia_worker(lambda _x, _y: combo), registry=NS(elements=handles))
+    snapshot = NS(
+        app_ref="app",
+        elements=[
+            NS(element_id="el:combo", name=combo.name, role="combobox"),
+            NS(element_id="el:option", name=option.name, role="listitem"),
+        ],
+    )
+    request = _element_request(Operation.SELECT, "el:combo", option_label="Ask every time")
+
+    if confirmed:
+        receipt = native_input.execute(driver, request, lambda: None, snapshot)
+        assert receipt.mechanism is DispatchMechanism.UIA_PATTERN
+    else:
+        with pytest.raises(UncertainEffect, match="observed value does not match"):
+            native_input.execute(driver, request, lambda: None, snapshot)

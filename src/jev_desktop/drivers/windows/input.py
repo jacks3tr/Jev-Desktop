@@ -14,7 +14,7 @@ and the hit target under the intended screen point. Failures before the boundary
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import comtypes
@@ -92,6 +92,7 @@ SUPPORTED_CHORDS = {
     "ctrl+l",
     "ctrl+shift+s",
     "ctrl+p",
+    "ctrl+w",
     "alt+f4",
     "alt+tab",
     "shift+tab",
@@ -193,6 +194,14 @@ def live_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
         ) from exc
 
 
+def _typing_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
+    """Live state whose `focused` also counts UIA focus inside an element the target controls."""
+    state = live_state(worker, handle)
+    if state.focused or not uia.focus_in_controlled(worker, handle):
+        return state
+    return replace(state, focused=True)
+
+
 def _geometry_ok(cached: Rect, live: Rect, tolerance: int = 4) -> bool:
     return (
         not live.is_empty
@@ -203,8 +212,24 @@ def _geometry_ok(cached: Rect, live: Rect, tolerance: int = 4) -> bool:
     )
 
 
+CAPTION_HIT_CODES = {8, 9, 20}  # HTMINBUTTON, HTMAXBUTTON, HTCLOSE
+
+
 def _hit_ok(worker: uia.UiaWorker, handle: uia.ElementHandle, x: int, y: int) -> bool:
-    return uia.hit_is_descendant_or_self(worker, handle, x, y)
+    return uia.hit_is_descendant_or_self(worker, handle, x, y) or _caption_button_hit(worker, handle, x, y)
+
+
+def _caption_button_hit(worker: uia.UiaWorker, handle: uia.ElementHandle, x: int, y: int) -> bool:
+    # Electron titleBarOverlay caption buttons are native views that a UIA point query sees
+    # through to the web page beneath; the top-level window's non-client hit test is what
+    # routes a click there.
+    class_name = worker.submit(lambda _: uia._cached(handle.element, uia.PROP_CLASSNAME), timeout=10.0)
+    if class_name != "WinCaptionButton":
+        return False
+    root = win32.root_window(handle.hwnd)
+    return (
+        win32.root_window(win32.window_from_point(x, y)) == root and win32.nc_hit_test(root, x, y) in CAPTION_HIT_CODES
+    )
 
 
 def require_user_path_ready(
@@ -512,9 +537,14 @@ def execute(
             raise DriverError("SELECT requires an observed option label")
         option = _observed_option(driver, snapshot, handle, request.option_label)
         if option is None:
-            raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "SELECT requires a visible observed option"})
+            raise Pause(
+                Reason.UNSUPPORTED_CONTROL,
+                {"reason": "no enabled observed option with this label belongs to the control"},
+            )
+        option_handle, option_state, reachable = option
+        if not reachable:
+            return _select_by_pattern(worker, handle, option_handle, request, guard, started)
         select_notes: tuple[str, ...]
-        option_state = option[1]
         ox, oy = option_state.rect.center()
         guard()
         previous = win32.cursor_position()
@@ -529,7 +559,7 @@ def execute(
             ) from exc
         finally:
             _restore_cursor(previous, (ox, oy))
-        _verify_selection(worker, handle, request.option_label)
+        _verify_selection(worker, handle, request, guard, started, DispatchMechanism.SEND_INPUT_MOUSE)
         return _receipt(request, DispatchMechanism.SEND_INPUT_MOUSE, inserted, started, notes=select_notes)
 
     if request.operation is Operation.TYPE_TEXT:
@@ -542,18 +572,18 @@ def execute(
         except DriverError as exc:
             raise UncertainEffect(f"focus click failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE) from exc
         try:
-            focus = live_state(worker, handle)
+            focus = _typing_state(worker, handle)
             focus_deadline = time.monotonic() + min(0.5, max(0.0, request.deadline_s))
             while not focus.focused and time.monotonic() < focus_deadline:
                 guard()
                 time.sleep(0.025)
-                focus = live_state(worker, handle)
+                focus = _typing_state(worker, handle)
             if not focus.focused:
                 raise UncertainEffect(
                     "click was dispatched but the control did not take focus; no text was typed",
                     mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
                 )
-            ready = live_state(worker, handle)
+            ready = _typing_state(worker, handle)
             if not ready.focused or ready.root != ready.foreground_root:
                 raise UncertainEffect(
                     "focus changed after the click; no text was typed",
@@ -673,8 +703,16 @@ def _focus_window(driver: Any, request: ActionRequest, guard: Any, started: floa
     guard()
     activated = win32.activate_window(handle.hwnd)
     if not activated:
-        # Activation may already have restored, raised, or reordered the window.
-        raise UncertainEffect("window could not be activated; it may have been restored or raised")
+        # Windows refuses SetForegroundWindow to a background process while another application
+        # owns the foreground. No input was sent, so trying again later is safe.
+        raise Pause(
+            Reason.USER_TAKEOVER,
+            {
+                "reason": "Windows kept another window in the foreground; no input was sent",
+                "foreground_process": _foreground_process(),
+                "resumable": True,
+            },
+        )
     return _receipt(
         request,
         DispatchMechanism.NONE,
@@ -684,12 +722,27 @@ def _focus_window(driver: Any, request: ActionRequest, guard: Any, started: floa
     )
 
 
+def _foreground_process() -> str | None:
+    foreground = win32.foreground_window()
+    if not foreground:
+        return None
+    try:
+        return win32.process_image_path(win32.window_process_id(foreground)).rsplit("\\", 1)[-1]
+    except DriverError:  # elevated or protected processes refuse the query
+        return None
+
+
 def _observed_option(
     driver: Any, snapshot: Snapshot, handle: uia.ElementHandle, label: str
-) -> tuple[str, LiveState] | None:
-    """Select only an unambiguous option belonging to the requested container."""
+) -> tuple[uia.ElementHandle, LiveState, bool] | None:
+    """Select only an unambiguous option belonging to the requested container.
+
+    The flag says whether the pointer route to the option is proven; an option with a proven
+    route is preferred over one that only its selection pattern can reach.
+    """
     wanted = label.strip().lower()
-    best: tuple[str, LiveState] | None = None
+    reachable: list[tuple[uia.ElementHandle, LiveState, bool]] = []
+    unreachable: list[tuple[uia.ElementHandle, LiveState, bool]] = []
     for element in snapshot.elements:
         if not element.name:
             continue
@@ -708,25 +761,76 @@ def _observed_option(
             state = live_state(driver.worker, candidate)
         except Exception:
             continue
-        if state.rect.is_empty or not state.enabled or state.offscreen:
+        if not state.enabled:
             continue
-        if not _geometry_ok(candidate.rect, state.rect) or not _hit_ok(driver.worker, candidate, *state.rect.center()):
-            continue
-        if best is not None:
+        if (
+            not state.rect.is_empty
+            and not state.offscreen
+            and _geometry_ok(candidate.rect, state.rect)
+            and _hit_ok(driver.worker, candidate, *state.rect.center())
+        ):
+            reachable.append((candidate, state, True))
+        else:
+            unreachable.append((candidate, state, False))
+    for options in (reachable, unreachable):
+        if len(options) > 1:
             raise Pause(Reason.NO_APPROPRIATE_TARGET, {"detail": "ambiguous options in selection container"})
-        best = (element.element_id, state)
-    return best
+        if options:
+            return options[0]
+    return None
 
 
-def _verify_selection(worker: uia.UiaWorker, handle: uia.ElementHandle, label: str) -> None:
-    value = _live_value(worker, handle)
-    if value is None:
-        return
-    if label.strip().lower() != value.strip().lower():
+def _select_by_pattern(
+    worker: uia.UiaWorker,
+    container: uia.ElementHandle,
+    option: uia.ElementHandle,
+    request: ActionRequest,
+    guard: Any,
+    started: float,
+) -> Receipt:
+    """Choose an option the pointer cannot be proven to reach, then verify the container's value.
+
+    Chromium's native select options report the select's own bounds or live in a separate
+    popup window, so no hit test can prove a click on them.
+    """
+    selection = worker.submit(lambda _: _pattern(option.element, "UIA_SelectionItemPatternId", 10010), timeout=10.0)
+    if selection is None:
+        raise Pause(Reason.UNSUPPORTED_CONTROL, {"reason": "the option has no selection pattern"})
+    guard()
+    try:
+        worker.submit(lambda _: selection.Select(), timeout=request.deadline_s)
+    except Exception as exc:
         raise UncertainEffect(
-            "selection was dispatched but the observed value does not match",
-            mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
-        )
+            f"selection pattern failed after dispatch boundary: {exc}", mechanism=DispatchMechanism.UIA_PATTERN
+        ) from exc
+    _verify_selection(worker, container, request, guard, started, DispatchMechanism.UIA_PATTERN)
+    return _receipt(
+        request,
+        DispatchMechanism.UIA_PATTERN,
+        1,
+        started,
+        notes=("pattern=selection_item", "option pointer route unproven"),
+    )
+
+
+def _verify_selection(
+    worker: uia.UiaWorker,
+    handle: uia.ElementHandle,
+    request: ActionRequest,
+    guard: Any,
+    started: float,
+    mechanism: DispatchMechanism,
+) -> None:
+    # Web selects commit asynchronously, so the first read can still hold the previous value.
+    expected = (request.option_label or "").strip().lower()
+    deadline = time.monotonic() + max(0.0, request.deadline_s - (time.time() - started))
+    value = _live_value(worker, handle)
+    while value is not None and value.strip().lower() != expected:
+        if time.monotonic() >= deadline:
+            raise UncertainEffect("selection was dispatched but the observed value does not match", mechanism=mechanism)
+        guard()
+        time.sleep(0.01)
+        value = _live_value(worker, handle)
 
 
 def _live_value(worker: uia.UiaWorker, handle: uia.ElementHandle) -> str | None:

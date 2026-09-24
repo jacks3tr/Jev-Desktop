@@ -219,8 +219,8 @@ class WindowsDriver:
     def list_windows(self):
         return self._call("list_windows")
 
-    def observe(self, scope):
-        return self._call("observe", scope)
+    def observe(self, scope, query=""):
+        return self._call("observe", scope, query=query)
 
     def snapshot(self, snapshot_id, scope):
         return self._call("snapshot", snapshot_id, scope)

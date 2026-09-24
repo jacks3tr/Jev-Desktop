@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from jev_desktop.broker import Broker, BrokerConfig, fit_frame
 from jev_desktop.client import BrokerClient, BrokerError
 from jev_desktop.contracts import Envelope, Limits, Operation, new_id
 from jev_desktop.ipc import MAX_MESSAGE_BYTES, PipeClient, PipeServer
+from jev_desktop.journal import DispatchJournal
 from jev_desktop.policy import PolicyConfig
 
 from .fakes import FakeApp, FakeDriver, FakeElement, ScriptedDecision, ScriptedPolicy
@@ -285,6 +287,112 @@ def test_oversized_response_drops_inline_images_but_keeps_the_resume_token():
     assert fallback.ok is False and fallback.error is not None
     assert fallback.error["code"] == "response_too_large"
     assert fallback.error["detail"] == {"run_id": "run:x", "resume_token": "resume:y"}
+
+
+def _act(client: BrokerClient, observed: dict, operation: str, element: str | None = None) -> dict:
+    action = {"operation": operation, "snapshot_id": observed["snapshot_id"], "window_ref": "win:" + "b" * 24}
+    if element is not None:
+        action["element_id"] = next(e["element_id"] for e in observed["elements"] if e["name"] == element)
+    return client.call("act", {"action": action, "access_token": observed["access_token"]})
+
+
+def test_refused_action_leaves_the_inspection_usable(broker_env):
+    client = broker_env["make"]()
+    driver = broker_env["driver"]
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+
+    driver.fail_next = "pause:stale_observation"
+    with pytest.raises(BrokerError) as refused:
+        _act(client, observed, "CLICK", "Save")
+    assert refused.value.code == "paused"
+
+    focused = _act(client, observed, "FOCUS_WINDOW")
+    assert focused["receipt"]["dispatch_state"] == "dispatched"
+    with pytest.raises(BrokerError) as used:
+        _act(client, observed, "FOCUS_WINDOW")
+    assert used.value.code == "invalid_request"
+    assert used.value.message == "the inspection is unknown or already used; inspect the application again"
+
+
+def test_uncertain_direct_action_reports_uncertain_effect_and_consumes_the_inspection(broker_env):
+    client = broker_env["make"]()
+    driver = broker_env["driver"]
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+
+    driver.fail_next = "uncertain"
+    with pytest.raises(BrokerError) as uncertain:
+        _act(client, observed, "CLICK", "Save")
+    assert uncertain.value.code == "uncertain_effect"
+    assert uncertain.value.message == "injected partial dispatch"
+    with pytest.raises(BrokerError) as used:
+        _act(client, observed, "FOCUS_WINDOW")
+    assert used.value.code == "invalid_request"
+    assert len(driver.executed) == 1
+
+
+def _journal_health_after_restart(config: BrokerConfig, app: FakeApp) -> dict:
+    pipe = f"\\\\.\\pipe\\jev-test-{uuid.uuid4().hex[:12]}"
+    broker = Broker(config, driver=FakeDriver(app, evidence_dir=config.evidence_dir))
+    broker.start()
+    server = PipeServer(name=pipe, handler=broker.handle, on_disconnect=broker.on_disconnect)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    client = BrokerClient(pipe=pipe, client_name="restarted", autostart=False, timeout_s=30.0)
+    try:
+        return client.call("health")["journal"]
+    finally:
+        client.close()
+        server.stop()
+        broker.close()
+
+
+def test_restart_recovers_only_actions_left_mid_dispatch(broker_env):
+    client = broker_env["make"]()
+    broker = broker_env["broker"]
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+    broker_env["driver"].fail_next = "uncertain"
+    with pytest.raises(BrokerError):
+        _act(client, observed, "CLICK", "Save")
+    (settled,) = [row[0] for row in broker.journal._db.execute("SELECT action_id FROM effects")]
+    interrupted = "act:" + "c" * 24
+    # A broker that died between recording intent and settling the outcome leaves this row.
+    broker.journal._db.execute(
+        "INSERT INTO effects VALUES (?, 'h', NULL, 'dispatching', NULL, NULL, 1.0, 1.0)", (interrupted,)
+    )
+    client.close()
+    broker_env["server"].stop()
+    broker.close()
+
+    assert _journal_health_after_restart(broker.config, broker_env["app"])["recovered_uncertain"] == [interrupted]
+    assert _journal_health_after_restart(broker.config, broker_env["app"])["recovered_uncertain"] == []
+    journal = DispatchJournal(str(broker.config.journal_path))
+    try:
+        assert journal.lookup(settled).note == "uncertain: injected partial dispatch"
+        assert journal.lookup(interrupted).note == "recovered after broker restart"
+    finally:
+        journal.close()
+
+
+def test_physical_input_during_a_refused_action_consumes_the_inspection(broker_env, monkeypatch):
+    client = broker_env["make"]()
+    broker, driver = broker_env["broker"], broker_env["driver"]
+    presence = SimpleNamespace(human_epoch=0)
+    broker.runtime.presence = presence
+    execute = driver.execute
+
+    def touched(request, guard, snapshot):
+        presence.human_epoch += 1
+        return execute(request, guard, snapshot)
+
+    monkeypatch.setattr(driver, "execute", touched)
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+    with pytest.raises(BrokerError) as takeover:
+        _act(client, observed, "CLICK", "Save")
+    assert takeover.value.code == "paused"
+    assert takeover.value.detail["reason"] == "physical input during the action; inspect again"
+    with pytest.raises(BrokerError) as used:
+        _act(client, observed, "FOCUS_WINDOW")
+    assert used.value.code == "invalid_request"
+    assert not driver.executed
 
 
 def test_inspect_query_filters_elements_not_the_application(broker_env):

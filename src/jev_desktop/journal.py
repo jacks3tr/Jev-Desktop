@@ -262,7 +262,7 @@ class DispatchJournal:
         """Actions left mid-flight, e.g. after a broker restart. Recover as uncertain."""
         with self._lock:
             rows = self._execute(
-                "SELECT action_id FROM effects WHERE state IN ('dispatching','uncertain') ORDER BY created_at"
+                "SELECT action_id FROM effects WHERE state='dispatching' ORDER BY created_at"
             ).fetchall()
         return [record for record in (self.lookup(row[0]) for row in rows) if record is not None]
 

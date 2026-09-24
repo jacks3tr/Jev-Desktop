@@ -25,9 +25,19 @@ from jev_desktop.contracts import (
 from jev_desktop.evidence import EvidenceStore
 from jev_desktop.journal import DispatchJournal, DispatchState
 from jev_desktop.ownership import Ownership
+from jev_desktop.policy import JevPolicy
 from jev_desktop.runtime import ResumeInputs, Runtime, RuntimeConfig
 
-from .fakes import Clock, FakeApp, FakeDriver, FakeElement, ScriptedDecision, ScriptedPolicy
+from .fakes import (
+    Clock,
+    FakeApp,
+    FakeDriver,
+    FakeElement,
+    ScriptedDecision,
+    ScriptedPolicy,
+    choice_answer,
+    fake_response,
+)
 
 APP_REF = "app:" + "a" * 24
 _OWNERS: list[Ownership] = []
@@ -535,7 +545,7 @@ def test_task_checks_completion_after_low_confidence_without_more_input(tmp_path
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise Pause(Reason.LOW_CONFIDENCE, {"selected": "WAIT"})
+            raise Pause(Reason.LOW_CONFIDENCE, {"selected": "WAIT", "operation": "WAIT"})
         if calls == 3:
             assert kwargs["contexts"] == []
         return decide(**kwargs)
@@ -548,6 +558,190 @@ def test_task_checks_completion_after_low_confidence_without_more_input(tmp_path
     if not complete:
         assert result.reason == "needs_visual_assistance"
     assert ownership.active_lease() is None
+    journal.close()
+
+
+class TurnTransport:
+    """Fake TypeSafe endpoint: each request takes the next turn, {question: (option, confidence)}.
+
+    An option that is not a literal choice names the control whose description carries it.
+    """
+
+    def __init__(self, *turns):
+        self.turns = list(turns)
+        self.sent = []
+
+    def post_json(self, url, *, headers, payload, timeout_s):
+        self.sent.append(payload)
+        answers = {}
+        for key, (option, confidence) in self.turns.pop(0).items():
+            criteria = payload["questions"][key]["criteria"]
+            if option not in criteria:
+                option = next(alias for alias, text in criteria.items() if f'name="{option}"' in text)
+            answers[key] = choice_answer(option, list(criteria), confidence=confidence)
+        return 200, fake_response("jev-1.13.0", answers)
+
+
+SEARCH_ELEMENTS = [
+    FakeElement("button", "Save", operations=("CLICK",)),
+    FakeElement("edit", "Search", editable=True, operations=("TYPE_TEXT", "CLICK")),
+    FakeElement("text", "Saved", value="no", text="no", operations=()),
+]
+
+
+def task_with_turns(tmp_path, *turns, elements=SEARCH_ELEMENTS, fixtures=None):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=elements,
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"} if fixtures is None else fixtures,
+    )
+    transport = TurnTransport(*turns)
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    return runtime, driver, app, journal, transport, slice_once(runtime, ownership, session, created)
+
+
+@pytest.mark.parametrize("settles", [True, False], ids=["recheck-acts", "doubt-persists"])
+def test_task_next_step_doubt_rechecks_with_actions_still_offered(tmp_path, settles):
+    recheck = (
+        [
+            {"operation": ("CLICK", 0.9), "CLICK_target": ("Search", 0.9)},
+            {"operation": ("DONE", 0.9)},
+            {"done": ("YES", 0.9)},
+        ]
+        if settles
+        else [{"operation": ("TYPE_TEXT", 0.25)}]
+    )
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("CLICK", 0.9), "CLICK_target": ("Save", 0.9)},
+        {"operation": ("TYPE_TEXT", 0.3)},
+        *recheck,
+    )
+    rechecked = transport.sent[2]["questions"]
+    assert "TYPE_TEXT_target" in rechecked and "CLICK_target" in rechecked
+    if settles:
+        assert result.execution is Execution.COMPLETED
+        assert [request.operation for request in driver.executed] == [Operation.CLICK, Operation.CLICK]
+    else:
+        assert result.execution is Execution.PAUSED
+        assert result.reason == "low_confidence"
+        assert dict(result.detail) == {
+            "selected": "TYPE_TEXT",
+            "confidence": 0.3,
+            "margin": 0.125,
+            "floor": 0.35,
+            "operation": "TYPE_TEXT",
+        }
+        assert len(transport.sent) == 3
+        assert len(driver.executed) == 1
+    journal.close()
+
+
+def test_task_completion_doubt_probe_keeps_the_low_confidence_detail(tmp_path):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("CLICK", 0.9), "CLICK_target": ("Save", 0.9)},
+        {"operation": ("DONE", 0.3)},
+        {"operation": ("ESCALATE", 0.9)},
+    )
+    probe = transport.sent[2]["questions"]
+    assert list(probe) == ["operation"]
+    assert set(probe["operation"]["criteria"]) == {"WAIT", "DONE", "ESCALATE"}
+    assert result.reason == "needs_visual_assistance"
+    assert dict(result.detail) == {
+        "detail": "completion could not be established; inspect the final window",
+        "low_confidence": {"selected": "DONE", "confidence": 0.3, "margin": 0.125, "floor": 0.35, "operation": "DONE"},
+    }
+    assert len(driver.executed) == 1
+    journal.close()
+
+
+SIDEBAR_ELEMENTS = [
+    FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
+    FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),
+    FakeElement("listitem", "Plugins", operations=("CLICK", "SELECT")),
+    FakeElement("button", "Archived", enabled=False, operations=("CLICK",)),
+    FakeElement("document", "Unbound", operations=("SCROLL",)),
+    FakeElement("text", "Agents", operations=()),
+]
+
+
+def test_task_operation_choice_sees_which_offered_operations_each_control_supports(tmp_path):
+    _runtime, _driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+        elements=SIDEBAR_ELEMENTS,
+        fixtures={},
+    )
+    assert result.execution is Execution.COMPLETED
+
+    names = [item.name for item in SIDEBAR_ELEMENTS]
+
+    def operations(request):
+        return {
+            name: element.get("operations")
+            for element in request["state"]["elements"]
+            for name in names
+            if f'name="{name}"' in element["description"]
+        }
+
+    assert operations(transport.sent[0]) == {
+        "PSTACK Development Team 7": ["CLICK"],
+        "Dispatch": ["CLICK", "TOGGLE"],
+        "Plugins": ["CLICK"],
+        "Archived": None,
+        "Unbound": ["SCROLL"],
+        "Agents": None,
+    }
+    assert set(operations(transport.sent[1]).values()) == {None}, "the completion question offers no operations"
+    journal.close()
+
+
+def test_task_retries_without_an_operation_that_has_no_target(tmp_path):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("TOGGLE", 0.8), "TOGGLE_target": ("NONE", 0.8)},
+        {"operation": ("CLICK", 0.8), "CLICK_target": ("PSTACK Development Team 7", 0.8)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+        elements=SIDEBAR_ELEMENTS,
+        fixtures={},
+    )
+    retry = transport.sent[1]
+    assert "TOGGLE" not in retry["questions"]["operation"]["criteria"]
+    assert "TOGGLE_target" not in retry["questions"]
+    assert "TOGGLE" not in retry["state"]["permitted_operations"]
+    assert [request.operation for request in driver.executed] == [Operation.CLICK]
+    assert "TOGGLE" in transport.sent[2]["questions"]["operation"]["criteria"], "a dispatch offers it again"
+    assert result.execution is Execution.COMPLETED
+    journal.close()
+
+
+def test_task_excluded_operations_last_until_the_next_observation(tmp_path):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("TOGGLE", 0.8), "TOGGLE_target": ("NONE", 0.8)},
+        {"operation": ("SCROLL", 0.8), "SCROLL_target": ("NONE", 0.8)},
+        {"operation": ("CLICK", 0.8), "CLICK_target": ("NONE", 0.8)},
+        {"operation": ("WAIT", 0.8)},
+        {"operation": ("ESCALATE", 0.8)},
+        elements=SIDEBAR_ELEMENTS,
+        fixtures={},
+    )
+    offered = [set(request["questions"]["operation"]["criteria"]) for request in transport.sent]
+    finishing = {"WAIT", "DONE", "ESCALATE"}
+    assert offered == [
+        {"CLICK", "TOGGLE", "SCROLL"} | finishing,
+        {"CLICK", "SCROLL"} | finishing,
+        {"CLICK"} | finishing,
+        finishing,
+        {"CLICK", "TOGGLE", "SCROLL"} | finishing,
+    ]
+    assert result.reason == "needs_visual_assistance"
+    assert driver.executed == []
     journal.close()
 
 
