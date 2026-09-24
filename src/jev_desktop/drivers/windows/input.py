@@ -673,8 +673,16 @@ def _focus_window(driver: Any, request: ActionRequest, guard: Any, started: floa
     guard()
     activated = win32.activate_window(handle.hwnd)
     if not activated:
-        # Activation may already have restored, raised, or reordered the window.
-        raise UncertainEffect("window could not be activated; it may have been restored or raised")
+        # Windows refuses SetForegroundWindow to a background process while another application
+        # owns the foreground. No input was sent, so trying again later is safe.
+        raise Pause(
+            Reason.USER_TAKEOVER,
+            {
+                "reason": "Windows kept another window in the foreground; no input was sent",
+                "foreground_process": _foreground_process(),
+                "resumable": True,
+            },
+        )
     return _receipt(
         request,
         DispatchMechanism.NONE,
@@ -682,6 +690,16 @@ def _focus_window(driver: Any, request: ActionRequest, guard: Any, started: floa
         started,
         notes=("window activation, no synthetic input",),
     )
+
+
+def _foreground_process() -> str | None:
+    foreground = win32.foreground_window()
+    if not foreground:
+        return None
+    try:
+        return win32.process_image_path(win32.window_process_id(foreground)).rsplit("\\", 1)[-1]
+    except DriverError:  # elevated or protected processes refuse the query
+        return None
 
 
 def _observed_option(
