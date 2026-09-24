@@ -394,3 +394,126 @@ def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
     for kind, mouse_extra, key_extra in sent:
         extra = mouse_extra if kind == win32.INPUT_MOUSE else key_extra
         assert extra == win32.JEV_INPUT_TAG
+
+
+# --------------------------------------------------------------------------------------
+# Element dispatch against fake UI Automation trees
+# --------------------------------------------------------------------------------------
+
+HWND = 786718
+
+
+class _Uia:
+    """A live UIA element: compared by identity, with a parent link and current properties."""
+
+    def __init__(self, name, parent=None, rect=None, focused=lambda: False, props=None):
+        self.name, self.parent, self._focused, self.props = name, parent, focused, props or {}
+        self.rect = rect or Rect(0, 0, 0, 0)
+
+    def GetCurrentPropertyValue(self, prop):
+        if prop == uia.PROP_BOUNDS:
+            return [self.rect.left, self.rect.top, self.rect.width, self.rect.height]
+        if prop == uia.PROP_ENABLED:
+            return True
+        if prop == uia.PROP_OFFSCREEN:
+            return False
+        if prop == uia.PROP_FOCUSED:
+            return self._focused()
+        return self.props.get(prop)
+
+
+def _uia_worker(element_at_point, **automation):
+    worker = NS(
+        automation=NS(
+            CompareElements=lambda a, b: a is b,
+            RawViewWalker=NS(GetParentElement=lambda element: element.parent),
+            **automation,
+        ),
+        element_at_point=element_at_point,
+    )
+    worker.submit = lambda fn, **_: fn(worker)
+    return worker
+
+
+def _element_handle(element, element_id, role, operations):
+    return NS(
+        element=element,
+        element_id=element_id,
+        role=role,
+        operations=operations,
+        rect=element.rect,
+        hwnd=HWND,
+        name=element.name,
+        visible=True,
+        snapshot_id="snap",
+    )
+
+
+def _element_request(operation, element_id, **extra):
+    return NS(
+        operation=operation,
+        point=None,
+        element_id=element_id,
+        snapshot_id="snap",
+        mode=InputMode.USER_PATH,
+        text=None,
+        option_label=None,
+        replace_existing=True,
+        deadline_s=1.0,
+        action_id="act",
+        window_ref="win",
+        **extra,
+    )
+
+
+@pytest.fixture
+def desktop(monkeypatch, no_send_input):
+    """An enabled foreground window. Returns the points clicked; typing fails the test."""
+    monkeypatch.setattr(win32.user32, "IsWindow", lambda _h: True)
+    monkeypatch.setattr(win32.user32, "IsWindowEnabled", lambda _h: True)
+    monkeypatch.setattr(win32, "root_window", lambda hwnd: hwnd)
+    monkeypatch.setattr(win32, "foreground_window", lambda: HWND)
+    monkeypatch.setattr(win32, "virtual_screen", lambda: Rect(0, 0, 2560, 1440))
+    monkeypatch.setattr(win32, "cursor_position", lambda: (0, 0))
+    monkeypatch.setattr(win32, "set_cursor_position", lambda *_: None)
+    clicks = []
+    monkeypatch.setattr(win32, "click_at", lambda x, y: clicks.append((x, y)) or 3)
+    monkeypatch.setattr(win32, "type_unicode", lambda _text: pytest.fail("text was typed"))
+    monkeypatch.setattr(win32, "key_chord", lambda _codes: 2)
+    monkeypatch.setattr(native_input.time, "sleep", lambda _s: None)
+    return clicks
+
+
+@pytest.mark.parametrize(("nc_hit", "clicked"), [(20, True), (1, False)], ids=["htclose", "htclient"])
+def test_caption_button_click_is_proven_by_the_window_hit_test(monkeypatch, desktop, nc_hit, clicked):
+    # Electron titleBarOverlay: the caption buttons are native views, and a UIA point query over
+    # them resolves into the web document beneath the overlay.
+    window = _Uia("window")
+    frame = _Uia("WinFrameView", window)
+    buttons = _Uia("WinCaptionButtonContainer", frame)
+    close = _Uia("Close", buttons, rect=Rect(1928, 1, 1986, 45), props={uia.PROP_CLASSNAME: "WinCaptionButton"})
+    page = _Uia("header group", _Uia("Document", _Uia("Chrome Legacy Window", frame)))
+    render_widget = 900
+    monkeypatch.setattr(win32, "root_window", lambda hwnd: HWND if hwnd == render_widget else hwnd)
+    monkeypatch.setattr(win32, "window_from_point", lambda x, y: render_widget)
+    queried = []
+
+    def send_message_timeout(hwnd, message, wparam, lparam, flags, timeout_ms, result):
+        queried.append((hwnd, message, lparam))
+        result._obj.value = nc_hit
+        return 1
+
+    monkeypatch.setattr(win32.user32, "SendMessageTimeoutW", send_message_timeout)
+    monkeypatch.setattr(uia, "resolve_element", lambda *_: _element_handle(close, "el:close", "button", ("CLICK",)))
+    driver = NS(worker=_uia_worker(lambda _x, _y: page), registry=None)
+    request = _element_request(Operation.CLICK, "el:close")
+
+    if clicked:
+        receipt = native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert receipt.notes == ("point=1957,23",)
+    else:
+        with pytest.raises(Pause) as paused:
+            native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert paused.value.reason is Reason.STALE_OBSERVATION
+    assert queried == [(HWND, 0x84, (23 << 16) | 1957)]
+    assert desktop == ([(1957, 23)] if clicked else [])
