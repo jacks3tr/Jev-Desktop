@@ -40,6 +40,7 @@ from .contracts import (
     RunResult,
     RunSpec,
     ScopeSpec,
+    UncertainEffect,
     canonical_json,
     keyed_fingerprint,
     new_id,
@@ -306,6 +307,8 @@ class Broker:
             return Envelope.failure(envelope.request_id, "paused", str(exc), {"reason": exc.reason_value, **exc.detail})
         except (ContractError, PolicyError) as exc:
             return Envelope.failure(envelope.request_id, "invalid_request", str(exc))
+        except UncertainEffect as exc:
+            return Envelope.failure(envelope.request_id, Reason.UNCERTAIN_EFFECT.value, str(exc))
         except DriverError as exc:
             return Envelope.failure(envelope.request_id, "driver_error", str(exc))
         except Exception as exc:
