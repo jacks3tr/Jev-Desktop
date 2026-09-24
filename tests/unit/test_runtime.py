@@ -545,7 +545,7 @@ def test_task_checks_completion_after_low_confidence_without_more_input(tmp_path
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise Pause(Reason.LOW_CONFIDENCE, {"selected": "WAIT"})
+            raise Pause(Reason.LOW_CONFIDENCE, {"selected": "WAIT", "operation": "WAIT"})
         if calls == 3:
             assert kwargs["contexts"] == []
         return decide(**kwargs)

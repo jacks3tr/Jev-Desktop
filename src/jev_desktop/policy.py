@@ -412,7 +412,15 @@ def resolve_answers(
         raise Pause(Reason.INVALID_MODEL_RESPONSE, {"detail": "no answers object"})
 
     questions = body["questions"]
-    operation_name = valid_choice(answers.get("operation"), set(questions["operation"]["criteria"]), operation_floor)
+    try:
+        operation_name = valid_choice(
+            answers.get("operation"), set(questions["operation"]["criteria"]), operation_floor
+        )
+    except Pause as pause:
+        # The runtime rechecks doubt about finishing differently from doubt about the next action.
+        if pause.reason is Reason.LOW_CONFIDENCE:
+            pause.detail["operation"] = pause.detail["selected"]
+        raise
     operation = Operation(operation_name)
     if operation in {Operation.WAIT, Operation.DONE, Operation.ESCALATE}:
         return operation, None, usage
@@ -425,7 +433,12 @@ def resolve_answers(
     question = questions.get(key)
     if question is None:
         raise Pause(Reason.INVALID_MODEL_RESPONSE, {"detail": f"missing target question {key}"})
-    selected = valid_choice(answers.get(key), set(question["criteria"]), target_floor, target_margin)
+    try:
+        selected = valid_choice(answers.get(key), set(question["criteria"]), target_floor, target_margin)
+    except Pause as pause:
+        if pause.reason is Reason.LOW_CONFIDENCE:
+            pause.detail["operation"] = operation.value
+        raise
     if selected == NONE:
         raise Pause(Reason.NO_APPROPRIATE_TARGET, {"operation": operation.value})
     for candidate in context.candidates:
@@ -501,7 +514,9 @@ class JevPolicy:
             return
         attempt["outcome"] = exc.reason_value
         if exc.reason is Reason.LOW_CONFIDENCE:
-            attempt.update({key: exc.detail[key] for key in ("selected", "confidence", "margin") if key in exc.detail})
+            attempt.update(
+                {key: exc.detail[key] for key in ("operation", "selected", "confidence", "margin") if key in exc.detail}
+            )
 
     def confirm_done(self, *, goal: str, state: Mapping[str, Any], deadline: float | None = None) -> bool:
         """Whether the goal's end state is visible, asked without the action history.
