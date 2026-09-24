@@ -666,6 +666,21 @@ def window_from_point(x: int, y: int) -> int:
     return int(user32.WindowFromPoint(POINT(x, y)) or 0)
 
 
+WM_NCHITTEST = 0x0084
+SMTO_ABORTIFHUNG = 0x0002
+
+
+def nc_hit_test(hwnd: int, x: int, y: int, timeout_ms: int = 200) -> int | None:
+    """The window's own WM_NCHITTEST answer at a screen point (a query, not input)."""
+    result = ctypes.c_size_t(0)
+    lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+    if not user32.SendMessageTimeoutW(
+        hwnd, WM_NCHITTEST, 0, lparam, SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result)
+    ):
+        return None
+    return ctypes.c_ssize_t(result.value).value
+
+
 def activate_window(hwnd: int) -> bool:
     """Best-effort activation: restore, attach input queues, then foreground.
 

@@ -204,8 +204,24 @@ def _geometry_ok(cached: Rect, live: Rect, tolerance: int = 4) -> bool:
     )
 
 
+CAPTION_HIT_CODES = {8, 9, 20}  # HTMINBUTTON, HTMAXBUTTON, HTCLOSE
+
+
 def _hit_ok(worker: uia.UiaWorker, handle: uia.ElementHandle, x: int, y: int) -> bool:
-    return uia.hit_is_descendant_or_self(worker, handle, x, y)
+    return uia.hit_is_descendant_or_self(worker, handle, x, y) or _caption_button_hit(worker, handle, x, y)
+
+
+def _caption_button_hit(worker: uia.UiaWorker, handle: uia.ElementHandle, x: int, y: int) -> bool:
+    # Electron titleBarOverlay caption buttons are native views that a UIA point query sees
+    # through to the web page beneath; the top-level window's non-client hit test is what
+    # routes a click there.
+    class_name = worker.submit(lambda _: uia._cached(handle.element, uia.PROP_CLASSNAME), timeout=10.0)
+    if class_name != "WinCaptionButton":
+        return False
+    root = win32.root_window(handle.hwnd)
+    return (
+        win32.root_window(win32.window_from_point(x, y)) == root and win32.nc_hit_test(root, x, y) in CAPTION_HIT_CODES
+    )
 
 
 def require_user_path_ready(
