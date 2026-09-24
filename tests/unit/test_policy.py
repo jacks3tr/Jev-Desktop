@@ -381,6 +381,38 @@ def test_refused_answers_record_the_selected_option_and_its_numbers():
     }
 
 
+@pytest.mark.parametrize(
+    ("operation", "operation_confidence", "target_confidence"),
+    [("WAIT", 0.3, 0.9), ("CLICK", 0.9, 0.4)],
+    ids=["operation-doubted", "target-doubted"],
+)
+def test_low_confidence_names_the_operation_in_doubt(operation, operation_confidence, target_confidence):
+    contexts = [context(Operation.CLICK, 2)]
+    questions = build_questions(goal="g", contexts=contexts, allow_done=True, allow_escalate=True)
+    target = contexts[0].candidates[0].element_id
+    result = fake_response(
+        "jev-1.13.0",
+        {
+            "operation": choice_answer(
+                operation, list(questions["operation"]["criteria"]), confidence=operation_confidence
+            ),
+            "CLICK_target": choice_answer(
+                target, list(questions["CLICK_target"]["criteria"]), confidence=target_confidence
+            ),
+        },
+    )
+    with pytest.raises(Pause) as paused:
+        resolve_answers(
+            result,
+            {"model": "jev-1.13.0", "questions": questions},
+            operation_floor=0.35,
+            target_floor=0.45,
+            contexts=contexts,
+        )
+    assert paused.value.reason is Reason.LOW_CONFIDENCE
+    assert paused.value.detail["operation"] == operation
+
+
 def test_provider_receives_full_context_without_local_byte_caps():
     from dataclasses import replace
 
