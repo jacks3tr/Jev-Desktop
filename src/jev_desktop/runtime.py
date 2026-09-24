@@ -88,12 +88,7 @@ def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str,
     elements = [e for e in snapshot.elements if e.name or e.value or e.text or e.operations or e.focused]
     truncation = list(snapshot.truncation)
     if query:
-        lowered = query.casefold()
-        elements = [
-            e
-            for e in elements
-            if any(lowered in part.casefold() for part in (e.name, e.value or "", e.text or "", *e.path))
-        ]
+        elements = [e for e in elements if e.matches(query)]
         if len(elements) > limit:
             truncation.append(f"{len(elements)} elements match the query; showing the first {limit}")
     shown = elements[:limit]

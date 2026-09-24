@@ -159,7 +159,7 @@ class FakeDriver:
     def list_windows(self) -> list[WindowInfo]:
         return [self._window()]
 
-    def observe(self, scope: ScopeSpec) -> Snapshot:
+    def observe(self, scope: ScopeSpec, query: str = "") -> Snapshot:
         if self.fail_next == "observe":
             self.fail_next = None
             raise DriverError("observation failed (injected)")

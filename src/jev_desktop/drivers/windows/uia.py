@@ -223,6 +223,10 @@ CHROME_ROLES = {
 # Scan collections after controls, then retain focus and populated content before empty rows.
 ROW_ROLES = {"listitem", "treeitem", "dataitem"}
 CONTAINER_ROLES = {"pane", "group", "custom", "table", "tree", "list", "datagrid"}
+# A query search reads past the unfiltered budgets but must finish well inside the 30 s worker
+# call, which can run two observations; a read-only walk costs about 1.3 ms per node.
+QUERY_NODE_BUDGET = 10_000
+QUERY_SECONDS = 8.0
 
 
 @dataclass
@@ -628,11 +632,16 @@ def observe(
     text_limit: int,
     include_invisible: bool,
     geometry: Geometry,
+    query: str = "",
 ) -> Snapshot:
-    """Scoped, cached, indexed observation of the approved application."""
+    """Scoped, cached, indexed observation of the approved application.
+
+    With a query, every node is still walked and counted but only matches are retained.
+    """
 
     def _build(_worker: UiaWorker) -> Snapshot:
         started = time.perf_counter()
+        deadline = started + QUERY_SECONDS if query else float("inf")
         previous = registry.current_snapshot.pop(app_ref, None)
         for element_id in registry.snapshots.pop(previous or "", set()):
             registry.elements.pop(element_id, None)
@@ -718,6 +727,8 @@ def observe(
                     content_cap=max_elements,
                     content_seen=0,
                     traversal=[0],
+                    query=query,
+                    deadline=deadline,
                 )
                 focused_elements.extend(focused_chrome + focused_content)
             content_seen = _walk(
@@ -741,6 +752,8 @@ def observe(
                 content_cap=content_cap,
                 content_seen=content_seen,
                 traversal=traversal,
+                query=query,
+                deadline=deadline,
             )
         if not window_infos:
             raise DriverError("every window in scope closed during observation")
@@ -861,16 +874,22 @@ def _walk(
     content_cap: int,
     content_seen: int,
     traversal: list[int],
+    query: str,
+    deadline: float,
 ) -> int:
     stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
     collections: list[tuple[Any, int, tuple[str, ...]]] = []
     collection_phase = False
+    node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
     while stack or collections:
         if not stack:
             stack.append(collections.pop(0))
             collection_phase = True
-        if traversal[0] >= max(64, max_elements * 4):
+        if traversal[0] >= node_budget:
             truncation.append("traversal node budget reached")
+            break
+        if time.perf_counter() >= deadline:
+            truncation.append("query search time limit reached")
             break
         if len(elements) >= max_elements:
             break
@@ -906,7 +925,8 @@ def _walk(
                 stack.append(children)
         else:
             truncation.append(f"depth cap reached ({max_depth})")
-        if role in ROW_ROLES:
+        # A query bounds rows by matches (the content cap below), not by rows walked.
+        if role in ROW_ROLES and not query:
             content_seen += 1
             if content_seen > content_cap:
                 rows_dropped.append(1)
@@ -942,6 +962,35 @@ def _walk(
         native_handle = _cached(element, PROP_NATIVE_HANDLE)
         element_hwnd = int(native_handle) if isinstance(native_handle, int) and native_handle else hwnd
         operations = _operations_for(role, available, editable)
+        text: str | None = None
+        raw = ""
+        if role in TEXT_ROLES or value:
+            raw = value or name
+            text = raw[:text_limit] if text_limit else raw[:0]
+        element_text = (text or None) if (role in TEXT_ROLES or value) else None
+        info = ElementInfo(
+            element_id=element_id,
+            window_ref=window_ref,
+            role=role,
+            name=name,
+            value=None if password else value,
+            enabled=enabled,
+            visible=visible,
+            editable=bool(editable),
+            focusable=focusable,
+            focused=focused,
+            operations=operations,
+            rect=rect,
+            index=registry.next_index,
+            path=path[-4:],
+            state={**state, "password": password},
+            text=None if password else element_text,
+            truncation=None if element_text is None or text is None or len(text) < text_limit else "length",
+        )
+        if query and not info.matches(query):
+            continue
+        if text is not None and len(raw) > len(text):
+            truncation.append(f"text truncated for {role}")
         registry.elements[element_id] = ElementHandle(
             element_id=element_id,
             element=element,
@@ -957,34 +1006,7 @@ def _walk(
             operations=operations,
             created_at=now(),
         )
-        text: str | None = None
-        if role in TEXT_ROLES or value:
-            raw = value or name
-            text = raw[:text_limit] if text_limit else raw[:0]
-            if raw and len(raw) > len(text):
-                truncation.append(f"text truncated for {role}")
-        element_text = (text or None) if (role in TEXT_ROLES or value) else None
-        (elements if role in CHROME_ROLES else pending).append(
-            ElementInfo(
-                element_id=element_id,
-                window_ref=window_ref,
-                role=role,
-                name=name,
-                value=None if password else value,
-                enabled=enabled,
-                visible=visible,
-                editable=bool(editable),
-                focusable=focusable,
-                focused=focused,
-                operations=operations,
-                rect=rect,
-                index=registry.next_index,
-                path=path[-4:],
-                state={**state, "password": password},
-                text=None if password else element_text,
-                truncation=None if element_text is None or text is None or len(text) < text_limit else "length",
-            )
-        )
+        (elements if role in CHROME_ROLES else pending).append(info)
         registry.next_index += 1
         if element_text and len(texts) < 40:
             texts.append({"element_id": element_id, "role": role, "name": name, "text": element_text})

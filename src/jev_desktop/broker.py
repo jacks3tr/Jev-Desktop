@@ -415,7 +415,7 @@ class Broker:
         if query:
             # Match against the widest observation; tree order would otherwise fill the cap with window chrome.
             scope = replace(scope, max_elements=SCOPE_LIMITS["max_elements"])
-        snapshot = self.driver.observe(scope)
+        snapshot = self.driver.observe(scope, query=query)
         include_screenshot = bool(params.get("screenshot", True))
         secrets = self.runtime._secret_values(state) if params.get("run_id") else []
         if secrets:

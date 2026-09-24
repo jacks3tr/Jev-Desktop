@@ -533,6 +533,10 @@ class ElementInfo:
     text: str | None = None
     truncation: str | None = None
 
+    def matches(self, query: str) -> bool:
+        lowered = query.casefold()
+        return any(lowered in part.casefold() for part in (self.name, self.value or "", self.text or "", *self.path))
+
     def to_json(self) -> dict[str, Any]:
         return {
             "element_id": self.element_id,
@@ -1059,7 +1063,7 @@ class Driver(Protocol):
 
     def list_windows(self) -> list[WindowInfo]: ...
 
-    def observe(self, scope: ScopeSpec) -> Snapshot: ...
+    def observe(self, scope: ScopeSpec, query: str = "") -> Snapshot: ...
 
     def capture(
         self,
