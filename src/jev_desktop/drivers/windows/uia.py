@@ -1078,6 +1078,37 @@ def hit_is_descendant_or_self(
     return False
 
 
+def focus_in_controlled(worker: UiaWorker, target: ElementHandle) -> bool:
+    """Whether UIA focus is on the target or inside an element it controls (aria-controls).
+
+    Chromium reports focus on an ARIA combobox's aria-activedescendant option, while DOM focus,
+    and so the keyboard, stays in the combobox input.
+    """
+
+    def check(_worker: UiaWorker) -> bool:
+        automation = worker.automation
+        try:
+            focused = automation.GetFocusedElement()
+            if not focused:
+                return False
+            if automation.CompareElements(focused, target.element):
+                return True
+            listed = target.element.CurrentControllerFor
+            controlled = [listed.GetElement(i) for i in range(listed.Length)] if listed else []
+            current = focused
+            for _ in range(32):
+                if not current or not controlled:
+                    return False
+                if any(automation.CompareElements(current, element) for element in controlled):
+                    return True
+                current = automation.RawViewWalker.GetParentElement(current)
+        except Exception:
+            return False
+        return False
+
+    return bool(worker.submit(check, timeout=10.0))
+
+
 def selection_belongs_to(worker: UiaWorker, option: ElementHandle, container: ElementHandle) -> bool:
     def check(_worker: UiaWorker) -> bool:
         if not _bool(option.element.GetCurrentPropertyValue(AVAILABILITY["selectionitem"])):

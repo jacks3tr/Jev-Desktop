@@ -14,7 +14,7 @@ and the hit target under the intended screen point. Failures before the boundary
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import comtypes
@@ -192,6 +192,14 @@ def live_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
         raise Pause(
             Reason.STALE_OBSERVATION, {"reason": "the target element no longer exists", "element": handle.element_id}
         ) from exc
+
+
+def _typing_state(worker: uia.UiaWorker, handle: uia.ElementHandle) -> LiveState:
+    """Live state whose `focused` also counts UIA focus inside an element the target controls."""
+    state = live_state(worker, handle)
+    if state.focused or not uia.focus_in_controlled(worker, handle):
+        return state
+    return replace(state, focused=True)
 
 
 def _geometry_ok(cached: Rect, live: Rect, tolerance: int = 4) -> bool:
@@ -559,18 +567,18 @@ def execute(
         except DriverError as exc:
             raise UncertainEffect(f"focus click failed: {exc}", mechanism=DispatchMechanism.SEND_INPUT_MOUSE) from exc
         try:
-            focus = live_state(worker, handle)
+            focus = _typing_state(worker, handle)
             focus_deadline = time.monotonic() + min(0.5, max(0.0, request.deadline_s))
             while not focus.focused and time.monotonic() < focus_deadline:
                 guard()
                 time.sleep(0.025)
-                focus = live_state(worker, handle)
+                focus = _typing_state(worker, handle)
             if not focus.focused:
                 raise UncertainEffect(
                     "click was dispatched but the control did not take focus; no text was typed",
                     mechanism=DispatchMechanism.SEND_INPUT_MOUSE,
                 )
-            ready = live_state(worker, handle)
+            ready = _typing_state(worker, handle)
             if not ready.focused or ready.root != ready.foreground_root:
                 raise UncertainEffect(
                     "focus changed after the click; no text was typed",
