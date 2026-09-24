@@ -559,7 +559,7 @@ def execute(
             ) from exc
         finally:
             _restore_cursor(previous, (ox, oy))
-        _verify_selection(worker, handle, request.option_label, DispatchMechanism.SEND_INPUT_MOUSE)
+        _verify_selection(worker, handle, request, guard, started, DispatchMechanism.SEND_INPUT_MOUSE)
         return _receipt(request, DispatchMechanism.SEND_INPUT_MOUSE, inserted, started, notes=select_notes)
 
     if request.operation is Operation.TYPE_TEXT:
@@ -803,7 +803,7 @@ def _select_by_pattern(
         raise UncertainEffect(
             f"selection pattern failed after dispatch boundary: {exc}", mechanism=DispatchMechanism.UIA_PATTERN
         ) from exc
-    _verify_selection(worker, container, request.option_label or "", DispatchMechanism.UIA_PATTERN)
+    _verify_selection(worker, container, request, guard, started, DispatchMechanism.UIA_PATTERN)
     return _receipt(
         request,
         DispatchMechanism.UIA_PATTERN,
@@ -814,13 +814,23 @@ def _select_by_pattern(
 
 
 def _verify_selection(
-    worker: uia.UiaWorker, handle: uia.ElementHandle, label: str, mechanism: DispatchMechanism
+    worker: uia.UiaWorker,
+    handle: uia.ElementHandle,
+    request: ActionRequest,
+    guard: Any,
+    started: float,
+    mechanism: DispatchMechanism,
 ) -> None:
+    # Web selects commit asynchronously, so the first read can still hold the previous value.
+    expected = (request.option_label or "").strip().lower()
+    deadline = time.monotonic() + max(0.0, request.deadline_s - (time.time() - started))
     value = _live_value(worker, handle)
-    if value is None:
-        return
-    if label.strip().lower() != value.strip().lower():
-        raise UncertainEffect("selection was dispatched but the observed value does not match", mechanism=mechanism)
+    while value is not None and value.strip().lower() != expected:
+        if time.monotonic() >= deadline:
+            raise UncertainEffect("selection was dispatched but the observed value does not match", mechanism=mechanism)
+        guard()
+        time.sleep(0.01)
+        value = _live_value(worker, handle)
 
 
 def _live_value(worker: uia.UiaWorker, handle: uia.ElementHandle) -> str | None:
