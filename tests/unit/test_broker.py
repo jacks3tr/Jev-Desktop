@@ -18,6 +18,7 @@ from jev_desktop.broker import Broker, BrokerConfig, fit_frame
 from jev_desktop.client import BrokerClient, BrokerError
 from jev_desktop.contracts import Envelope, Limits, Operation, new_id
 from jev_desktop.ipc import MAX_MESSAGE_BYTES, PipeClient, PipeServer
+from jev_desktop.journal import DispatchJournal
 from jev_desktop.policy import PolicyConfig
 
 from .fakes import FakeApp, FakeDriver, FakeElement, ScriptedDecision, ScriptedPolicy
@@ -327,6 +328,48 @@ def test_uncertain_direct_action_reports_uncertain_effect_and_consumes_the_inspe
         _act(client, observed, "FOCUS_WINDOW")
     assert used.value.code == "invalid_request"
     assert len(driver.executed) == 1
+
+
+def _journal_health_after_restart(config: BrokerConfig, app: FakeApp) -> dict:
+    pipe = f"\\\\.\\pipe\\jev-test-{uuid.uuid4().hex[:12]}"
+    broker = Broker(config, driver=FakeDriver(app, evidence_dir=config.evidence_dir))
+    broker.start()
+    server = PipeServer(name=pipe, handler=broker.handle, on_disconnect=broker.on_disconnect)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    client = BrokerClient(pipe=pipe, client_name="restarted", autostart=False, timeout_s=30.0)
+    try:
+        return client.call("health")["journal"]
+    finally:
+        client.close()
+        server.stop()
+        broker.close()
+
+
+def test_restart_recovers_only_actions_left_mid_dispatch(broker_env):
+    client = broker_env["make"]()
+    broker = broker_env["broker"]
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+    broker_env["driver"].fail_next = "uncertain"
+    with pytest.raises(BrokerError):
+        _act(client, observed, "CLICK", "Save")
+    (settled,) = [row[0] for row in broker.journal._db.execute("SELECT action_id FROM effects")]
+    interrupted = "act:" + "c" * 24
+    # A broker that died between recording intent and settling the outcome leaves this row.
+    broker.journal._db.execute(
+        "INSERT INTO effects VALUES (?, 'h', NULL, 'dispatching', NULL, NULL, 1.0, 1.0)", (interrupted,)
+    )
+    client.close()
+    broker_env["server"].stop()
+    broker.close()
+
+    assert _journal_health_after_restart(broker.config, broker_env["app"])["recovered_uncertain"] == [interrupted]
+    assert _journal_health_after_restart(broker.config, broker_env["app"])["recovered_uncertain"] == []
+    journal = DispatchJournal(str(broker.config.journal_path))
+    try:
+        assert journal.lookup(settled).note == "uncertain: injected partial dispatch"
+        assert journal.lookup(interrupted).note == "recovered after broker restart"
+    finally:
+        journal.close()
 
 
 def test_physical_input_during_a_refused_action_consumes_the_inspection(broker_env, monkeypatch):
