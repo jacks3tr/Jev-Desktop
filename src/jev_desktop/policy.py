@@ -378,17 +378,13 @@ def valid_choice(answer: Any, options: set[str], floor: float, margin: float = 0
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         raise Pause(Reason.INVALID_MODEL_RESPONSE, {"detail": "confidence is not a probability"})
     confidence_value = float(confidence)
-    if confidence_value < floor:
-        raise Pause(
-            Reason.LOW_CONFIDENCE,
-            {"selected": selected, "confidence": confidence_value, "floor": floor},
-        )
     runner_up = max((value for option, value in probabilities.items() if option != selected), default=0.0)
-    if probabilities[selected] - runner_up + 1e-9 < margin:
-        raise Pause(
-            Reason.LOW_CONFIDENCE,
-            {"selected": selected, "margin": round(probabilities[selected] - runner_up, 4), "required": margin},
-        )
+    lead = probabilities[selected] - runner_up
+    refused = {"selected": selected, "confidence": confidence_value, "margin": round(lead, 4)}
+    if confidence_value < floor:
+        raise Pause(Reason.LOW_CONFIDENCE, {**refused, "floor": floor})
+    if lead + 1e-9 < margin:
+        raise Pause(Reason.LOW_CONFIDENCE, {**refused, "required": margin})
     return selected
 
 
@@ -491,11 +487,21 @@ class JevPolicy:
                 self.last_attempts[-1]["outcome"] = "accepted"
             return result
         except (Pause, PolicyError) as exc:
-            if self.last_attempts:
-                self.last_attempts[-1]["outcome"] = exc.reason_value if isinstance(exc, Pause) else "provider_error"
+            self._record_refusal(exc)
             raise
         finally:
             self.last_latency_ms = int((time.perf_counter() - started) * 1000)
+
+    def _record_refusal(self, exc: Pause | PolicyError) -> None:
+        if not self.last_attempts:
+            return
+        attempt = self.last_attempts[-1]
+        if not isinstance(exc, Pause):
+            attempt["outcome"] = "provider_error"
+            return
+        attempt["outcome"] = exc.reason_value
+        if exc.reason is Reason.LOW_CONFIDENCE:
+            attempt.update({key: exc.detail[key] for key in ("selected", "confidence", "margin") if key in exc.detail})
 
     def confirm_done(self, *, goal: str, state: Mapping[str, Any], deadline: float | None = None) -> bool:
         """Whether the goal's end state is visible, asked without the action history.
@@ -536,8 +542,7 @@ class JevPolicy:
             self.resolved_models.append(str(result["model"]))
             return confirmed
         except (Pause, PolicyError) as exc:
-            if self.last_attempts:
-                self.last_attempts[-1]["outcome"] = exc.reason_value if isinstance(exc, Pause) else "provider_error"
+            self._record_refusal(exc)
             raise
         finally:
             self.last_latency_ms = int((time.perf_counter() - started) * 1000)
