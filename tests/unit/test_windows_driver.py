@@ -21,6 +21,7 @@ from jev_desktop.contracts import (
     Reason,
     Rect,
     ScreenshotPoint,
+    UncertainEffect,
 )
 from jev_desktop.drivers import windows as windows_driver
 from jev_desktop.drivers.windows import capture, identity, uia, win32
@@ -449,20 +450,19 @@ def _element_handle(element, element_id, role, operations):
     )
 
 
-def _element_request(operation, element_id, **extra):
+def _element_request(operation, element_id, text=None, option_label=None):
     return NS(
         operation=operation,
         point=None,
         element_id=element_id,
         snapshot_id="snap",
         mode=InputMode.USER_PATH,
-        text=None,
-        option_label=None,
+        text=text,
+        option_label=option_label,
         replace_existing=True,
         deadline_s=1.0,
         action_id="act",
         window_ref="win",
-        **extra,
     )
 
 
@@ -517,3 +517,38 @@ def test_caption_button_click_is_proven_by_the_window_hit_test(monkeypatch, desk
         assert paused.value.reason is Reason.STALE_OBSERVATION
     assert queried == [(HWND, 0x84, (23 << 16) | 1957)]
     assert desktop == ([(1957, 23)] if clicked else [])
+
+
+@pytest.mark.parametrize("controls_list", [True, False], ids=["aria-controls", "unrelated-focus"])
+def test_combobox_types_while_focus_reports_its_active_option(monkeypatch, desktop, controls_list):
+    # Chromium reports UIA focus on a combobox's aria-activedescendant option, while DOM focus,
+    # and the keys, stay in the input.
+    dialog = _Uia("Command palette")
+    field = _Uia("Command palette search", dialog, rect=Rect(700, 200, 1200, 240))
+    results = _Uia("Commands and search results", dialog)
+    option = _Uia("New agent", results, rect=Rect(700, 260, 1200, 290))
+    controlled = [results] if controls_list else []
+    field.CurrentControllerFor = NS(Length=len(controlled), GetElement=controlled.__getitem__)
+    typed = []
+
+    def type_unicode(text):
+        typed.append(text)
+        field.props[uia.PROP_VALUE] = text
+        return 2 * len(text)
+
+    monkeypatch.setattr(win32, "type_unicode", type_unicode)
+    monkeypatch.setattr(
+        uia, "resolve_element", lambda *_: _element_handle(field, "el:field", "combobox", ("TYPE_TEXT",))
+    )
+    driver = NS(worker=_uia_worker(lambda _x, _y: field, GetFocusedElement=lambda: option), registry=None)
+    request = _element_request(Operation.TYPE_TEXT, "el:field", text="UI Navigator")
+
+    if controls_list:
+        receipt = native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert receipt.mechanism.value == "send_input_keyboard"
+        assert typed == ["UI Navigator"]
+    else:
+        with pytest.raises(UncertainEffect, match="did not take focus"):
+            native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+        assert typed == []
+    assert desktop == [(950, 220)]
