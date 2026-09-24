@@ -325,6 +325,62 @@ def test_rejected_answer_retains_usage_and_provider_errors_are_sanitized():
     assert "test-key" not in str(failure.value)
 
 
+def test_refused_answers_record_the_selected_option_and_its_numbers():
+    def refused(attempt):
+        return {key: attempt.get(key) for key in ("outcome", "selected", "confidence", "margin")}
+
+    class Transport:
+        def __init__(self, answers):
+            self.answers = answers
+
+        def post_json(self, url, *, headers, payload, timeout_s):
+            return 200, fake_response("jev-1.13.0", self.answers)
+
+    below_floor = {
+        "type": "choice",
+        "choice": "WAIT",
+        "probabilities": {"WAIT": 0.34, "DONE": 0.33, "ESCALATE": 0.33},
+        "confidence": 0.2,
+    }
+    policy = JevPolicy(transport=Transport({"operation": below_floor}), api_key="test-key")
+    with pytest.raises(Pause):
+        policy.decide(goal="g", state={}, contexts=[], allow_done=True)
+    assert refused(policy.last_attempts[-1]) == {
+        "outcome": "low_confidence",
+        "selected": "WAIT",
+        "confidence": 0.2,
+        "margin": 0.01,
+    }
+
+    near_tie = {
+        "type": "choice",
+        "choice": "t1",
+        "probabilities": {"t1": 0.46, "t2": 0.44, NONE: 0.1},
+        "confidence": 0.46,
+    }
+    policy.transport = Transport(
+        {"operation": choice_answer("CLICK", ["CLICK", "WAIT", "DONE", "ESCALATE"]), "CLICK_target": near_tie}
+    )
+    with pytest.raises(Pause):
+        policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 2)], allow_done=True)
+    assert refused(policy.last_attempts[-1]) == {
+        "outcome": "low_confidence",
+        "selected": "t1",
+        "confidence": 0.46,
+        "margin": 0.02,
+    }
+
+    policy.transport = Transport({"done": choice_answer("YES", ["YES", "NO"], confidence=0.55)})
+    with pytest.raises(Pause):
+        policy.confirm_done(goal="g", state={"elements": []})
+    assert refused(policy.last_attempts[-1]) == {
+        "outcome": "low_confidence",
+        "selected": "YES",
+        "confidence": 0.55,
+        "margin": 0.1,
+    }
+
+
 def test_provider_receives_full_context_without_local_byte_caps():
     from dataclasses import replace
 
