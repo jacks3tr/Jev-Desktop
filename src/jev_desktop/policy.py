@@ -725,6 +725,8 @@ def decision_state(state: Mapping[str, Any], aliases: Mapping[str, str]) -> dict
     observed = set()
     controls = []
     windows: dict[str, str] = {}
+    # The operation question otherwise cannot tell which controls an operation would reach.
+    offered = set(state.get("permitted_operations") or ())
     for element in elements:
         if not isinstance(element, Mapping) or "element_id" not in element:
             controls.append(element)
@@ -742,6 +744,10 @@ def decision_state(state: Mapping[str, Any], aliases: Mapping[str, str]) -> dict
         if element.get("window_ref"):
             ref = str(element["window_ref"])
             control["window"] = windows.setdefault(ref, f"window{len(windows) + 1}")
+        if element.get("enabled") is not False and element.get("visible") is not False:
+            supported = [operation for operation in element.get("operations") or () if operation in offered]
+            if supported:
+                control["operations"] = supported
         controls.append(control)
     payload["elements"] = controls
     application = state.get("application")
