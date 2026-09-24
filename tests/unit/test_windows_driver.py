@@ -336,6 +336,30 @@ def test_unreadable_cursor_is_left_alone(monkeypatch):
     native_input._restore_cursor((1, 2), (3, 4))
 
 
+def test_refused_activation_pauses_resumably_naming_the_foreground_app(monkeypatch, no_send_input):
+    target, other = 101, 202
+    monkeypatch.setattr(win32.user32, "IsWindow", lambda _h: True)
+    monkeypatch.setattr(win32.user32, "IsWindowEnabled", lambda _h: True)
+    monkeypatch.setattr(win32, "activate_window", lambda _h: False)
+    monkeypatch.setattr(win32, "foreground_window", lambda: other)
+    monkeypatch.setattr(win32, "window_process_id", lambda hwnd: {other: 4242}[hwnd])
+    monkeypatch.setattr(win32, "process_image_path", lambda pid: {4242: r"C:\Windows\ApplicationFrameHost.exe"}[pid])
+    driver = NS(worker=None, registry=NS(windows={"win:1": NS(hwnd=target)}))
+    request = NS(operation=Operation.FOCUS_WINDOW, window_ref="win:1", action_id="act", element_id=None)
+    guarded = []
+
+    with pytest.raises(Pause) as paused:
+        native_input.execute(driver, request, lambda: guarded.append(True), NS(app_ref="app"))
+
+    assert guarded == [True]
+    assert paused.value.reason is Reason.USER_TAKEOVER
+    assert paused.value.detail == {
+        "reason": "Windows kept another window in the foreground; no input was sent",
+        "foreground_process": "ApplicationFrameHost.exe",
+        "resumable": True,
+    }
+
+
 def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
     sent = []
 
