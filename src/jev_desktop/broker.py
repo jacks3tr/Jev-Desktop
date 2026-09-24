@@ -27,6 +27,7 @@ from .contracts import (
     ActionRequest,
     AuthorizationError,
     ContractError,
+    DispatchState,
     DriverError,
     EmergencyStop,
     Envelope,
@@ -634,7 +635,7 @@ class Broker:
         snapshot_id = str(payload.get("snapshot_id") or "")
         observation = self._observations.get(snapshot_id)
         if observation is None:
-            raise ContractError("inspect the application before each action")
+            raise ContractError("the inspection is unknown or already used; inspect the application again")
         scope, token, action_run_id = observation
         if params.get("access_token") != token:
             raise AuthorizationError("action requires the inspection access_token")
@@ -722,13 +723,25 @@ class Broker:
             )
             # Consume before dispatch, including uncertain outcomes. A new request must inspect again.
             self._observations.pop(snapshot_id)
-            receipt = self.journal.dispatch_once(
-                action_id=request.action_id,
-                request_hash=request.request_hash,
-                run_id=action_run_id,
-                guard=guard,
-                send=lambda: self.driver.execute(request, guard, snapshot),
-            )
+            try:
+                receipt = self.journal.dispatch_once(
+                    action_id=request.action_id,
+                    request_hash=request.request_hash,
+                    run_id=action_run_id,
+                    guard=guard,
+                    send=lambda: self.driver.execute(request, guard, snapshot),
+                )
+            except Exception as exc:
+                # Nothing was sent and the screen is as inspected, so the caller may still recover from it.
+                record = self.journal.lookup(request.action_id)
+                if (
+                    not isinstance(exc, EmergencyStop)
+                    and record is not None
+                    and record.state is DispatchState.NOT_DISPATCHED
+                    and self.runtime._human_epoch() == epoch
+                ):
+                    self._observations[snapshot_id] = observation
+                raise
             return {"receipt": receipt.to_json(), "app_ref": scope.app_ref, "needs_inspection": True}
         finally:
             if hasattr(self.driver, "set_boundary"):
