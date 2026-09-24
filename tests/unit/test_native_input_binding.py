@@ -35,7 +35,7 @@ def test_same_label_option_must_belong_to_selected_container(monkeypatch):
     monkeypatch.setattr(native_input, "live_state", lambda *_: state)
     monkeypatch.setattr(native_input, "_hit_ok", lambda *_: True)
     result = native_input._observed_option(driver, NS(elements=elements), NS(element=container), "Yes")
-    assert result[0] == "right-list"
+    assert result[0] is handles["right-list"]
 
 
 def test_discarded_target_is_a_stale_observation_not_a_driver_error():
