@@ -76,11 +76,13 @@ Do not translate a routine goal into individual `desktop_act` calls or a test sp
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
 `completion: model_reported` means Jev chose DONE and a separate check of the final
 observation, made without the action history, confirmed the goal is visible. When that check
-is unsure, the task pauses with `needs_visual_assistance` instead; a `low_confidence` entry in
-its detail means Jev itself doubted finishing. A `low_confidence` pause comes only after Jev
-observed again and was still unsure; its detail names the doubted `operation` and the numbers. Neither is an independent
-verification: check the returned observation before reporting success, and never turn an
-uncertain or budget-limited result into a success claim.
+says no, or is still unsure after Jev observes once more, the task pauses with
+`needs_visual_assistance` instead. A `low_confidence` entry in its detail holds the doubted
+answer: `selected` YES or NO from that check, or an `operation` when Jev doubted finishing. A
+`low_confidence` pause comes only after Jev observed again and was still unsure; its detail
+names the doubted `operation` and the numbers. Neither is an independent verification: check
+the returned observation before reporting success, and never turn an uncertain or
+budget-limited result into a success claim.
 
 ## 4. Act directly when needed
 

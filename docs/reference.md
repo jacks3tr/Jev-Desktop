@@ -43,8 +43,10 @@ counts include provider-reported usage from accepted and rejected responses.
 `model_latency_ms` includes rejected calls and retries; `elapsed_seconds` includes observation, input,
 and waits. No dollar estimate is inferred. Completion is model-reported and must be checked
 against the returned observation. A fresh observation is taken before accepting DONE, and a
-separate question asks whether the goal's end state is visible in it without the action history;
-anything short of a confident yes pauses with `needs_visual_assistance`.
+separate question asks whether the goal's end state is visible in it without the action history.
+A confident no pauses with `needs_visual_assistance`. An unsure answer gets one more look: the
+broker waits briefly, observes again, and asks about completion once more; if that is still
+unsure, the pause carries the check's own answer (`selected` YES or NO) under `low_confidence`.
 After a low-confidence decision following input, the broker waits briefly, observes again, and
 decides once more. Actions stay available unless the doubted answer was DONE or WAIT; then the
 recheck asks only about completion, cannot send input, and a `needs_visual_assistance` pause
