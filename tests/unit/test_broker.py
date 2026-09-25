@@ -42,6 +42,14 @@ def test_config_timeout_load_and_save(tmp_path: Path):
     assert BrokerConfig.load(path).policy.timeout_s == 12.5
 
 
+def test_config_round_trips_every_policy_setting(tmp_path: Path):
+    path = tmp_path / "config.json"
+    config = BrokerConfig(home=tmp_path)
+    config.policy = PolicyConfig(completion_floor=0.75, operation_floor=0.4, timeout_s=9.0, max_retries=1)
+    config.save(path)
+    assert BrokerConfig.load(path).policy == config.policy
+
+
 def spec_payload(*, goal: str = "regression: save the document") -> dict:
     return {
         "goal": goal,
