@@ -12,7 +12,7 @@ Run CLI `inspect` or call MCP `desktop_inspect`. Use returned references to insp
 
 ## Driving it with CLI/MCP
 
-Run `python .cursor/skills/verify-jev-desktop/scripts/smoke.py`. It launches the real broker and executes `doctor`, `inspect --no-screenshot`, and `inspect --query jev-no-match-<run UUID> --no-screenshot`. Proof: at least one window, every window belongs to a returned application, and the unique unmatched query returns empty app/window lists. The helper supplies the actual UUID, no manual substitution is needed.
+Run `python .claude/skills/verify-jev-desktop/scripts/smoke.py`. It launches the real broker and executes `doctor`, `inspect --no-screenshot`, and `inspect --query jev-no-match-<run UUID> --no-screenshot`. Proof: at least one window, every window belongs to a returned application, and the unique unmatched query returns empty app/window lists. The helper supplies the actual UUID, no manual substitution is needed.
 
 For scoped coverage, run `python -m jev_desktop.transports.cli --no-autostart inspect --query Calculator --no-screenshot` against a disposable Calculator. Copy the returned `app_ref` and `window_ref` into `inspect --app-ref $appRef --window $windowRef --no-screenshot`. Assert the returned window matches and inspect `elements`, `coverage`, and `truncation`. Repeat with screenshot enabled if changing capture behavior. MCP equivalents are `desktop_inspect(query="Calculator", screenshot=false)` followed by `desktop_inspect(app_ref=..., window_refs=[...], screenshot=false)` using actual returned values.
 
