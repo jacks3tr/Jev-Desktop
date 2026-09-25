@@ -41,7 +41,20 @@ This performs a diagnostic handshake without launching an absent broker or injec
 
 ## Drive
 
-Run the helper above for discovery plus an empty query result through real CLI commands. It records commands, stdout, stderr, and exit codes. Use [discovery](features/discovery.md), [direct input](features/direct-input.md), [tasks](features/tasks.md), and [recovery](features/recovery.md) for targeted behavior.
+Run the helper above for discovery plus an empty query result through real CLI commands. It records commands, stdout, stderr, and exit codes.
+
+For live input, run your own broker on a unique pipe with its own journal, so a shared default broker and its runs stay untouched, and launch a Notepad you own:
+
+```powershell
+$id = [guid]::NewGuid().ToString('N'); $R = ".artifacts/verification/live-$id"; New-Item -ItemType Directory -Force $R | Out-Null
+@{ home = (Resolve-Path $R).Path + '\home' } | ConvertTo-Json | Set-Content "$R/config.json"
+$PIPE = "\\.\pipe\jev-verify-$id"
+# In a separate background process: $env:JEV_DESKTOP_PIPE = $PIPE; python -m jev_desktop.transports.cli broker --config "$R/config.json"
+function jev { python -m jev_desktop.transports.cli --pipe $PIPE --no-autostart @args }
+Set-Content "$R/scratch.txt" ''; $np = Start-Process notepad.exe "`"$((Resolve-Path $R).Path)\scratch.txt`"" -PassThru
+```
+
+Doctor it with `jev --timeout 20 doctor` and check `broker.health.pid` is the new process. Batch each feature's drive (inspect, act, reinspect, assert) into one script. PowerShell variable names ignore case, so don't reuse `$PIPE`'s letters for results, and never name a helper `Cli`, which is an alias for `Clear-Item`. At teardown stop `$np.Id` and your broker's PID only. Use [discovery](features/discovery.md), [direct input](features/direct-input.md), [tasks](features/tasks.md), and [recovery](features/recovery.md) for targeted behavior.
 
 For MCP, launch `python -m jev_desktop.transports.mcp_stdio` from an MCP client configured with this checkout's environment. Use `desktop_inspect`, `desktop_act`, `desktop_run`, and `desktop_stop` as mapped. CLI proof alone does not prove MCP serialization; include the MCP entry point when modifying that transport. `tests/unit/test_mcp_transport.py` provides complementary transport coverage with doubles.
 

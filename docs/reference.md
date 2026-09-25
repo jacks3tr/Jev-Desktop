@@ -303,8 +303,8 @@ Use a process-bound runtime build marker for interpreter-hosted apps. Package-fa
 require the bound process to belong to the family and `expect_sha256` to identify its build.
 
 CLI status, stop, inspection of a run, and evidence fetch accept `--resume-token` when used
-from a new connection. For inspection-only evidence, pass its returned `access_token` as that
-argument. Secret fixture values stay in memory; screenshots are withheld when they are present.
+from a new connection. For inspection-only evidence, pass the screenshot's own
+`screenshot.access_token` as that argument; the inspection's top-level `access_token` is refused. Secret fixture values stay in memory; screenshots are withheld when they are present.
 
 ## Runtime
 
