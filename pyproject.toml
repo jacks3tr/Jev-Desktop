@@ -1,6 +1,6 @@
 [project]
 name = "jev-desktop"
-version = "0.3.1"
+version = "0.3.2"
 description = "Use Windows applications through MCP and the command line with Jev Desktop."
 readme = "README.md"
 license = "MIT"
