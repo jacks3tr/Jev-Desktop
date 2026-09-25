@@ -30,10 +30,10 @@ python -m pytest tests/unit/test_broker.py::test_name -q   # single test
   app tests live under `tests/windows/test_jev_real_apps.py`. `live` tests perform real input
   and are gated behind `JEV_DESKTOP_LIVE=1` — never run unattended (`addopts = "-m 'not live'"`
   in `pyproject.toml` excludes them by default).
-- `python .cursor/skills/verify-jev-desktop/scripts/smoke.py` — self-cleaning discovery smoke
+- `python .claude/skills/verify-jev-desktop/scripts/smoke.py` — self-cleaning discovery smoke
   check: hosts a real `Broker` + Windows driver with temp journal/evidence storage and a UUID
   pipe, drives it through real CLI subprocesses, and asserts a doctor handshake. No key needed,
-  injects no input. See `.cursor/skills/verify-jev-desktop/SKILL.md` and its `features/*.md`
+  injects no input. See `.claude/skills/verify-jev-desktop/SKILL.md` and its `features/*.md`
   for targeted coverage (discovery, direct input, tasks, recovery) when verifying a change by hand.
 - `JEV_DESKTOP_RECORD=<dir>` makes the broker record Jev request/response bodies;
   `python scripts/export_decisions.py <labeled.json> <recordings...>` turns them into rows to
@@ -42,9 +42,6 @@ python -m pytest tests/unit/test_broker.py::test_name -q   # single test
 - CI (`.github/workflows/ci.yml`) runs on `windows-latest` for Python 3.12/3.13: ruff
   format/check + mypy (3.12 only) + `pytest tests/unit -q`, plus a separate Linux packaging job
   (`python -m build` + `twine check`).
-- Releases: follow `.claude/skills/release-jev-desktop/SKILL.md` (version bump in four places,
-  PR, tag, publish, update the local Claude Code plugin), and add what you had to look up to
-  its Tips.
 - `.artifacts/` is ignored scratch/local-record storage (verification transcripts, decision
   logs, private application content) — never commit anything from it.
 

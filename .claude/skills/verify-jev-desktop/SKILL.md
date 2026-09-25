@@ -14,7 +14,7 @@ Requires Windows with an interactive desktop and Python 3.12+. Use the checkout'
 ```powershell
 $env:PYTHONIOENCODING = 'utf-8'
 python -m pip install -e ".[dev]"
-python .cursor/skills/verify-jev-desktop/scripts/smoke.py
+python .claude/skills/verify-jev-desktop/scripts/smoke.py
 ```
 
 The helper hosts a real `Broker` and Windows driver with temporary journal storage, a UUID pipe, and CLI subprocesses pinned to this checkout through `PYTHONPATH`. A successful doctor handshake is readiness. It shuts down in `finally`, including failed drives. The helper sets UTF-8 for captured CLI output because Unicode window titles can fail under Windows cp1252. It wakes the listener with one final pipe connection after `stop()`, because `stop()` alone does not unblock `ConnectNamedPipe`. No key is required for this smoke check. The helper makes no policy calls and injects no input.
@@ -59,7 +59,7 @@ The helper stops and joins only its own pipe server, closes its broker/driver, r
 
 ## Helpers
 
-`python .cursor/skills/verify-jev-desktop/scripts/smoke.py` is the executable, self-cleaning discovery workflow; it needs no arguments. It fails if no interactive windows exist, since an empty desktop cannot prove positive discovery. It never launches a visible application.
+`python .claude/skills/verify-jev-desktop/scripts/smoke.py` is the executable, self-cleaning discovery workflow; it needs no arguments. It fails if no interactive windows exist, since an empty desktop cannot prove positive discovery. It never launches a visible application.
 
 For supporting code checks use the repository commands (`ruff format --check`, `ruff check`, `mypy`, and `pytest tests/unit -q`). Existing opt-in real Notepad tests are described in the task map. Maintain this skill with `/maintain-verification-skill` when commands or behavior change.
 
