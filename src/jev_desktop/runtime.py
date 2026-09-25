@@ -846,7 +846,21 @@ class Runtime:
                 except Pause as pause:
                     if pause.reason is not Reason.LOW_CONFIDENCE:
                         raise
-                    confirmed = False
+                    if doubt is not None:
+                        return self._pause(
+                            state,
+                            Reason.NEEDS_VISUAL_ASSISTANCE.value,
+                            {
+                                "detail": "completion could not be established; inspect the final window",
+                                "low_confidence": pause.detail,
+                            },
+                        )
+                    # A result still rendering reads as doubt; observe once more before pausing.
+                    doubt = pause
+                    completion_probe = True
+                    self.config.sleeper(min(1.0, max(0.0, state.slice_deadline - self.config.clock())))
+                    snapshot = self._observe(state, completion=True)
+                    continue
                 finally:
                     if isinstance(self.policy, JevPolicy):
                         self._record_model_attempts(state)

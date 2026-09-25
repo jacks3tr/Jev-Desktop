@@ -658,6 +658,29 @@ def test_task_completion_doubt_probe_keeps_the_low_confidence_detail(tmp_path):
     journal.close()
 
 
+@pytest.mark.parametrize("settles", [True, False], ids=["recheck-confirms", "doubt-persists"])
+def test_task_unsure_completion_check_observes_again_and_reports_its_answer(tmp_path, settles):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("CLICK", 0.9), "CLICK_target": ("Save", 0.9)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.55)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9) if settles else ("YES", 0.58)},
+    )
+    assert set(transport.sent[3]["questions"]["operation"]["criteria"]) == {"WAIT", "DONE", "ESCALATE"}
+    assert len(driver.executed) == 1
+    if settles:
+        assert result.execution is Execution.COMPLETED
+    else:
+        assert result.reason == "needs_visual_assistance"
+        assert dict(result.detail) == {
+            "detail": "completion could not be established; inspect the final window",
+            "low_confidence": {"selected": "YES", "confidence": 0.58, "margin": 0.16, "floor": 0.6},
+        }
+    journal.close()
+
+
 SIDEBAR_ELEMENTS = [
     FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
     FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),
