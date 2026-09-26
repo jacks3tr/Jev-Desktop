@@ -86,6 +86,11 @@ def _element_signature(element: Mapping[str, Any]) -> str:
     return digest([element.get(key) for key in ("role", "name", "value", "text", "path")])[:16]
 
 
+def _control_key(element: Mapping[str, Any]) -> str:
+    """The same control across observations, whatever its state or element ID."""
+    return digest([element.get(key) for key in ("role", "name", "path")])[:16]
+
+
 def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str, Any]:
     """Elements, context, and truncation as callers see them; the model and verification read the snapshot.
 
@@ -578,6 +583,8 @@ class Runtime:
         # Operations whose target answer was NONE, withdrawn until the snapshot changes.
         operations_without_target: set[Operation] = set()
         operations_checked_on = snapshot.snapshot_id
+        # A toggle undoes itself, so the control just toggled is not offered for TOGGLE again.
+        last_toggled: str | None = None
         auto_focused = False
         while True:
             self.ownership.checkpoint(
@@ -602,6 +609,22 @@ class Runtime:
                     {_element_signature(element) for element in observation["elements"]}
                 )
             contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
+            if last_toggled is not None:
+                controls = {element["element_id"]: _control_key(element) for element in observation["elements"]}
+                contexts = [
+                    replace(
+                        context,
+                        candidates=tuple(
+                            candidate
+                            for candidate in context.candidates
+                            if controls.get(candidate.element_id) != last_toggled
+                        ),
+                    )
+                    if context.operation is Operation.TOGGLE
+                    else context
+                    for context in contexts
+                ]
+                contexts = [context for context in contexts if context.candidates]
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             for operation in (Operation.TYPE_TEXT, Operation.SCROLL):
                 base = build_contexts(observation=observation, operations=[operation])
@@ -939,6 +962,18 @@ class Runtime:
             )
             if isinstance(dispatched, RunResult):
                 return dispatched
+            last_toggled = (
+                next(
+                    (
+                        _control_key(element)
+                        for element in observation["elements"]
+                        if element["element_id"] == target.element_id
+                    ),
+                    None,
+                )
+                if decision.operation is Operation.TOGGLE
+                else None
+            )
             snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
             inputs_without_value.clear()
             doubt = None

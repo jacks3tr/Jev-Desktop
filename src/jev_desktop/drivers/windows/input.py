@@ -89,6 +89,7 @@ SUPPORTED_CHORDS = {
     "ctrl+n",
     "ctrl+o",
     "ctrl+f",
+    "ctrl+k",
     "ctrl+l",
     "ctrl+shift+s",
     "ctrl+p",
