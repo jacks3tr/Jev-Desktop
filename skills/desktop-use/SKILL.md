@@ -47,8 +47,8 @@ Call `desktop_run` once with a `task` holding the goal, `app_ref`, and explicit 
 **Goal.** Describe the desired result and how to recognize completion. Jev judges completion
 from the final window's accessibility text and which elements appeared since the task began, so
 name an end state that text shows, such as "stop when the message appears in the conversation
-transcript", not an event such as "once it is sent". Resolve
-missing information before starting; Jev selects supplied values and never generates text.
+transcript", not an event such as "once it is sent". Resolve missing information before
+starting; Jev selects supplied values and never generates text.
 
 Name controls by the exact labels `desktop_inspect` returned, not by position, icon, or
 appearance. Jev never sees the screen and reads the goal literally, so "the hamburger menu in
@@ -81,8 +81,8 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
 
 **Scope and budgets.** A task stays within the supplied windows and cannot launch
 applications. If its only window is not focused, Jev focuses it first. It never uses the
-window's own title-bar buttons; allow `alt+f4` if the goal is to close the window. Defaults are 20
-actions, 40 model decisions, and 60 seconds; a call lasts at most 120 seconds. Set
+window's own title-bar buttons; allow `alt+f4` if the goal is to close the window. Defaults
+are 20 actions, 40 model decisions, and 60 seconds; a call lasts at most 120 seconds. Set
 `max_actions`, `max_model_decisions`, and `timeout_seconds` for the work. Resume a paused task
 with its `run_id` and `resume_token`; the goal, scope, and inputs cannot change, and total
 budgets do not reset.
