@@ -66,22 +66,36 @@ class WindowsDriver:
         self.presence = DesktopPresence()
 
     def start(self) -> None:
-        with self._lock, self._lifecycle:
-            if self._process is not None:
-                if not self._process.is_alive():
-                    raise DriverError("native worker stopped; restart the broker and rebind the application")
-                return
-            context = multiprocessing.get_context("spawn")
-            parent, child = context.Pipe()
-            process = context.Process(
-                target=serve, args=(child, self.evidence_dir, self._pending_inputs, self._pending_count), daemon=True
-            )
-            _start_worker_process(process)
-            self._process = process
-            self._connection = parent
-            child.close()
-        self._call("start")
+        self._ensure_worker()
         self.presence.start()
+
+    def _ensure_worker(self) -> None:
+        """Start a worker, or replace one that exited or was aborted at a deadline.
+
+        References the old worker issued die with it, so callers inspect again.
+        """
+        with self._lifecycle:
+            if self._process is not None and self._process.is_alive():
+                return
+        with self._lock:
+            with self._lifecycle:
+                if self._process is not None and self._process.is_alive():
+                    return
+                if self._connection is not None:
+                    self._connection.close()
+                self._process, self._connection = self._spawn()
+                self._lease_handle = None
+            self._call("start")
+
+    def _spawn(self) -> tuple[Any, Any]:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        process = context.Process(
+            target=serve, args=(child, self.evidence_dir, self._pending_inputs, self._pending_count), daemon=True
+        )
+        _start_worker_process(process)
+        child.close()
+        return process, parent
 
     def close(self) -> None:
         self.abort()
@@ -123,6 +137,7 @@ class WindowsDriver:
 
     def retain_lease(self, handle: int) -> None:
         """Keep the OS lock alive until this worker exits even if its parent crashes."""
+        self._ensure_worker()
         with self._lifecycle:
             if self._process is None or not self._process.is_alive():
                 raise DriverError("cannot lease the desktop without a live native worker")
@@ -157,6 +172,8 @@ class WindowsDriver:
                 deadline = min(deadline, time.monotonic() + args[0].deadline_s)
             if boundary:
                 boundary()
+            if method != "start":
+                self._ensure_worker()
             with self._lifecycle:
                 if self._process is None or not self._process.is_alive():
                     raise DriverError("native worker unavailable; restart broker and inspect again")
