@@ -366,6 +366,10 @@ def test_ctrl_w_is_a_supported_chord():
     assert native_input.parse_chord(["Ctrl", "W"]) == [0x11, 0x57]
 
 
+def test_ctrl_k_is_a_supported_chord():
+    assert native_input.parse_chord(["ctrl", "k"]) == [0x11, 0x4B]
+
+
 def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
     sent = []
 

@@ -709,6 +709,24 @@ SIDEBAR_ELEMENTS = [
 ]
 
 
+def test_task_does_not_toggle_the_control_it_just_toggled(tmp_path):
+    _runtime, driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("TOGGLE", 0.9), "TOGGLE_target": ("Dispatch", 0.9)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+        elements=[
+            FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),
+            FakeElement("button", "Archive", operations=("CLICK",)),
+        ],
+        fixtures={},
+    )
+    assert result.execution is Execution.COMPLETED
+    assert [request.operation for request in driver.executed] == [Operation.TOGGLE]
+    assert "TOGGLE" not in transport.sent[1]["questions"]["operation"]["criteria"], "a second toggle undoes the first"
+    journal.close()
+
+
 def test_task_operation_choice_sees_which_offered_operations_each_control_supports(tmp_path):
     _runtime, _driver, _app, journal, transport, result = task_with_turns(
         tmp_path,
