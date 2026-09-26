@@ -43,8 +43,9 @@ Call `desktop_run` once with a `task` holding the goal, `app_ref`, and explicit 
 ```
 
 **Goal.** Describe the desired result and how to recognize completion. Jev judges completion
-from the final window's accessibility text alone, so name an end state that text shows, such as
-"stop when the message appears in the conversation transcript", not "as a sent message". Resolve
+from the final window's accessibility text and which elements appeared since the task began, so
+name an end state that text shows, such as "stop when the message appears in the conversation
+transcript", not an event such as "once it is sent". Resolve
 missing information before starting; Jev selects supplied values and never generates text.
 
 **Inputs.** Put exact strings in `texts`, named for their destination, such as
