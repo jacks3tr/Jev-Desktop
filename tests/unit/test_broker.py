@@ -439,3 +439,11 @@ def test_task_with_an_expired_app_ref_is_refused_before_a_run_starts(broker_env)
     assert refused.value.code == "invalid_request"
     assert "expired app reference" in refused.value.message
     assert broker_env["broker"].journal.list_runs(limit=5) == []
+
+
+def test_discovery_query_that_matches_nothing_says_how_to_list_windows(broker_env):
+    client = broker_env["make"]()
+    found = client.call("inspect", {"query": "File Explorer", "screenshot": False})
+    assert found["applications"] == [] and found["windows"] == []
+    assert "no window title or executable path contains 'File Explorer'" in found["note"]
+    assert "inspect without query" in found["note"]

@@ -370,6 +370,10 @@ def test_ctrl_k_is_a_supported_chord():
     assert native_input.parse_chord(["ctrl", "k"]) == [0x11, 0x4B]
 
 
+def test_shift_f10_opens_a_context_menu_without_a_right_click():
+    assert native_input.parse_chord(["shift", "f10"]) == [0x10, 0x79]
+
+
 def test_every_input_the_plugin_sends_carries_the_jev_tag(monkeypatch):
     sent = []
 

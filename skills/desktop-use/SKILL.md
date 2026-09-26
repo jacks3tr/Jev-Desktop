@@ -13,11 +13,13 @@ chooses controls, and acts inside the broker without a turn from you per click. 
 ## 1. Find the application and window
 
 Call `desktop_inspect` to discover the intended application and window, and keep the returned
-`app_ref` and `window_ref`. With an `app_ref`, `query` searches the whole window, beyond
-`max_elements`, for elements whose name, value, text, or path contains it, and returns only
-those. A `traversal node budget reached` or `query search time limit reached` note means the
-search stopped early, so an empty result does not prove the control is absent. Returned
-observations omit unnamed rows that offer no action.
+`app_ref` and `window_ref`. Without an `app_ref`, `query` keeps windows whose title or
+executable path contains it, such as `notepad` or a document name; a display name such as
+"File Explorer" may match neither, so inspect without `query` when it finds nothing. With an
+`app_ref`, `query` searches the whole window, beyond `max_elements`, for elements whose name,
+value, text, or path contains it, and returns only those. A `traversal node budget reached` or
+`query search time limit reached` note means the search stopped early, so an empty result does
+not prove the control is absent. Returned observations omit unnamed rows that offer no action.
 
 Jev receives structured accessibility data: control labels, values, focus, selection, and
 recent actions. It never sees screenshots. Read `coverage` and `truncation` before assuming a
@@ -31,7 +33,7 @@ Call `desktop_run` once with a `task` holding the goal, `app_ref`, and explicit 
 ```json
 {
   "task": {
-    "goal": "Open https://example.org through Chrome's address bar and stop when Example Domain loads.",
+    "goal": "Type the supplied url into the 'Address and search bar' and press enter. Stop when the heading 'Example Domain' is shown.",
     "app_ref": "<from inspection>",
     "window_refs": ["<from inspection>"],
     "texts": {"url": "https://example.org"},
@@ -48,6 +50,17 @@ name an end state that text shows, such as "stop when the message appears in the
 transcript", not an event such as "once it is sent". Resolve
 missing information before starting; Jev selects supplied values and never generates text.
 
+Name controls by the exact labels `desktop_inspect` returned, not by position, icon, or
+appearance. Jev never sees the screen and reads the goal literally, so "the hamburger menu in
+the top-left corner" matches nothing it observes; each guess from a description to a label
+costs accuracy on every decision. Write "click the button named 'Main menu', then the menu item
+named 'Plugins'".
+
+State any action the user has not authorized, such as "do not press Send or Discard; the user
+will send it", especially when the window shows controls that cannot be undone: `Send` beside a
+draft, `Delete` beside a list, `Save` over an original file, or `Buy`. Jev may choose any
+observed control, and the goal is its only record of what the user allowed.
+
 **Inputs.** Put exact strings in `texts`, named for their destination, such as
 `email_for_contact_field`, and state which value belongs in which field. Put passwords and
 other sensitive values in `secret_texts`: Jev sees only their names and lengths. Together they
@@ -58,6 +71,9 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
   reaches.
 - For a dropdown, open it and choose an observed option. A label in `texts` does not prove the
   dropdown contains that option.
+- To open a context menu, focus or select the item and allow `shift+f10`; there is no
+  right-click. A web or Electron menu appears in the observation. A native Windows popup menu
+  does not, so choose its item with `down` and `enter`.
 - For Excel, submit a cell address through the Name Box before entering its value in the
   Formula Bar, and check the cell's `selected` state; Name Box text alone does not prove
   navigation finished. Supply formulas exactly and let the spreadsheet calculate. See the

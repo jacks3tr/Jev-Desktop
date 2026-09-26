@@ -381,8 +381,10 @@ class Broker:
         else:
             apps = self.driver.list_apps()
             discovered_windows = self.driver.list_windows()
+        note = "pass app_ref to observe a specific application (opaque reference, not permission)"
         if query and not params.get("app_ref"):
             lowered = query.lower()
+            open_count = len(apps)
             apps = [
                 app
                 for app in apps
@@ -398,11 +400,12 @@ class Broker:
             and (not params.get("app_ref") or window.app_ref == params.get("app_ref"))
         ]
         if not params.get("app_ref"):
-            return {
-                "applications": [app.to_json() for app in apps],
-                "windows": windows,
-                "note": "pass app_ref to observe a specific application (opaque reference, not permission)",
-            }
+            if query and not apps:
+                note = (
+                    f"no window title or executable path contains {query!r}; {open_count} applications "
+                    "are open, so inspect without query to list them"
+                )
+            return {"applications": [app.to_json() for app in apps], "windows": windows, "note": note}
         scope_payload = dict(params.get("scope") or {})
         scope_payload.setdefault("app_ref", params["app_ref"])
         scope = ScopeSpec.from_json(scope_payload)
