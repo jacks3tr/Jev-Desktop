@@ -411,3 +411,11 @@ def test_inspect_query_filters_elements_not_the_application(broker_env):
     assert [element["name"] for element in observed["elements"]] == ["Save"]
     assert observed["application"]["app_ref"] == APP_REF
     assert any("query" in note for note in observed["truncation"])
+
+
+def test_discovery_query_that_matches_nothing_says_how_to_list_windows(broker_env):
+    client = broker_env["make"]()
+    found = client.call("inspect", {"query": "File Explorer", "screenshot": False})
+    assert found["applications"] == [] and found["windows"] == []
+    assert "no window title or executable path contains 'File Explorer'" in found["note"]
+    assert "inspect without query" in found["note"]

@@ -13,11 +13,13 @@ chooses controls, and acts inside the broker without a turn from you per click. 
 ## 1. Find the application and window
 
 Call `desktop_inspect` to discover the intended application and window, and keep the returned
-`app_ref` and `window_ref`. With an `app_ref`, `query` searches the whole window, beyond
-`max_elements`, for elements whose name, value, text, or path contains it, and returns only
-those. A `traversal node budget reached` or `query search time limit reached` note means the
-search stopped early, so an empty result does not prove the control is absent. Returned
-observations omit unnamed rows that offer no action.
+`app_ref` and `window_ref`. Without an `app_ref`, `query` keeps windows whose title or
+executable path contains it, such as `notepad` or a document name; a display name such as
+"File Explorer" may match neither, so inspect without `query` when it finds nothing. With an
+`app_ref`, `query` searches the whole window, beyond `max_elements`, for elements whose name,
+value, text, or path contains it, and returns only those. A `traversal node budget reached` or
+`query search time limit reached` note means the search stopped early, so an empty result does
+not prove the control is absent. Returned observations omit unnamed rows that offer no action.
 
 Jev receives structured accessibility data: control labels, values, focus, selection, and
 recent actions. It never sees screenshots. Read `coverage` and `truncation` before assuming a
