@@ -143,6 +143,43 @@ def test_deadline_terminates_worker_and_preserves_uncertainty(dispatch):
         driver.close()
 
 
+def _answering_worker(connection):
+    for _ in range(2):
+        method = connection.recv()[0]
+        connection.send(("result", f"fresh {method}"))
+
+
+def test_a_worker_aborted_at_a_deadline_is_replaced_on_the_next_call():
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    stalled = context.Process(target=_stalled_worker, args=(child, False))
+    replacement_parent, replacement_child = context.Pipe()
+    replacement = context.Process(target=_answering_worker, args=(replacement_child,))
+
+    def spawn():
+        replacement.start()
+        replacement_child.close()
+        return replacement, replacement_parent
+
+    driver = WindowsDriver()
+    driver._connection = parent
+    driver._process = stalled
+    driver._spawn = spawn
+    try:
+        stalled.start()
+        child.close()
+        assert parent.poll(10) and parent.recv()[0] == "ready"
+        driver.set_boundary(lambda: None, 0.15)
+        with pytest.raises(Pause):
+            driver._call("observe")
+        assert not stalled.is_alive()
+        driver.set_boundary(lambda: None, 10)
+        assert driver._call("observe") == "fresh observe"
+        assert driver.health()["worker_pid"] == replacement.pid
+    finally:
+        driver.close()
+
+
 def test_coordinate_transform_binds_snapshot_crop_and_actual_image_dimensions():
     geometry = Geometry(3, -1920, 0, 3840, 1080, 144, 1.5)
     rect = Rect(-1800, 100, -799, 801)

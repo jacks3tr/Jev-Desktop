@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import Envelope
-from .ipc import ConnectionClosed, PipeClient, UntrustedServer, pipe_name
+from .ipc import ConnectionClosed, PipeClient, RequestNotSent, UntrustedServer, pipe_name
 
 
 class BrokerError(RuntimeError):
@@ -117,10 +117,17 @@ class BrokerClient:
             # A run may hold the main connection for a whole slice; stop must not queue behind it.
             return self._stop_request(session_id, params, timeout_s=timeout_s)
         with self._request_lock:
-            self._ensure_session()
-            payload = dict(params or {})
-            payload.setdefault("session_id", self._session_id)
-            return self._transact(Envelope.request(method, payload, session_id=self._session_id), timeout_s=timeout_s)
+            try:
+                return self._call_once(method, params, timeout_s=timeout_s)
+            except RequestNotSent:
+                # The broker this client knew has exited; nothing reached it, so ask the one serving now.
+                return self._call_once(method, params, timeout_s=timeout_s)
+
+    def _call_once(self, method: str, params: Mapping[str, Any] | None, *, timeout_s: float | None) -> dict[str, Any]:
+        self._ensure_session()
+        payload = dict(params or {})
+        payload.setdefault("session_id", self._session_id)
+        return self._transact(Envelope.request(method, payload, session_id=self._session_id), timeout_s=timeout_s)
 
     def _stop_request(
         self, session_id: str, params: Mapping[str, Any] | None, *, timeout_s: float | None

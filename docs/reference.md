@@ -348,7 +348,11 @@ Run `jev-desktop doctor` for diagnostics. Remove credentials, tokens, private pa
 application content before sharing output.
 
 - Connection errors: use the same Windows session and `JEV_DESKTOP_PIPE` setting for client
-  and broker. Run `jev-desktop broker` in the foreground to inspect startup errors.
+  and broker. Run `jev-desktop broker` in the foreground to inspect startup errors. A client
+  resends a request only when the pipe refused it before the broker read it; any other lost
+  connection returns `broker_unavailable`, since the broker may have acted.
+- Native worker: when the worker exits, or is stopped at a deadline, the next call starts a new
+  one. References it issued expire, so inspect again.
 - Policy errors: set `TYPESAFE_API_KEY` before starting the broker. Inspection and directed
   actions work without it.
 - Refused input: check window focus, modal dialogs, scope, and privilege boundaries. Inspect
