@@ -44,6 +44,8 @@ counts include provider-reported usage from accepted and rejected responses.
 and waits. No dollar estimate is inferred. Completion is model-reported and must be checked
 against the returned observation. A fresh observation is taken before accepting DONE, and a
 separate question asks whether the goal's end state is visible in it without the action history.
+It also sees `new_since_task_start`: up to 60 of the newest elements that were not in the task's
+first observation, so a result the task produced is distinguishable from one already on screen.
 A confident no pauses with `needs_visual_assistance`. An unsure answer gets one more look: the
 broker waits briefly, observes again, and asks about completion once more; if that is still
 unsure, the pause carries the check's own answer (`selected` YES or NO) under `low_confidence`.

@@ -681,6 +681,24 @@ def test_task_unsure_completion_check_observes_again_and_reports_its_answer(tmp_
     journal.close()
 
 
+def test_task_completion_check_sees_what_appeared_since_the_task_began(tmp_path):
+    _runtime, _driver, _app, journal, transport, result = task_with_turns(
+        tmp_path,
+        {"operation": ("CLICK", 0.9), "CLICK_target": ("Save", 0.9)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
+    )
+    assert result.execution is Execution.COMPLETED
+    new = transport.sent[2]["state"]["new_since_task_start"]
+    assert any('name="Saved" value="yes"' in item for item in new), new
+    assert not any('name="Save"' in item or 'value="no"' in item for item in new), new
+    journal.close()
+
+
 SIDEBAR_ELEMENTS = [
     FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
     FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),

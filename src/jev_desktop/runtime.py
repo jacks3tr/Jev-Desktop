@@ -63,6 +63,7 @@ from .policy import (
     OpContext,
     PolicyError,
     build_contexts,
+    describe_element,
     summarize_state_for_policy,
     with_permitted_operations,
 )
@@ -77,6 +78,12 @@ from .verification import (
 
 RESERVED_DISPATCH_STATES = {DispatchState.DISPATCHING, DispatchState.UNCERTAIN}
 CONTROL_OPERATIONS = {Operation.HOTKEY}
+# The newest elements the completion check is shown as having appeared since the task began.
+NEW_ELEMENTS_LIMIT = 60
+
+
+def _element_signature(element: Mapping[str, Any]) -> str:
+    return digest([element.get(key) for key in ("role", "name", "value", "text", "path")])[:16]
 
 
 def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str, Any]:
@@ -590,6 +597,10 @@ class Runtime:
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
+            if "task_start_elements" not in state.summary:
+                state.summary["task_start_elements"] = sorted(
+                    {_element_signature(element) for element in observation["elements"]}
+                )
             contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             for operation in (Operation.TYPE_TEXT, Operation.SCROLL):
@@ -833,6 +844,13 @@ class Runtime:
                     snapshot = fresh
                     continue
                 confirm_state = {key: value for key, value in model_state.items() if key != "permitted_operations"}
+                # Without the action history, this is how the check tells a new result from an old one.
+                started = set(state.summary["task_start_elements"])
+                confirm_state["new_since_task_start"] = [
+                    describe_element(element)
+                    for element in observation["elements"]
+                    if _element_signature(element) not in started
+                ][-NEW_ELEMENTS_LIMIT:]
                 try:
                     confirmed = self.policy.confirm_done(
                         goal=state.spec.goal,
