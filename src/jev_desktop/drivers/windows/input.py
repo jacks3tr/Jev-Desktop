@@ -97,6 +97,7 @@ SUPPORTED_CHORDS = {
     "alt+f4",
     "alt+tab",
     "shift+tab",
+    "shift+f10",
     "enter",
     "esc",
     "tab",

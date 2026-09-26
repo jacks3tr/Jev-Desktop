@@ -48,6 +48,12 @@ name an end state that text shows, such as "stop when the message appears in the
 transcript", not an event such as "once it is sent". Resolve
 missing information before starting; Jev selects supplied values and never generates text.
 
+Jev reads the goal literally, so name controls by the labels the inspection returned, such as
+"open `Main menu` and choose `Plugins`", not by position or paraphrase such as "the menu at the
+top left". Jev may choose any observed control, so when the window also shows controls that
+must not be used, such as `Send` beside a draft or `Delete` beside a list, say so in the goal:
+"do not press Send".
+
 **Inputs.** Put exact strings in `texts`, named for their destination, such as
 `email_for_contact_field`, and state which value belongs in which field. Put passwords and
 other sensitive values in `secret_texts`: Jev sees only their names and lengths. Together they
@@ -58,6 +64,9 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
   reaches.
 - For a dropdown, open it and choose an observed option. A label in `texts` does not prove the
   dropdown contains that option.
+- To open a context menu, focus or select the item and allow `shift+f10`; there is no
+  right-click. A web or Electron menu appears in the observation. A native Windows popup menu
+  does not, so choose its item with `down` and `enter`.
 - For Excel, submit a cell address through the Name Box before entering its value in the
   Formula Bar, and check the cell's `selected` state; Name Box text alone does not prove
   navigation finished. Supply formulas exactly and let the spreadsheet calculate. See the
