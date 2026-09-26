@@ -32,6 +32,11 @@ coverage and default to 180 and 12. The loop batches operation and target questi
 With multiple supplied values, a second question selects the value for the chosen input control.
 Each control lists the offered operations it supports. When Jev finds no target for its chosen
 operation, the loop withdraws that operation and decides again on the same observation.
+The window's own title-bar buttons (Close, Minimize, Maximize, system menu) are never offered;
+closing the window takes a supplied chord such as `alt+f4`. When Jev first escalates, the
+broker waits briefly and observes again before deciding once more, since a window just focused
+may not expose its controls yet; a second escalation before the next action pauses with
+`needs_visual_assistance`.
 Jev receives structured accessibility data and action history, not screenshots. Native dispatch
 rechecks the target and records input before the next observation. Supplied text and chords
 are closed choices. Jev cannot invent values or launch applications. Low confidence, missing

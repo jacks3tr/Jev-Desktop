@@ -459,7 +459,7 @@ def test_task_focuses_the_one_approved_window_before_asking_the_model(tmp_path, 
         purpose="task",
         script=[ScriptedDecision(Operation.CLICK, "Save"), ScriptedDecision(Operation.DONE)]
         if focusable
-        else [ScriptedDecision(Operation.ESCALATE)],
+        else [ScriptedDecision(Operation.ESCALATE), ScriptedDecision(Operation.ESCALATE)],
     )
     app.focused, app.focusable = False, focusable
     result = slice_once(runtime, ownership, session, created)
@@ -727,6 +727,45 @@ def test_task_does_not_toggle_the_control_it_just_toggled(tmp_path):
     journal.close()
 
 
+def test_task_never_offers_the_windows_own_title_bar_buttons(tmp_path):
+    runtime, _driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("button", "Close", path=("titlebar",)),
+            FakeElement("button", "Minimize", path=("titlebar",)),
+            FakeElement("button", "Close", path=("Provider dialog",)),
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.CLICK, "Close"), ScriptedDecision(Operation.DONE)],
+    )
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    offered = [item.description for context in runtime.policy.calls[0]["contexts"] for item in context.candidates]
+    assert len(offered) == 1 and "Provider dialog" in offered[0]
+    journal.close()
+
+
+def test_task_observes_again_before_pausing_on_its_first_escalation(tmp_path):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=SAVE_ELEMENTS,
+        steps=[],
+        purpose="task",
+        script=[
+            ScriptedDecision(Operation.ESCALATE),
+            ScriptedDecision(Operation.CLICK, "Save"),
+            ScriptedDecision(Operation.DONE),
+        ],
+    )
+    observed = driver.observations
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert [request.operation for request in driver.executed] == [Operation.CLICK]
+    assert driver.observations - observed >= 3, "the escalation was followed by a fresh observation"
+    journal.close()
+
+
 def test_task_operation_choice_sees_which_offered_operations_each_control_supports(tmp_path):
     _runtime, _driver, _app, journal, transport, result = task_with_turns(
         tmp_path,
@@ -787,6 +826,7 @@ def test_task_excluded_operations_last_until_the_next_observation(tmp_path):
         {"operation": ("CLICK", 0.8), "CLICK_target": ("NONE", 0.8)},
         {"operation": ("WAIT", 0.8)},
         {"operation": ("ESCALATE", 0.8)},
+        {"operation": ("ESCALATE", 0.8)},
         elements=SIDEBAR_ELEMENTS,
         fixtures={},
     )
@@ -797,6 +837,7 @@ def test_task_excluded_operations_last_until_the_next_observation(tmp_path):
         {"CLICK", "SCROLL"} | finishing,
         {"CLICK"} | finishing,
         finishing,
+        {"CLICK", "TOGGLE", "SCROLL"} | finishing,
         {"CLICK", "TOGGLE", "SCROLL"} | finishing,
     ]
     assert result.reason == "needs_visual_assistance"
