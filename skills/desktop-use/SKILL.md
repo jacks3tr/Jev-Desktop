@@ -64,7 +64,8 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
   [spreadsheet example](../../examples/spreadsheet.json).
 
 **Scope and budgets.** A task stays within the supplied windows and cannot launch
-applications. If its only window is not focused, Jev focuses it first. Defaults are 20
+applications. If its only window is not focused, Jev focuses it first. It never uses the
+window's own title-bar buttons; allow `alt+f4` if the goal is to close the window. Defaults are 20
 actions, 40 model decisions, and 60 seconds; a call lasts at most 120 seconds. Set
 `max_actions`, `max_model_decisions`, and `timeout_seconds` for the work. Resume a paused task
 with its `run_id` and `resume_token`; the goal, scope, and inputs cannot change, and total
