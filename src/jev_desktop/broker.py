@@ -523,6 +523,8 @@ class Broker:
         timeout = task.get("timeout_seconds", 60)
         if type(timeout) not in (int, float) or not 0 < timeout <= 120:
             raise ContractError("timeout_seconds must be between 0 and 120")
+        if task.get("app_ref") and hasattr(self.driver, "discover"):
+            self.driver.discover(task["app_ref"])  # an expired reference fails here, before a run exists
         spec = {
             "goal": task.get("goal"),
             "purpose": "task",

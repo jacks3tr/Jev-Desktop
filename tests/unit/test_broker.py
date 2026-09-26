@@ -16,8 +16,8 @@ import jev_desktop
 from jev_desktop import client as client_module
 from jev_desktop.broker import Broker, BrokerConfig, fit_frame
 from jev_desktop.client import BrokerClient, BrokerError
-from jev_desktop.contracts import Envelope, Limits, Operation, new_id
-from jev_desktop.ipc import MAX_MESSAGE_BYTES, PipeClient, PipeServer
+from jev_desktop.contracts import ContractError, Envelope, Limits, Operation, new_id
+from jev_desktop.ipc import MAX_MESSAGE_BYTES, PipeClient, PipeServer, RequestNotSent
 from jev_desktop.journal import DispatchJournal
 from jev_desktop.policy import PolicyConfig
 
@@ -411,6 +411,34 @@ def test_inspect_query_filters_elements_not_the_application(broker_env):
     assert [element["name"] for element in observed["elements"]] == ["Save"]
     assert observed["application"]["app_ref"] == APP_REF
     assert any("query" in note for note in observed["truncation"])
+
+
+def test_client_retries_a_request_its_exited_broker_never_received(broker_env, monkeypatch):
+    client = broker_env["make"]()
+    first = client.session_id
+    stale = client._client
+    assert stale is not None
+
+    def exited(*_args, **_kwargs):
+        raise RequestNotSent("WriteFile failed (232)")
+
+    monkeypatch.setattr(stale, "request", exited)
+    client.call("status", {})
+    assert client.session_id != first
+
+
+def test_task_with_an_expired_app_ref_is_refused_before_a_run_starts(broker_env):
+    def discover(app_ref):
+        raise ContractError(f"unknown or expired app reference {app_ref}; inspect again for current references")
+
+    broker_env["driver"].discover = discover
+    client = broker_env["make"]()
+    task = {"goal": "Save the document", "app_ref": APP_REF, "window_refs": [broker_env["app"].window_ref]}
+    with pytest.raises(BrokerError) as refused:
+        client.call("run", {"task": task})
+    assert refused.value.code == "invalid_request"
+    assert "expired app reference" in refused.value.message
+    assert broker_env["broker"].journal.list_runs(limit=5) == []
 
 
 def test_discovery_query_that_matches_nothing_says_how_to_list_windows(broker_env):

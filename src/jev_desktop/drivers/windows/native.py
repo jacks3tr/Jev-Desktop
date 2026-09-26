@@ -116,7 +116,7 @@ class NativeWindowsDriver:
     def process_id_for(self, app_ref: str) -> int:
         pid = self._pid_by_app.get(app_ref)
         if pid is None:
-            raise ContractError(f"unknown or expired app reference {app_ref}")
+            raise ContractError(f"unknown or expired app reference {app_ref}; inspect again for current references")
         if abs(win32.process_creation_time(pid) - self._apps[app_ref].process_creation_time) > 0.001:
             raise ContractError("application process was replaced; inspect and bind the new process")
         return pid

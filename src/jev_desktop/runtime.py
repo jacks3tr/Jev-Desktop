@@ -585,6 +585,7 @@ class Runtime:
         operations_checked_on = snapshot.snapshot_id
         # A toggle undoes itself, so the control just toggled is not offered for TOGGLE again.
         last_toggled: str | None = None
+        escalated = False
         auto_focused = False
         while True:
             self.ownership.checkpoint(
@@ -609,22 +610,26 @@ class Runtime:
                     {_element_signature(element) for element in observation["elements"]}
                 )
             contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
-            if last_toggled is not None:
-                controls = {element["element_id"]: _control_key(element) for element in observation["elements"]}
-                contexts = [
-                    replace(
-                        context,
-                        candidates=tuple(
-                            candidate
-                            for candidate in context.candidates
-                            if controls.get(candidate.element_id) != last_toggled
-                        ),
-                    )
-                    if context.operation is Operation.TOGGLE
-                    else context
-                    for context in contexts
-                ]
-                contexts = [context for context in contexts if context.candidates]
+            # Title-bar buttons close, resize, or move the approved window itself, never a routine step.
+            caption = {element["element_id"] for element in observation["elements"] if "titlebar" in element["path"]}
+            toggled = {
+                element["element_id"]
+                for element in observation["elements"]
+                if last_toggled is not None and _control_key(element) == last_toggled
+            }
+            contexts = [
+                replace(
+                    context,
+                    candidates=tuple(
+                        candidate
+                        for candidate in context.candidates
+                        if candidate.element_id not in caption
+                        and (context.operation is not Operation.TOGGLE or candidate.element_id not in toggled)
+                    ),
+                )
+                for context in contexts
+            ]
+            contexts = [context for context in contexts if context.candidates]
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             for operation in (Operation.TYPE_TEXT, Operation.SCROLL):
                 base = build_contexts(observation=observation, operations=[operation])
@@ -932,6 +937,13 @@ class Runtime:
             if state.actions >= state.spec.limits.max_actions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_actions"})
             if decision.operation is Operation.ESCALATE:
+                if not escalated:
+                    # A window just focused or a view still loading may not expose its controls yet.
+                    escalated = True
+                    self.config.sleeper(min(1.0, max(0.0, state.slice_deadline - self.config.clock())))
+                    value_target = None
+                    snapshot = self._observe(state)
+                    continue
                 return self._pause(
                     state,
                     Reason.NEEDS_VISUAL_ASSISTANCE.value,
@@ -977,6 +989,7 @@ class Runtime:
             snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
             inputs_without_value.clear()
             doubt = None
+            escalated = False
 
     def _record_model_attempts(self, state: _RunState) -> None:
         if not isinstance(self.policy, JevPolicy):

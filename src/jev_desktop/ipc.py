@@ -151,6 +151,10 @@ class ConnectionClosed(RuntimeError):
     pass
 
 
+class RequestNotSent(ConnectionClosed):
+    """The pipe refused the first byte, so the server cannot have acted on the request."""
+
+
 class UntrustedServer(ConnectionClosed):
     """The pipe exists but is served by another account or session; never send it requests."""
 
@@ -177,7 +181,8 @@ class _FramedHandle:
         while offset < len(payload):
             chunk = ctypes.cast(ctypes.addressof(view) + offset, ctypes.c_void_p)
             if not kernel32.WriteFile(self.handle, chunk, len(payload) - offset, ctypes.byref(written), None):
-                raise ConnectionClosed(f"WriteFile failed ({ctypes.get_last_error()})")
+                closed = RequestNotSent if offset == 0 else ConnectionClosed
+                raise closed(f"WriteFile failed ({ctypes.get_last_error()})")
             if written.value == 0:
                 raise ConnectionClosed("write returned zero bytes")
             offset += written.value

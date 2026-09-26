@@ -32,6 +32,11 @@ coverage and default to 180 and 12. The loop batches operation and target questi
 With multiple supplied values, a second question selects the value for the chosen input control.
 Each control lists the offered operations it supports. When Jev finds no target for its chosen
 operation, the loop withdraws that operation and decides again on the same observation.
+The window's own title-bar buttons (Close, Minimize, Maximize, system menu) are never offered;
+closing the window takes a supplied chord such as `alt+f4`. When Jev first escalates, the
+broker waits briefly and observes again before deciding once more, since a window just focused
+may not expose its controls yet; a second escalation before the next action pauses with
+`needs_visual_assistance`.
 Jev receives structured accessibility data and action history, not screenshots. Native dispatch
 rechecks the target and records input before the next observation. Supplied text and chords
 are closed choices. Jev cannot invent values or launch applications. Low confidence, missing
@@ -348,7 +353,11 @@ Run `jev-desktop doctor` for diagnostics. Remove credentials, tokens, private pa
 application content before sharing output.
 
 - Connection errors: use the same Windows session and `JEV_DESKTOP_PIPE` setting for client
-  and broker. Run `jev-desktop broker` in the foreground to inspect startup errors.
+  and broker. Run `jev-desktop broker` in the foreground to inspect startup errors. A client
+  resends a request only when the pipe refused it before the broker read it; any other lost
+  connection returns `broker_unavailable`, since the broker may have acted.
+- Native worker: when the worker exits, or is stopped at a deadline, the next call starts a new
+  one. References it issued expire, so inspect again.
 - Policy errors: set `TYPESAFE_API_KEY` before starting the broker. Inspection and directed
   actions work without it.
 - Refused input: check window focus, modal dialogs, scope, and privilege boundaries. Inspect

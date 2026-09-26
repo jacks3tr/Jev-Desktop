@@ -265,3 +265,17 @@ def test_mcp_goal_handoff_returns_one_summary(live_broker, tmp_path):
     assert result["metrics"]["slices"] == 1
     assert "verdict" not in result and "assertions" not in result
     assert live_broker["broker"].ownership.active_lease() is None
+
+
+def test_mcp_reports_a_lost_broker_connection_as_a_structured_error(monkeypatch):
+    from jev_desktop.ipc import ConnectionClosed
+    from jev_desktop.transports import mcp_stdio
+
+    class Lost:
+        def call(self, *_args, **_kwargs):
+            raise ConnectionClosed("broker closed the connection")
+
+    monkeypatch.setattr(mcp_stdio, "_client", Lost())
+    payload = json.loads(mcp_stdio.desktop_run(task={"goal": "x"})[0].text)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "broker_unavailable"

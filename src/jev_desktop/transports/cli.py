@@ -18,7 +18,7 @@ from typing import Any
 
 from ..client import BrokerClient, BrokerError, load_json_argument
 from ..contracts import SCHEMA_VERSION
-from ..ipc import pipe_name
+from ..ipc import ConnectionClosed, pipe_name
 
 NON_PASS_EXIT = 2
 
@@ -344,6 +344,13 @@ def main(argv: list[str] | None = None) -> int:
     except BrokerError as exc:
         _emit(
             {"ok": False, "error": {"code": exc.code, "message": exc.message, "detail": exc.detail}}, pretty=args.pretty
+        )
+        return 1
+    except (ConnectionClosed, OSError) as exc:
+        # The broker may have acted before the connection was lost: inspect or check status, never resend.
+        _emit(
+            {"ok": False, "error": {"code": "broker_unavailable", "message": str(exc), "detail": None}},
+            pretty=args.pretty,
         )
         return 1
     except KeyboardInterrupt:

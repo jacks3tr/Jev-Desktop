@@ -19,6 +19,7 @@ from mcp.types import ImageContent, TextContent
 from .. import __version__
 from ..client import BrokerClient, BrokerError
 from ..contracts import SCHEMA_VERSION
+from ..ipc import ConnectionClosed
 
 INSTRUCTIONS = """Use desktop_run(task=...) for routine Windows work. Discover the intended
 application and window with desktop_inspect, then hand off a goal, app_ref, window_refs,
@@ -83,12 +84,15 @@ def _content(payload: Mapping[str, Any]) -> list[Any]:
     return content
 
 
-def _error_payload(exc: BrokerError) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "error": {"code": exc.code, "message": exc.message, "detail": exc.detail},
-        "schema_version": SCHEMA_VERSION,
-    }
+def _call(method: str, params: Mapping[str, Any], *, timeout_s: float) -> dict[str, Any]:
+    try:
+        return client().call(method, params, timeout_s=timeout_s)
+    except BrokerError as exc:
+        error: dict[str, Any] = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+    except (ConnectionClosed, OSError) as exc:
+        # The broker may have acted before the connection was lost: inspect or check status, never resend.
+        error = {"code": "broker_unavailable", "message": str(exc), "detail": None}
+    return {"ok": False, "error": error, "schema_version": SCHEMA_VERSION}
 
 
 @server.tool(
@@ -120,11 +124,7 @@ def desktop_inspect(
         params["query"] = query
     if run_id:
         params.update(run_id=run_id, resume_token=resume_token)
-    try:
-        payload = client().call("inspect", params, timeout_s=120.0)
-    except BrokerError as exc:
-        payload = _error_payload(exc)
-    return _content(payload)
+    return _content(_call("inspect", params, timeout_s=120.0))
 
 
 @server.tool(
@@ -171,11 +171,7 @@ def desktop_run(
             "visual_results": visual_results or {},
             "verifier_results": verifier_results or {},
         }
-    try:
-        payload = client().call("run", params, timeout_s=3600.0)
-    except BrokerError as exc:
-        payload = _error_payload(exc)
-    return _content(payload)
+    return _content(_call("run", params, timeout_s=3600.0))
 
 
 @server.tool(
@@ -228,11 +224,7 @@ def desktop_act(
         "action": action,
         "inline_image": inline_image,
     }
-    try:
-        payload = client().call("act", params, timeout_s=600.0)
-    except BrokerError as exc:
-        payload = _error_payload(exc)
-    return _content(payload)
+    return _content(_call("act", params, timeout_s=600.0))
 
 
 @server.tool(
@@ -258,11 +250,7 @@ def desktop_stop(
         params["run_id"] = run_id
     if reason:
         params["reason"] = reason
-    try:
-        payload = client().call("stop", params, timeout_s=60.0)
-    except BrokerError as exc:
-        payload = _error_payload(exc)
-    return _content(payload)
+    return _content(_call("stop", params, timeout_s=60.0))
 
 
 def main() -> int:

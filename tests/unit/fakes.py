@@ -65,6 +65,7 @@ class FakeElement:
     operations: tuple[str, ...] = ("CLICK",)
     state: dict[str, Any] = field(default_factory=dict)
     text: str | None = None
+    path: tuple[str, ...] = ()
 
 
 @dataclass
@@ -184,7 +185,7 @@ class FakeDriver:
                     operations=element.operations,
                     rect=Rect(120, 100 + index * 40, 320, 120 + index * 40),
                     index=index,
-                    path=(self.app.title,),
+                    path=(self.app.title, *element.path),
                     state=dict(element.state),
                     text=element.text if element.text is not None else (element.value or element.name),
                     truncation=None,

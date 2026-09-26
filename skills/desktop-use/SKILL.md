@@ -80,7 +80,8 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
   [spreadsheet example](../../examples/spreadsheet.json).
 
 **Scope and budgets.** A task stays within the supplied windows and cannot launch
-applications. If its only window is not focused, Jev focuses it first. Defaults are 20
+applications. If its only window is not focused, Jev focuses it first. It never uses the
+window's own title-bar buttons; allow `alt+f4` if the goal is to close the window. Defaults are 20
 actions, 40 model decisions, and 60 seconds; a call lasts at most 120 seconds. Set
 `max_actions`, `max_model_decisions`, and `timeout_seconds` for the work. Resume a paused task
 with its `run_id` and `resume_token`; the goal, scope, and inputs cannot change, and total
@@ -141,6 +142,11 @@ or resolve the blocked state, then hand back the remaining goal.
 - **Another application kept the foreground:** `user_takeover` with `foreground_process` means
   Windows refused to bring the window forward and no input was sent. Ask the user to switch to
   the application, then resume or act again.
+- **Broker or worker stopped:** `broker_unavailable` or `driver_error` means the call reached
+  no broker or its native worker exited; the next call reaches a replacement on its own.
+  References do not survive a replacement, and a task with an expired `app_ref` is refused as
+  `invalid_request`: inspect again. Check a run's status before assuming its input was or was
+  not sent.
 - **Uncertain effect:** a direct action returns `uncertain_effect`. Never repeat the action. An acknowledged input is not proof that the
   application did what you intended; inspect its result.
 - **Low confidence:** check competing candidates before touching thresholds. Duplicate
