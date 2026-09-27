@@ -92,6 +92,11 @@ Do not translate a routine goal into individual `desktop_act` calls or a test sp
 ## 3. Read the result
 
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
+Task observations are summaries: they retain controls, window references, paths, values, and
+semantic state, but omit rectangles, default flags, and internal native IDs. Omitted element
+flags mean enabled and visible, but not editable, focusable, or focused. Inspect again for a
+full observation and authorization before a direct action. MCP returns JSON text and optional
+image content blocks without a duplicate `structuredContent` result.
 `completion: model_reported` means Jev chose DONE and a separate check of the final
 observation, made without the action history, confirmed the goal is visible. When that check
 says no, or is still unsure after Jev observes once more, the task pauses with
@@ -122,7 +127,9 @@ so you can `FOCUS_WINDOW` and retry with the same `snapshot_id`.
 Explicit targets need no TypeSafe key; task handoffs and `target_description` require one.
 
 **Screenshots and coordinates.** Request a screenshot only when you need visual context; it
-adds nothing to Jev's decisions. Screenshots need a scoped window in the foreground, and
+adds nothing to Jev's decisions. Set `include_screenshot: false` on MCP inspections when you do
+not need one; screenshots default on and can make results large. Screenshots need a scoped
+window in the foreground, and
 inspection never focuses one, so use `FOCUS_WINDOW` first. For a screenshot-based click,
 toggle, or scroll, supply `point` instead of `element_id`: copy the evidence ID, crop, scale,
 image dimensions, and geometry epoch from the screenshot, and set `x` and `y` in image pixels.
