@@ -230,6 +230,34 @@ def test_observation_links_an_option_to_its_selection_container(monkeypatch):
     assert changed.fingerprint != snapshot.fingerprint
 
 
+def test_observation_marks_only_native_caption_buttons_as_titlebar(monkeypatch):
+    root = _ObservedElement(1, 50026, "root", Rect(0, 0, 100, 100))
+    native_close = _ObservedElement(
+        2,
+        50000,
+        "Close",
+        Rect(80, 0, 100, 10),
+        parent=root,
+        props={uia.PROP_CLASSNAME: "WinCaptionButton"},
+    )
+    dialog_close = _ObservedElement(
+        3,
+        50000,
+        "Close",
+        Rect(70, 20, 90, 40),
+        parent=root,
+        props={uia.PROP_CLASSNAME: "op-plugin-close op-icon-button"},
+    )
+    snapshot = _observe_fake_tree(
+        monkeypatch,
+        _observation_worker(root, {root: (native_close, dialog_close)}),
+    )
+
+    native, dialog = [element for element in snapshot.elements if element.name == "Close"]
+    assert native.path[-1] == "titlebar"
+    assert "titlebar" not in dialog.path
+
+
 def test_vanished_subtree_and_window_leave_a_partial_snapshot(monkeypatch):
     _stable_windows(monkeypatch, vanished={2})
     root, child = _Element("root"), _Element("child")
