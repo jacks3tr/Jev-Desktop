@@ -118,6 +118,118 @@ class _Element:
         return self.values.get(prop)
 
 
+class _ObservedElement:
+    def __init__(self, runtime_id, role, name, rect, *, parent=None, props=None):
+        self.parent = parent
+        self.values = {
+            uia.PROP_RUNTIME_ID: [runtime_id],
+            uia.PROP_CONTROL_TYPE: role,
+            uia.PROP_NAME: name,
+            uia.PROP_BOUNDS: [rect.left, rect.top, rect.width, rect.height],
+            uia.PROP_ENABLED: True,
+            uia.PROP_OFFSCREEN: False,
+            **(props or {}),
+        }
+
+    def GetCachedPropertyValue(self, prop):
+        return self.values.get(prop)
+
+    def GetCurrentPropertyValue(self, prop):
+        return self.values.get(prop)
+
+
+def _observation_worker(root, control_children):
+    raw = NS(GetParentElement=lambda element: element.parent)
+    worker = NS(
+        automation=NS(RawViewWalker=raw, CompareElements=lambda left, right: left is right),
+        has_cached_walker=True,
+        element_from_handle=lambda _hwnd: root,
+        focused_element=lambda _hwnd: None,
+        children=lambda element: iter(control_children.get(element, ())),
+    )
+    worker.submit = lambda fn, **_: fn(worker)
+    return worker
+
+
+def _observe_fake_tree(monkeypatch, worker):
+    _stable_windows(monkeypatch, vanished=set())
+    monkeypatch.setattr(win32, "foreground_window", lambda: 1)
+    return uia.observe(
+        worker,
+        uia.Registry(),
+        app_ref="app",
+        process_id=7,
+        scope_windows=[("win:1", 1)],
+        max_elements=50,
+        max_depth=8,
+        text_limit=100,
+        include_invisible=False,
+        geometry=Geometry(1, 0, 0, 100, 100, 96, 1.0),
+    )
+
+
+def test_observation_surfaces_a_raw_scroll_ancestor_once(monkeypatch):
+    def refuse_selection_lookup(*_args):
+        raise AssertionError("ordinary controls must not resolve a selection container")
+
+    monkeypatch.setattr(uia, "_selection_container_id", refuse_selection_lookup)
+    root = _ObservedElement(1, 50026, "root", Rect(0, 0, 100, 100))
+    sidebar = _ObservedElement(
+        2,
+        50026,
+        "",
+        Rect(0, 10, 30, 90),
+        parent=root,
+        props={uia.AVAILABILITY["scroll"]: True},
+    )
+    scroll_item = {uia.AVAILABILITY["scrollitem"]: True}
+    first = _ObservedElement(3, 50000, "First room", Rect(1, 12, 29, 30), parent=sidebar, props=scroll_item)
+    second = _ObservedElement(4, 50000, "Second room", Rect(1, 31, 29, 49), parent=sidebar, props=scroll_item)
+    snapshot = _observe_fake_tree(monkeypatch, _observation_worker(root, {root: (first, second)}))
+
+    scroll_targets = [element for element in snapshot.elements if "SCROLL" in element.operations]
+    assert [(element.role, element.name, element.rect) for element in scroll_targets] == [
+        ("group", "", Rect(0, 10, 30, 90))
+    ]
+
+
+def test_observation_links_an_option_to_its_selection_container(monkeypatch):
+    root = _ObservedElement(1, 50026, "root", Rect(0, 0, 100, 100))
+    combo = _ObservedElement(
+        2,
+        50003,
+        "Shell commands policy",
+        Rect(10, 10, 80, 30),
+        parent=root,
+        props={uia.AVAILABILITY["selection"]: True, uia.AVAILABILITY["expandcollapse"]: True},
+    )
+    popup = _ObservedElement(4, 50008, "", Rect(10, 31, 80, 70), parent=combo)
+    unknown_owner = NS(QueryInterface=lambda _interface: popup)
+    option = _ObservedElement(
+        3,
+        50007,
+        "Ask every time",
+        Rect(10, 31, 80, 50),
+        parent=popup,
+        props={uia.AVAILABILITY["selectionitem"]: True, uia.PROP_SELECTED: False, 30080: unknown_owner},
+    )
+    monkeypatch.setattr(uia, "uia_module", lambda: NS(IUIAutomationElement=object()))
+    snapshot = _observe_fake_tree(monkeypatch, _observation_worker(root, {root: (combo, option)}))
+
+    observed_combo = next(element for element in snapshot.elements if element.name == combo.values[uia.PROP_NAME])
+    observed_option = next(element for element in snapshot.elements if element.name == option.values[uia.PROP_NAME])
+    assert observed_option.state["selection_container_id"] == observed_combo.element_id
+    repeated = _observe_fake_tree(monkeypatch, _observation_worker(root, {root: (combo, option)}))
+    repeated_option = next(element for element in repeated.elements if element.name == option.values[uia.PROP_NAME])
+    assert observed_option.state["control_id"] == repeated_option.state["control_id"]
+    assert observed_option.state["selection_container_control_id"] == observed_combo.state["control_id"]
+    assert snapshot.fingerprint == repeated.fingerprint
+
+    option.values[uia.PROP_SELECTED] = True
+    changed = _observe_fake_tree(monkeypatch, _observation_worker(root, {root: (combo, option)}))
+    assert changed.fingerprint != snapshot.fingerprint
+
+
 def test_vanished_subtree_and_window_leave_a_partial_snapshot(monkeypatch):
     _stable_windows(monkeypatch, vanished={2})
     root, child = _Element("root"), _Element("child")
