@@ -466,7 +466,8 @@ def _control_id(runtime_id: tuple[int, ...]) -> str | None:
 
 
 def _fingerprint_state(state: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in state.items() if key != "selection_container_id"}
+    internal_ids = {"control_id", "selection_container_id", "selection_container_control_id"}
+    return {key: value for key, value in state.items() if key not in internal_ids}
 
 
 def _bool(value: Any, default: bool = False) -> bool:
