@@ -88,7 +88,10 @@ def _element_signature(element: Mapping[str, Any]) -> str:
 
 def _control_key(element: Mapping[str, Any]) -> str:
     """The same control across observations, whatever its state or element ID."""
-    return digest([element.get(key) for key in ("role", "name", "path")])[:16]
+    control_id = (element.get("state") or {}).get("control_id")
+    if isinstance(control_id, str) and control_id:
+        return digest([element.get("window_ref"), control_id])[:16]
+    return digest([element.get(key) for key in ("window_ref", "role", "name", "rect")])[:16]
 
 
 def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str, Any]:
@@ -609,6 +612,50 @@ class Runtime:
                 state.summary["task_start_elements"] = sorted(
                     {_element_signature(element) for element in observation["elements"]}
                 )
+            bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
+            elements_by_id = {element["element_id"]: element for element in observation["elements"]}
+            select_candidates: list[TargetCandidate] = []
+            bound_options: set[str] = set()
+            for option in observation["elements"]:
+                container_id = (option.get("state") or {}).get("selection_container_id")
+                container = elements_by_id.get(container_id)
+                if (
+                    option.get("role") != "listitem"
+                    or not option.get("name")
+                    or option.get("enabled") is False
+                    or option.get("visible") is False
+                    or Operation.SELECT.value not in (option.get("operations") or ())
+                    or container is None
+                    or container.get("role") != "combobox"
+                    or container.get("enabled") is False
+                    or container.get("visible") is False
+                    or Operation.SELECT.value not in (container.get("operations") or ())
+                    or (container.get("state") or {}).get("expanded") != "expanded"
+                ):
+                    continue
+                bound_options.add(str(option["element_id"]))
+                if (option.get("state") or {}).get("selected") is True:
+                    continue
+                candidate_id = new_id("cfg")
+                label = str(option["name"])
+                select_candidates.append(
+                    TargetCandidate(
+                        element_id=candidate_id,
+                        description=f"{describe_element(option)} in {describe_element(container)}",
+                        operation=Operation.SELECT,
+                        option_label=label,
+                    )
+                )
+                bindings[candidate_id] = (
+                    TargetCandidate(
+                        element_id=str(container["element_id"]),
+                        description=describe_element(container),
+                        operation=Operation.SELECT,
+                        option_label=label,
+                    ),
+                    None,
+                    {},
+                )
             contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
             # Title-bar buttons close, resize, or move the approved window itself, never a routine step.
             caption = {element["element_id"] for element in observation["elements"] if "titlebar" in element["path"]}
@@ -624,13 +671,21 @@ class Runtime:
                         candidate
                         for candidate in context.candidates
                         if candidate.element_id not in caption
+                        and (context.operation is not Operation.CLICK or candidate.element_id not in bound_options)
                         and (context.operation is not Operation.TOGGLE or candidate.element_id not in toggled)
                     ),
                 )
                 for context in contexts
             ]
             contexts = [context for context in contexts if context.candidates]
-            bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
+            if select_candidates:
+                contexts.append(
+                    OpContext(
+                        operation=Operation.SELECT,
+                        candidates=tuple(select_candidates),
+                        note="Select an observed option through its expanded combobox.",
+                    )
+                )
             for operation in (Operation.TYPE_TEXT, Operation.SCROLL):
                 base = build_contexts(observation=observation, operations=[operation])
                 choices = []
@@ -958,7 +1013,11 @@ class Runtime:
             if decision.target is None:
                 return self._pause(state, Reason.NO_APPROPRIATE_TARGET.value, {})
             target, fixture, scroll = bindings.get(decision.target.element_id, (decision.target, None, {}))
-            if decision.operation in {Operation.TYPE_TEXT, Operation.SELECT} and fixture is None:
+            if (
+                decision.operation in {Operation.TYPE_TEXT, Operation.SELECT}
+                and fixture is None
+                and target.option_label is None
+            ):
                 value_target = target
                 continue
             value_target = None
@@ -1413,13 +1472,15 @@ class Runtime:
                         {"step": step.step_id, "fixture": step.fixture_reference},
                     )
             if operation is Operation.SELECT:
-                if not step.fixture_reference:
+                option_label = target.option_label if target is not None else None
+                if option_label is None and not step.fixture_reference:
                     return self._pause(
                         state,
                         Reason.NEEDS_TEXT.value,
                         {"step": step.step_id, "detail": "SELECT needs an option fixture"},
                     )
-                option_label = self._fixture_value(state, step.fixture_reference)
+                if option_label is None:
+                    option_label = self._fixture_value(state, step.fixture_reference)
                 if option_label is None:
                     return self._pause(
                         state,

@@ -98,6 +98,7 @@ AVAILABILITY = {
     "selectionitem": _prop("UIA_IsSelectionItemPatternAvailablePropertyId", 30078),
     "selection": _prop("UIA_IsSelectionPatternAvailablePropertyId", 30077),
     "scroll": _prop("UIA_IsScrollPatternAvailablePropertyId", 30072),
+    "scrollitem": _prop("UIA_IsScrollItemPatternAvailablePropertyId", 30035),
     "expandcollapse": _prop("UIA_IsExpandCollapsePatternAvailablePropertyId", 30069),
     "text": _prop("UIA_IsTextPatternAvailablePropertyId", 30066),
     "window": _prop("UIA_IsWindowPatternAvailablePropertyId", 30076),
@@ -458,6 +459,16 @@ def _runtime_id(element: Any) -> tuple[int, ...]:
     return ()
 
 
+def _control_id(runtime_id: tuple[int, ...]) -> str | None:
+    if not runtime_id:
+        return None
+    return hashlib.blake2s(canonical_json(runtime_id).encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _fingerprint_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in state.items() if key != "selection_container_id"}
+
+
 def _bool(value: Any, default: bool = False) -> bool:
     return bool(value) if isinstance(value, (bool, int)) else default
 
@@ -528,6 +539,89 @@ def _operations_for(role: str, available: Mapping[str, bool], editable: bool) ->
             seen.add(candidate)
             unique.append(candidate)
     return tuple(unique)
+
+
+def _raw_scroll_ancestor(
+    worker: UiaWorker,
+    element: Any,
+    hwnd: int,
+    cache: dict[tuple[int, ...], Any | None],
+) -> Any | None:
+    """Find the nearest scroll provider omitted by UIA's ControlView.
+
+    Chromium keeps generic CSS overflow containers in RawView while flattening their controls
+    into ControlView. Stop at the approved top-level window so an observed child can never
+    import a desktop or foreign-window scroll target.
+    """
+
+    current = element
+    visited: list[tuple[int, ...]] = []
+    for _ in range(32):
+        try:
+            current = worker.automation.RawViewWalker.GetParentElement(current)
+        except Exception:
+            return None
+        if not current:
+            for runtime_id in visited:
+                cache[runtime_id] = None
+            return None
+        runtime_id = _runtime_id(current)
+        if runtime_id in cache:
+            result = cache[runtime_id]
+            for visited_id in visited:
+                cache[visited_id] = result
+            return result
+        if runtime_id:
+            visited.append(runtime_id)
+        native_handle = _cached(current, PROP_NATIVE_HANDLE)
+        if isinstance(native_handle, int) and native_handle:
+            if win32.root_window(native_handle) != win32.root_window(hwnd):
+                for visited_id in visited:
+                    cache[visited_id] = None
+                return None
+            if native_handle == hwnd:
+                for visited_id in visited:
+                    cache[visited_id] = None
+                return None
+        if _bool(_cached(current, AVAILABILITY["scroll"])):
+            for visited_id in visited:
+                cache[visited_id] = current
+            return current
+    for visited_id in visited:
+        cache[visited_id] = None
+    return None
+
+
+def _selection_container_id(
+    worker: UiaWorker,
+    element: Any,
+    observed: Mapping[tuple[int, ...], str],
+    registry: Registry,
+) -> str | None:
+    try:
+        owner = element.GetCurrentPropertyValue(30080)
+        if owner and not hasattr(owner, "GetCurrentPropertyValue"):
+            interface = getattr(uia_module(), "IUIAutomationElement", None)
+            if interface is None:
+                return None
+            owner = owner.QueryInterface(interface)
+    except Exception:
+        owner = None
+
+    for start in (owner, element):
+        current = start
+        for _ in range(32):
+            if not current:
+                break
+            element_id = observed.get(_runtime_id(current))
+            handle = registry.elements.get(element_id or "")
+            if handle is not None and handle.role == "combobox" and Operation.SELECT.value in handle.operations:
+                return handle.element_id
+            try:
+                current = worker.automation.RawViewWalker.GetParentElement(current)
+            except Exception:
+                break
+    return None
 
 
 def _control_type(element: Any) -> str:
@@ -668,6 +762,9 @@ def observe(
         traversal = [0]
         rows_dropped: list[int] = []
         for window_ref, hwnd in ordered_windows:
+            observed_runtime_ids: dict[tuple[int, ...], str] = {}
+            scroll_targets: set[tuple[int, ...]] = set()
+            raw_scroll_cache: dict[tuple[int, ...], Any | None] = {}
             try:
                 rect = win32.window_rect(hwnd)
             except DriverError:
@@ -729,6 +826,9 @@ def observe(
                     traversal=[0],
                     query=query,
                     deadline=deadline,
+                    observed_runtime_ids={},
+                    scroll_targets=set(),
+                    raw_scroll_cache={},
                 )
                 focused_elements.extend(focused_chrome + focused_content)
             content_seen = _walk(
@@ -754,6 +854,9 @@ def observe(
                 traversal=traversal,
                 query=query,
                 deadline=deadline,
+                observed_runtime_ids=observed_runtime_ids,
+                scroll_targets=scroll_targets,
+                raw_scroll_cache=raw_scroll_cache,
             )
         if not window_infos:
             raise DriverError("every window in scope closed during observation")
@@ -761,10 +864,10 @@ def observe(
         # Actionable elements are all in `elements` by now; content fills what is left, so a
         # dialog's own buttons are never crowded out by a file list that happens to sit earlier
         # in the tree.
-        observed_runtime_ids = {registry.elements[item.element_id].runtime_id for item in elements + deferred}
+        retained_runtime_ids = {registry.elements[item.element_id].runtime_id for item in elements + deferred}
         for item in focused_elements:
             runtime_id = registry.elements[item.element_id].runtime_id
-            if not runtime_id or runtime_id not in observed_runtime_ids:
+            if not runtime_id or runtime_id not in retained_runtime_ids:
                 deferred.insert(0, item)
         deferred.sort(
             key=lambda item: (
@@ -799,7 +902,17 @@ def observe(
         fingerprint = hashlib.blake2s(
             canonical_json(
                 [
-                    [e.window_ref, e.role, e.name, e.value, e.enabled, e.visible, e.focused, e.rect.to_json(), e.state]
+                    [
+                        e.window_ref,
+                        e.role,
+                        e.name,
+                        e.value,
+                        e.enabled,
+                        e.visible,
+                        e.focused,
+                        e.rect.to_json(),
+                        _fingerprint_state(e.state),
+                    ]
                     for e in elements
                 ]
                 + [[w.window_ref, w.title, w.rect.to_json(), w.enabled, w.modal, w.focused] for w in window_infos]
@@ -876,6 +989,9 @@ def _walk(
     traversal: list[int],
     query: str,
     deadline: float,
+    observed_runtime_ids: dict[tuple[int, ...], str],
+    scroll_targets: set[tuple[int, ...]],
+    raw_scroll_cache: dict[tuple[int, ...], Any | None],
 ) -> int:
     stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
     collections: list[tuple[Any, int, tuple[str, ...]]] = []
@@ -955,10 +1071,77 @@ def _walk(
         if not visible and not include_invisible:
             skipped.append(1)
             continue
+        runtime_id = _runtime_id(element)
+        if available.get("scroll") and runtime_id:
+            scroll_targets.add(runtime_id)
+        elif not query and available.get("scrollitem"):
+            scroll_ancestor = _raw_scroll_ancestor(worker, element, hwnd, raw_scroll_cache)
+            scroll_runtime_id = _runtime_id(scroll_ancestor) if scroll_ancestor is not None else ()
+            if scroll_runtime_id and scroll_runtime_id not in scroll_targets and len(elements) < max_elements:
+                scroll_rect = _rect_of(_cached(scroll_ancestor, PROP_BOUNDS))
+                scroll_offscreen = _bool(_cached(scroll_ancestor, PROP_OFFSCREEN), False)
+                if not scroll_rect.is_empty and (include_invisible or not scroll_offscreen):
+                    scroll_id = new_id("el")
+                    scroll_role = _control_type(scroll_ancestor)
+                    scroll_name_value = _cached(scroll_ancestor, PROP_NAME)
+                    scroll_name = scroll_name_value if isinstance(scroll_name_value, str) else ""
+                    scroll_enabled = _bool(_cached(scroll_ancestor, PROP_ENABLED), True)
+                    scroll_info = ElementInfo(
+                        element_id=scroll_id,
+                        window_ref=window_ref,
+                        role=scroll_role,
+                        name=scroll_name,
+                        value=None,
+                        enabled=scroll_enabled,
+                        visible=not scroll_offscreen,
+                        editable=False,
+                        focusable=_bool(_cached(scroll_ancestor, PROP_FOCUSABLE)),
+                        focused=_bool(_cached(scroll_ancestor, PROP_FOCUSED)),
+                        operations=(Operation.SCROLL.value,),
+                        rect=scroll_rect,
+                        index=registry.next_index,
+                        path=path[-4:],
+                        state={"password": False, "control_id": _control_id(scroll_runtime_id)},
+                        text=None,
+                        truncation=None,
+                    )
+                    registry.elements[scroll_id] = ElementHandle(
+                        element_id=scroll_id,
+                        element=scroll_ancestor,
+                        runtime_id=scroll_runtime_id,
+                        snapshot_id=snapshot_id,
+                        window_ref=window_ref,
+                        hwnd=hwnd,
+                        role=scroll_role,
+                        name=scroll_name,
+                        rect=scroll_rect,
+                        enabled=scroll_enabled,
+                        visible=not scroll_offscreen,
+                        operations=(Operation.SCROLL.value,),
+                        created_at=now(),
+                    )
+                    elements.append(scroll_info)
+                    observed_runtime_ids[scroll_runtime_id] = scroll_id
+                    scroll_targets.add(scroll_runtime_id)
+                    registry.next_index += 1
+        if len(elements) >= max_elements:
+            continue
         if role not in CHROME_ROLES and len(pending) >= max_elements + content_cap:
             truncation.append("content element cap reached")
             continue
         element_id = new_id("el")
+        selection_container_id = (
+            _selection_container_id(worker, element, observed_runtime_ids, registry)
+            if role == "listitem" and available.get("selectionitem")
+            else None
+        )
+        if selection_container_id is not None:
+            state["selection_container_id"] = selection_container_id
+            container = registry.elements[selection_container_id]
+            state["selection_container_control_id"] = _control_id(container.runtime_id)
+        control_id = _control_id(runtime_id)
+        if control_id is not None:
+            state["control_id"] = control_id
         native_handle = _cached(element, PROP_NATIVE_HANDLE)
         element_hwnd = int(native_handle) if isinstance(native_handle, int) and native_handle else hwnd
         operations = _operations_for(role, available, editable)
@@ -994,7 +1177,7 @@ def _walk(
         registry.elements[element_id] = ElementHandle(
             element_id=element_id,
             element=element,
-            runtime_id=_runtime_id(element),
+            runtime_id=runtime_id,
             snapshot_id=snapshot_id,
             window_ref=window_ref,
             hwnd=element_hwnd,
@@ -1006,7 +1189,9 @@ def _walk(
             operations=operations,
             created_at=now(),
         )
-        (elements if role in CHROME_ROLES else pending).append(info)
+        (elements if role in CHROME_ROLES or Operation.SCROLL.value in operations else pending).append(info)
+        if runtime_id:
+            observed_runtime_ids[runtime_id] = element_id
         registry.next_index += 1
         if element_text and len(texts) < 40:
             texts.append({"element_id": element_id, "role": role, "name": name, "text": element_text})
