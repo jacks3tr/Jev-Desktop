@@ -96,11 +96,12 @@ def _call(method: str, params: Mapping[str, Any], *, timeout_s: float) -> dict[s
 
 
 @server.tool(
+    structured_output=False,
     description=(
         "Discover observable applications and windows, or inspect one application and return a "
         "structured observation with an opaque app_ref, window refs, indexed elements, coverage "
         "limitations, and an optional scoped screenshot. Observation is authorized like input."
-    )
+    ),
 )
 def desktop_inspect(
     app_ref: str | None = None,
@@ -128,6 +129,7 @@ def desktop_inspect(
 
 
 @server.tool(
+    structured_output=False,
     description=(
         "Preferred for routine desktop use: supply task with goal, app_ref, window_refs, optional "
         "texts (named exact strings), secret_texts (named strings Jev never sees), hotkeys (chords), "
@@ -140,7 +142,7 @@ def desktop_inspect(
         "state, verdict, step records, assertion results, and evidence references. Resume requires the "
         "run_id and current resume_token and may only supply fixture values, scoped visual assistance, "
         "or an explicitly requested verifier result."
-    )
+    ),
 )
 def desktop_run(
     task: dict[str, Any] | None = None,
@@ -175,13 +177,14 @@ def desktop_run(
 
 
 @server.tool(
+    structured_output=False,
     description=(
         "Click, type, select, scroll, focus a window, or send keys from a current inspection. "
         "Supply snapshot_id, access_token, window_ref, and an observed element_id when needed. "
         "Alternatively, supply target_description for Jev to choose a control using a TypeSafe key. "
         "No run or test definition is required. Inspect again after each action. For an existing "
         "predefined run, supply run_id, resume_token, and step_id instead."
-    )
+    ),
 )
 def desktop_act(
     operation: str,
@@ -228,11 +231,12 @@ def desktop_act(
 
 
 @server.tool(
+    structured_output=False,
     description=(
         "Cancel the caller's run, release desktop control, or set the local emergency stop. The "
         "emergency stop is independent of any run, model, or capture work: it blocks all further input "
         "until the user clears it."
-    )
+    ),
 )
 def desktop_stop(
     run_id: str | None = None,

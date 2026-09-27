@@ -62,6 +62,7 @@ next action pauses with the first one's detail. If the result remains unclear, i
 window or request a screenshot.
 
 Paused tasks resume with `run_id` and `resume_token` within their original total budgets.
+A goal-task result summarizes its final controls without per-control geometry; inspect again before a direct action.
 A broker restart requires a new task and fresh references. Use direct actions for recovery;
 a new task is needed if its goal or supplied inputs change. This path preserves the desktop
 lease, native guards, cancellation, and no-replay journal without requiring a test definition.
