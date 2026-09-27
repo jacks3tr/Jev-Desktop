@@ -1145,6 +1145,11 @@ def _walk(
         native_handle = _cached(element, PROP_NATIVE_HANDLE)
         element_hwnd = int(native_handle) if isinstance(native_handle, int) and native_handle else hwnd
         operations = _operations_for(role, available, editable)
+        element_path = (
+            (*path[-3:], "titlebar")
+            if role == "button" and _cached(element, PROP_CLASSNAME) == "WinCaptionButton"
+            else path[-4:]
+        )
         text: str | None = None
         raw = ""
         if role in TEXT_ROLES or value:
@@ -1165,7 +1170,7 @@ def _walk(
             operations=operations,
             rect=rect,
             index=registry.next_index,
-            path=path[-4:],
+            path=element_path,
             state={**state, "password": password},
             text=None if password else element_text,
             truncation=None if element_text is None or text is None or len(text) < text_limit else "length",
