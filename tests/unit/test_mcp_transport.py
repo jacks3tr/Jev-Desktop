@@ -130,13 +130,27 @@ def test_mcp_tools_expose_the_same_engine(live_broker, tmp_path):
             )
             stop_text = [block for block in status.content if getattr(block, "type", "") == "text"]
             stop_payload = json.loads(stop_text[0].text) if stop_text else {}
+            inspect_wire = observed.model_dump(by_alias=True, exclude_none=True)
+            duplicated_wire = {
+                **inspect_wire,
+                "structuredContent": {
+                    "result": [block.model_dump(by_alias=True, exclude_none=True) for block in observed.content]
+                },
+            }
+            wire_sizes = {
+                "before": len(json.dumps(duplicated_wire, ensure_ascii=False, separators=(",", ":"))),
+                "after": len(json.dumps(inspect_wire, ensure_ascii=False, separators=(",", ":"))),
+            }
         return {
             "tools": names,
             "stop_arguments": set(stop_tool.input_schema["properties"]),
             "inspect": payload,
             "images": len(image_blocks),
+            "inspect_structured": observed.structured_content,
+            "run_structured": run.structured_content,
             "run": run_payload,
             "stop": stop_payload,
+            "wire_sizes": wire_sizes,
         }
 
     try:
@@ -149,6 +163,9 @@ def test_mcp_tools_expose_the_same_engine(live_broker, tmp_path):
     assert not {name for name in result["stop_arguments"] if "clear" in name}, "the halted agent cannot clear"
     assert {element["name"] for element in result["inspect"]["elements"]} == {"Save", "Saved"}
     assert result["images"] >= 1, "the screenshot must arrive as MCP image content"
+    assert result["inspect_structured"] is None, "structuredContent duplicates the hand-built content blocks"
+    assert result["run_structured"] is None, "structuredContent duplicates the hand-built content blocks"
+    assert result["wire_sizes"]["after"] < result["wire_sizes"]["before"]
     assert result["run"]["execution"] == "completed"
     assert result["run"]["verdict"] == "passed"
     assert result["run"]["assertions"][0]["status"] == "passed"
@@ -231,6 +248,15 @@ def test_mcp_standalone_action_needs_no_test_and_consumes_inspection(live_broker
 
 
 def test_mcp_goal_handoff_returns_one_summary(live_broker, tmp_path):
+    source_save = next(element for element in live_broker["app"].elements if element.name == "Save")
+    source_save.state = {
+        "checked": False,
+        "description": "",
+        "password": False,
+        "readonly": False,
+        "control_id": "native-only",
+    }
+    source_save.text = "Save"
     live_broker["broker"].policy = live_broker["broker"].runtime.policy = ScriptedPolicy(
         [
             ScriptedDecision(Operation.CLICK, "Save"),
@@ -263,6 +289,18 @@ def test_mcp_goal_handoff_returns_one_summary(live_broker, tmp_path):
     assert result["metrics"]["actions"] == 1
     assert result["metrics"]["decisions"] == 2
     assert result["metrics"]["slices"] == 1
+    saved = next(element for element in result["observation"]["elements"] if element["name"] == "Save")
+    assert saved["operations"] == ["CLICK"]
+    assert saved["state"] == {
+        "checked": False,
+        "description": "",
+        "password": False,
+        "readonly": False,
+    }
+    assert "text" not in saved
+    assert "rect" not in saved
+    assert saved["window_ref"] == live_broker["app"].window_ref
+    assert "enabled" not in saved and "visible" not in saved and "editable" not in saved
     assert "verdict" not in result and "assertions" not in result
     assert live_broker["broker"].ownership.active_lease() is None
 
