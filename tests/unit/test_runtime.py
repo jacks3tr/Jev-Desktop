@@ -758,6 +758,38 @@ def test_task_remembers_a_toggled_control_when_dynamic_ancestors_change(tmp_path
     journal.close()
 
 
+def test_task_remembers_a_toggled_control_when_provider_identity_is_remounted(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "before-remount"},
+            )
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.TOGGLE, "Dispatch"), ScriptedDecision(Operation.DONE)],
+    )
+    execute = driver.execute
+
+    def remount_control(request, guard, snapshot):
+        receipt = execute(request, guard, snapshot)
+        app.elements[0].state["control_id"] = "after-remount"
+        app.title = "Jev checkbox on"
+        return receipt
+
+    driver.execute = remount_control
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert [request.operation for request in driver.executed] == [Operation.TOGGLE]
+    offered = {context.operation for context in runtime.policy.calls[1]["contexts"]}
+    assert Operation.TOGGLE not in offered
+    journal.close()
+
+
 def test_task_toggle_identity_does_not_hide_a_different_same_named_control(tmp_path):
     runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,
@@ -796,6 +828,61 @@ def test_task_toggle_identity_does_not_hide_a_different_same_named_control(tmp_p
     )
     assert len(toggles) == 1
     assert "Second" in toggles[0].description
+    journal.close()
+
+
+def test_task_does_not_guess_a_remounted_toggle_among_collocated_identical_controls(tmp_path):
+    from dataclasses import replace
+
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "first"},
+                path=("First",),
+            ),
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "second"},
+                path=("Second",),
+            ),
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.TOGGLE, "Dispatch"), ScriptedDecision(Operation.DONE)],
+    )
+    observe = driver.observe
+    execute = driver.execute
+
+    def collocate_controls(scope, query=""):
+        snapshot = observe(scope, query)
+        shared_rect = snapshot.elements[0].rect
+        snapshot = replace(
+            snapshot,
+            elements=tuple(replace(element, rect=shared_rect) for element in snapshot.elements),
+        )
+        driver._snapshot = snapshot
+        return snapshot
+
+    def remount_first_control(request, guard, snapshot):
+        receipt = execute(request, guard, snapshot)
+        app.elements[0].state["control_id"] = "first-remounted"
+        app.title = "Jev checkbox on"
+        return receipt
+
+    driver.observe = collocate_controls
+    driver.execute = remount_first_control
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    toggles = next(
+        context.candidates for context in runtime.policy.calls[1]["contexts"] if context.operation is Operation.TOGGLE
+    )
+    assert len(toggles) == 2
     journal.close()
 
 
