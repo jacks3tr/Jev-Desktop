@@ -34,6 +34,7 @@ from .contracts import (
     EvidenceRef,
     Execution,
     IdentityReport,
+    InputMode,
     Limits,
     Operation,
     Pause,
@@ -646,10 +647,11 @@ class Runtime:
                         option_label=label,
                     )
                 )
+                dispatch_element = option if state.spec.interaction_mode is InputMode.SEMANTIC else container
                 bindings[candidate_id] = (
                     TargetCandidate(
-                        element_id=str(container["element_id"]),
-                        description=describe_element(container),
+                        element_id=str(dispatch_element["element_id"]),
+                        description=describe_element(dispatch_element),
                         operation=Operation.SELECT,
                         option_label=label,
                     ),
