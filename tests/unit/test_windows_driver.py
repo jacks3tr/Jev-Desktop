@@ -230,6 +230,43 @@ def test_observation_links_an_option_to_its_selection_container(monkeypatch):
     assert changed.fingerprint != snapshot.fingerprint
 
 
+def test_observation_fingerprint_ignores_remounted_control_identity(monkeypatch):
+    def observe(runtime_offset):
+        root = _ObservedElement(runtime_offset + 1, 50026, "root", Rect(0, 0, 100, 100))
+        combo = _ObservedElement(
+            runtime_offset + 2,
+            50003,
+            "Shell commands policy",
+            Rect(10, 10, 80, 30),
+            parent=root,
+            props={uia.AVAILABILITY["selection"]: True, uia.AVAILABILITY["expandcollapse"]: True},
+        )
+        popup = _ObservedElement(runtime_offset + 4, 50008, "", Rect(10, 31, 80, 70), parent=combo)
+        unknown_owner = NS(QueryInterface=lambda _interface: popup)
+        option = _ObservedElement(
+            runtime_offset + 3,
+            50007,
+            "Ask every time",
+            Rect(10, 31, 80, 50),
+            parent=popup,
+            props={uia.AVAILABILITY["selectionitem"]: True, uia.PROP_SELECTED: False, 30080: unknown_owner},
+        )
+        return _observe_fake_tree(monkeypatch, _observation_worker(root, {root: (combo, option)}))
+
+    monkeypatch.setattr(uia, "uia_module", lambda: NS(IUIAutomationElement=object()))
+    before = observe(0)
+    remounted = observe(100)
+    before_option = next(element for element in before.elements if element.name == "Ask every time")
+    remounted_option = next(element for element in remounted.elements if element.name == "Ask every time")
+
+    assert before_option.state["control_id"] != remounted_option.state["control_id"]
+    assert (
+        before_option.state["selection_container_control_id"]
+        != remounted_option.state["selection_container_control_id"]
+    )
+    assert before.fingerprint == remounted.fingerprint
+
+
 def test_observation_marks_only_native_caption_buttons_as_titlebar(monkeypatch):
     root = _ObservedElement(1, 50026, "root", Rect(0, 0, 100, 100))
     native_close = _ObservedElement(
