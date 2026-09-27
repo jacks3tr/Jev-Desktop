@@ -872,6 +872,62 @@ def test_task_selects_an_observed_option_through_its_expanded_combobox(tmp_path)
     journal.close()
 
 
+def test_semantic_task_selects_the_observed_option_itself(tmp_path):
+    from dataclasses import replace
+
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "combobox",
+                "Shell commands policy",
+                value="Always allow",
+                operations=("SELECT",),
+                state={"expanded": "expanded"},
+            ),
+            FakeElement(
+                "listitem",
+                "Ask every time",
+                operations=("SELECT",),
+                state={"selected": False},
+            ),
+        ],
+        steps=[],
+        purpose="task",
+        mode="semantic",
+        script=[ScriptedDecision(Operation.SELECT, "Ask every time"), ScriptedDecision(Operation.DONE)],
+    )
+    dispatched = []
+    execute = driver.execute
+    observe = driver.observe
+
+    def relate_option(scope, query=""):
+        snapshot = observe(scope, query)
+        container = next(element for element in snapshot.elements if element.role == "combobox")
+        snapshot = replace(
+            snapshot,
+            elements=tuple(
+                replace(element, state={**element.state, "selection_container_id": container.element_id})
+                if element.role == "listitem"
+                else element
+                for element in snapshot.elements
+            ),
+        )
+        driver._snapshot = snapshot
+        return snapshot
+
+    def record_target(request, guard, snapshot):
+        dispatched.append((snapshot.element(request.element_id).role, request.option_label))
+        return execute(request, guard, snapshot)
+
+    driver.observe = relate_option
+    driver.execute = record_target
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert dispatched == [("listitem", "Ask every time")]
+    journal.close()
+
+
 def test_task_keeps_list_items_clickable_without_observed_selection_ownership(tmp_path):
     elements = [
         FakeElement("listitem", "Open conversation", operations=("CLICK", "SELECT"), path=("Conversations",)),
