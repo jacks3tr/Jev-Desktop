@@ -727,6 +727,329 @@ def test_task_does_not_toggle_the_control_it_just_toggled(tmp_path):
     journal.close()
 
 
+def test_task_remembers_a_toggled_control_when_dynamic_ancestors_change(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "dispatch-control"},
+            )
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.TOGGLE, "Dispatch"), ScriptedDecision(Operation.DONE)],
+    )
+    execute = driver.execute
+
+    def change_title(request, guard, snapshot):
+        receipt = execute(request, guard, snapshot)
+        app.title = "Jev checkbox on"
+        return receipt
+
+    driver.execute = change_title
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert [request.operation for request in driver.executed] == [Operation.TOGGLE]
+    offered = {context.operation for context in runtime.policy.calls[1]["contexts"]}
+    assert Operation.TOGGLE not in offered
+    journal.close()
+
+
+def test_task_remembers_a_toggled_control_when_provider_identity_is_remounted(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "before-remount"},
+            )
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.TOGGLE, "Dispatch"), ScriptedDecision(Operation.DONE)],
+    )
+    execute = driver.execute
+
+    def remount_control(request, guard, snapshot):
+        receipt = execute(request, guard, snapshot)
+        app.elements[0].state["control_id"] = "after-remount"
+        app.title = "Jev checkbox on"
+        return receipt
+
+    driver.execute = remount_control
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert [request.operation for request in driver.executed] == [Operation.TOGGLE]
+    offered = {context.operation for context in runtime.policy.calls[1]["contexts"]}
+    assert Operation.TOGGLE not in offered
+    journal.close()
+
+
+def test_task_toggle_identity_does_not_hide_a_different_same_named_control(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "first"},
+                path=("First",),
+            ),
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "second"},
+                path=("Second",),
+            ),
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.TOGGLE, "Dispatch"), ScriptedDecision(Operation.DONE)],
+    )
+    execute = driver.execute
+
+    def change_title(request, guard, snapshot):
+        receipt = execute(request, guard, snapshot)
+        app.title = "Jev checkbox on"
+        return receipt
+
+    driver.execute = change_title
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    toggles = next(
+        context.candidates for context in runtime.policy.calls[1]["contexts"] if context.operation is Operation.TOGGLE
+    )
+    assert len(toggles) == 1
+    assert "Second" in toggles[0].description
+    journal.close()
+
+
+def test_task_does_not_guess_a_remounted_toggle_among_collocated_identical_controls(tmp_path):
+    from dataclasses import replace
+
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "first"},
+                path=("First",),
+            ),
+            FakeElement(
+                "button",
+                "Dispatch",
+                operations=("CLICK", "TOGGLE"),
+                state={"checked": "off", "control_id": "second"},
+                path=("Second",),
+            ),
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.TOGGLE, "Dispatch"), ScriptedDecision(Operation.DONE)],
+    )
+    observe = driver.observe
+    execute = driver.execute
+
+    def collocate_controls(scope, query=""):
+        snapshot = observe(scope, query)
+        shared_rect = snapshot.elements[0].rect
+        snapshot = replace(
+            snapshot,
+            elements=tuple(replace(element, rect=shared_rect) for element in snapshot.elements),
+        )
+        driver._snapshot = snapshot
+        return snapshot
+
+    def remount_first_control(request, guard, snapshot):
+        receipt = execute(request, guard, snapshot)
+        app.elements[0].state["control_id"] = "first-remounted"
+        app.title = "Jev checkbox on"
+        return receipt
+
+    driver.observe = collocate_controls
+    driver.execute = remount_first_control
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    toggles = next(
+        context.candidates for context in runtime.policy.calls[1]["contexts"] if context.operation is Operation.TOGGLE
+    )
+    assert len(toggles) == 2
+    journal.close()
+
+
+def test_task_selects_an_observed_option_through_its_expanded_combobox(tmp_path):
+    from dataclasses import replace
+
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "combobox",
+                "Shell commands policy",
+                value="Always allow",
+                operations=("CLICK", "TYPE_TEXT", "SELECT"),
+                state={"expanded": "expanded"},
+                path=("Settings",),
+            ),
+            FakeElement(
+                "listitem",
+                "Always allow",
+                operations=("CLICK", "SELECT"),
+                state={"selected": True},
+                path=("Settings", "Shell commands policy"),
+            ),
+            FakeElement(
+                "listitem",
+                "Ask every time",
+                operations=("CLICK", "SELECT"),
+                state={"selected": False},
+                path=("Settings", "Shell commands policy"),
+            ),
+        ],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.SELECT, "Ask every time"), ScriptedDecision(Operation.DONE)],
+    )
+    dispatched = []
+    execute = driver.execute
+    observe = driver.observe
+
+    def relate_options(scope, query=""):
+        snapshot = observe(scope, query)
+        container = next(element for element in snapshot.elements if element.name == "Shell commands policy")
+        snapshot = replace(
+            snapshot,
+            elements=tuple(
+                replace(
+                    element,
+                    state={**element.state, "selection_container_id": container.element_id},
+                )
+                if element.role == "listitem"
+                else element
+                for element in snapshot.elements
+            ),
+        )
+        driver._snapshot = snapshot
+        return snapshot
+
+    def record_target(request, guard, snapshot):
+        dispatched.append((snapshot.element(request.element_id).name, request.option_label))
+        return execute(request, guard, snapshot)
+
+    driver.observe = relate_options
+    driver.execute = record_target
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert dispatched == [("Shell commands policy", "Ask every time")]
+    offered = {context.operation: context for context in runtime.policy.calls[0]["contexts"]}
+    assert any('name="Ask every time"' in candidate.description for candidate in offered[Operation.SELECT].candidates)
+    assert not any(
+        'name="Ask every time"' in candidate.description for candidate in offered[Operation.CLICK].candidates
+    )
+    assert not any('name="Always allow"' in candidate.description for candidate in offered[Operation.CLICK].candidates)
+    journal.close()
+
+
+def test_semantic_task_selects_the_observed_option_itself(tmp_path):
+    from dataclasses import replace
+
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement(
+                "combobox",
+                "Shell commands policy",
+                value="Always allow",
+                operations=("SELECT",),
+                state={"expanded": "expanded"},
+            ),
+            FakeElement(
+                "listitem",
+                "Ask every time",
+                operations=("SELECT",),
+                state={"selected": False},
+            ),
+        ],
+        steps=[],
+        purpose="task",
+        mode="semantic",
+        script=[ScriptedDecision(Operation.SELECT, "Ask every time"), ScriptedDecision(Operation.DONE)],
+    )
+    dispatched = []
+    execute = driver.execute
+    observe = driver.observe
+
+    def relate_option(scope, query=""):
+        snapshot = observe(scope, query)
+        container = next(element for element in snapshot.elements if element.role == "combobox")
+        snapshot = replace(
+            snapshot,
+            elements=tuple(
+                replace(element, state={**element.state, "selection_container_id": container.element_id})
+                if element.role == "listitem"
+                else element
+                for element in snapshot.elements
+            ),
+        )
+        driver._snapshot = snapshot
+        return snapshot
+
+    def record_target(request, guard, snapshot):
+        dispatched.append((snapshot.element(request.element_id).role, request.option_label))
+        return execute(request, guard, snapshot)
+
+    driver.observe = relate_option
+    driver.execute = record_target
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert dispatched == [("listitem", "Ask every time")]
+    journal.close()
+
+
+def test_task_keeps_list_items_clickable_without_observed_selection_ownership(tmp_path):
+    elements = [
+        FakeElement("listitem", "Open conversation", operations=("CLICK", "SELECT"), path=("Conversations",)),
+        FakeElement(
+            "combobox",
+            "Policy",
+            operations=("CLICK", "SELECT"),
+            state={"expanded": "expanded"},
+            path=("Settings",),
+        ),
+        FakeElement(
+            "combobox",
+            "Policy",
+            operations=("CLICK", "SELECT"),
+            state={"expanded": "expanded"},
+            path=("Advanced",),
+        ),
+        FakeElement("listitem", "Ask", operations=("CLICK", "SELECT"), path=("Settings", "Policy")),
+    ]
+    runtime, _driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=elements,
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.ESCALATE), ScriptedDecision(Operation.ESCALATE)],
+    )
+    slice_once(runtime, ownership, session, created)
+    offered = {context.operation: context for context in runtime.policy.calls[0]["contexts"]}
+    clicks = [candidate.description for candidate in offered[Operation.CLICK].candidates]
+    assert any('name="Open conversation"' in description for description in clicks)
+    assert any('name="Ask"' in description for description in clicks)
+    assert Operation.SELECT not in offered
+    journal.close()
+
+
 def test_task_never_offers_the_windows_own_title_bar_buttons(tmp_path):
     runtime, _driver, _app, _clock, journal, ownership, session, created = build(
         tmp_path,

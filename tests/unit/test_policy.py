@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from jev_desktop.contracts import Operation, Pause, PolicyError, Reason, TargetCandidate
@@ -273,6 +275,80 @@ def test_connection_failures_never_carry_the_credential():
     with pytest.raises(PolicyError) as failure:
         policy.decide(goal="g", state={}, contexts=[context(Operation.CLICK, 1)], allow_done=True)
     assert fake_key not in str(failure.value)
+
+
+def test_policy_timeout_at_the_run_deadline_is_a_budget_pause():
+    class TimesOut:
+        def post_json(self, url, *, headers, payload, timeout_s):
+            raise TimeoutError("ReadTimeout")
+
+    policy = JevPolicy(transport=TimesOut(), api_key="test-key")
+    with pytest.raises(Pause) as failure:
+        policy.decide(
+            goal="g",
+            state={},
+            contexts=[context(Operation.CLICK, 1)],
+            allow_done=True,
+            deadline=time.monotonic() + 30,
+        )
+    assert failure.value.reason is Reason.BUDGET_EXHAUSTED
+    assert failure.value.detail == {"budget": "model_deadline"}
+
+
+def test_http_transport_classifies_a_read_timeout():
+    import httpx
+
+    class TimesOut:
+        def post(self, *args, **kwargs):
+            raise httpx.ReadTimeout("timed out")
+
+    transport = HttpTransport()
+    transport._client = TimesOut()
+    with pytest.raises(TimeoutError, match="ReadTimeout"):
+        transport.post_json("https://example.test", headers={}, payload={}, timeout_s=1)
+
+
+def test_configured_provider_timeout_remains_a_policy_error_before_the_run_deadline():
+    class TimesOut:
+        def post_json(self, url, *, headers, payload, timeout_s):
+            raise TimeoutError("ReadTimeout")
+
+    policy = JevPolicy(
+        transport=TimesOut(),
+        config=PolicyConfig(timeout_s=0.1),
+        api_key="test-key",
+    )
+    with pytest.raises(PolicyError, match="ReadTimeout"):
+        policy.decide(
+            goal="g",
+            state={},
+            contexts=[context(Operation.CLICK, 1)],
+            allow_done=True,
+            deadline=time.monotonic() + 30,
+        )
+
+
+def test_provider_timeout_after_multiple_io_phases_respects_elapsed_run_deadline(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("jev_desktop.policy.time.monotonic", lambda: clock[0])
+
+    class TimesOut:
+        def post_json(self, url, *, headers, payload, timeout_s):
+            assert timeout_s == 2.0
+            clock[0] = 105.0
+            raise TimeoutError("ReadTimeout")
+
+    policy = JevPolicy(transport=TimesOut(), config=PolicyConfig(timeout_s=2.0), api_key="test-key")
+    with pytest.raises(Pause) as failure:
+        policy.decide(
+            goal="g",
+            state={},
+            contexts=[context(Operation.CLICK, 1)],
+            allow_done=True,
+            deadline=104.0,
+        )
+    assert failure.value.reason is Reason.BUDGET_EXHAUSTED
+    assert failure.value.detail == {"budget": "model_deadline"}
 
 
 def test_sanitize_message_redacts_a_credential_that_appears_in_the_text():

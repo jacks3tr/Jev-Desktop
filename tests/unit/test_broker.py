@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import jev_desktop
+from jev_desktop import broker as broker_module
 from jev_desktop import client as client_module
 from jev_desktop.broker import Broker, BrokerConfig, fit_frame
 from jev_desktop.client import BrokerClient, BrokerError
@@ -135,6 +136,32 @@ def test_run_completes_and_returns_verdict_with_evidence(broker_env):
 
     evidence = client.call("evidence", {"evidence_id": payload["evidence"][0]["evidence_id"]})
     assert evidence["base64"], "evidence is fetchable by reference"
+
+
+def test_task_result_summary_keeps_window_attribution_for_identical_controls():
+    task_result_view = getattr(broker_module, "task_result_view", None)
+    assert callable(task_result_view), "goal-task results need a compact, non-actionable observation summary"
+    observation = {
+        "elements": [
+            {
+                "element_id": "el:" + character * 24,
+                "window_ref": "win:" + character * 24,
+                "index": index,
+                "role": "button",
+                "name": "Close",
+                "path": ["Dialog", "group"],
+                "rect": {"left": index, "top": 0, "right": index + 1, "bottom": 1},
+            }
+            for index, character in enumerate(("a", "b"), start=1)
+        ]
+    }
+    summary = task_result_view(observation)
+    assert summary is not None
+    assert [element["window_ref"] for element in summary["elements"]] == [
+        "win:" + "a" * 24,
+        "win:" + "b" * 24,
+    ]
+    assert all("rect" not in element for element in summary["elements"])
 
 
 def test_unauthorized_session_and_unknown_method_are_refused(broker_env):

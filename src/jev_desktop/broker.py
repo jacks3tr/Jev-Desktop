@@ -856,6 +856,9 @@ class Broker:
     def _run_payload(self, result: RunResult, *, inline_image: bool) -> dict[str, Any]:
         state = self.runtime._load(result.run_id)
         if state.spec.purpose is Purpose.TASK:
+            observation = (
+                result.observation if result.execution.value == "completed" else state.summary.get("task_observation")
+            )
             return {
                 "run_id": result.run_id,
                 "resume_token": result.resume_token,
@@ -863,9 +866,7 @@ class Broker:
                 "reason": result.reason,
                 "completion": result.detail.get("completion"),
                 "detail": dict(result.detail),
-                "observation": result.observation
-                if result.execution.value == "completed"
-                else state.summary.get("task_observation"),
+                "observation": task_result_view(observation),
                 "actions": [
                     {
                         "operation": step.operation.value,
@@ -883,6 +884,53 @@ class Broker:
             images.append(self._evidence_payload(reference, include_base64=True))
         payload["images"] = images
         return payload
+
+
+def task_result_view(observation: Any) -> dict[str, Any] | None:
+    """Project a task's final observation into a non-actionable result summary."""
+    if not isinstance(observation, Mapping):
+        return None
+    result = dict(observation)
+    elements = observation.get("elements")
+    if not isinstance(elements, list):
+        return result
+    projected = []
+    defaults = {"enabled": True, "visible": True, "editable": False, "focusable": False, "focused": False}
+    internal_state_keys = {
+        "control_id",
+        "selection_container_control_id",
+        "selection_container_id",
+    }
+    for element in elements:
+        if not isinstance(element, Mapping):
+            continue
+        item = {
+            key: element.get(key)
+            for key in ("element_id", "window_ref", "index", "role", "name", "path")
+            if element.get(key) is not None
+        }
+        if element.get("value") is not None:
+            item["value"] = element["value"]
+        operations = element.get("operations")
+        if operations:
+            item["operations"] = operations
+        for key, default in defaults.items():
+            value = element.get(key, default)
+            if value != default:
+                item[key] = value
+        text = element.get("text")
+        if text and text not in {element.get("name"), element.get("value")}:
+            item["text"] = text
+        state = element.get("state")
+        if isinstance(state, Mapping):
+            semantic_state = {key: value for key, value in state.items() if key not in internal_state_keys}
+            if semantic_state:
+                item["state"] = semantic_state
+        if element.get("truncation"):
+            item["truncation"] = element["truncation"]
+        projected.append(item)
+    result["elements"] = projected
+    return result
 
 
 def _frame_size(payload: Envelope) -> int:

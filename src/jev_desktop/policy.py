@@ -166,13 +166,17 @@ class HttpTransport:
     def post_json(
         self, url: str, *, headers: Mapping[str, str], payload: Mapping[str, Any], timeout_s: float | None
     ) -> tuple[int, Any]:
+        import httpx
+
         client = self._client
         if client is None:
-            import httpx
-
             client = self._client = httpx.Client(http2=False, timeout=None)
         try:
             response = client.post(url, json=dict(payload), headers=dict(headers), timeout=timeout_s)
+        except httpx.TimeoutException as exc:
+            authorization = str(headers.get("Authorization", ""))
+            secret = authorization.removeprefix("Bearer ").strip() or None
+            raise TimeoutError(f"{type(exc).__name__}: {sanitize_message(str(exc), secret)}") from exc
         except Exception as exc:  # network failure: never dispatch anything
             authorization = str(headers.get("Authorization", ""))
             secret = authorization.removeprefix("Bearer ").strip() or None
@@ -634,18 +638,37 @@ class JevPolicy:
             remaining = self.config.timeout_s if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "model_deadline"})
+            timeout_s = (
+                min(self.config.timeout_s, remaining)
+                if self.config.timeout_s is not None and remaining is not None
+                else remaining
+            )
+            deadline_bounded = (
+                deadline is not None
+                and remaining is not None
+                and (self.config.timeout_s is None or remaining <= self.config.timeout_s)
+            )
             attempt_started = time.perf_counter()
             try:
                 status, payload = self.transport.post_json(
                     self.config.endpoint,
                     headers=headers,
                     payload=body,
-                    timeout_s=(
-                        min(self.config.timeout_s, remaining)
-                        if self.config.timeout_s is not None and remaining is not None
-                        else remaining
-                    ),
+                    timeout_s=timeout_s,
                 )
+            except TimeoutError as exc:
+                self.last_attempts.append(
+                    {
+                        "outcome": "transport_failure",
+                        "latency_ms": int((time.perf_counter() - attempt_started) * 1000),
+                        "usage": {},
+                    }
+                )
+                if deadline_bounded or (deadline is not None and time.monotonic() >= deadline):
+                    raise Pause(Reason.BUDGET_EXHAUSTED, {"budget": "model_deadline"}) from exc
+                raise PolicyError(
+                    f"policy transport failed: {type(exc).__name__}: {sanitize_message(str(exc), secret)}"
+                ) from exc
             except Exception as exc:
                 self.last_attempts.append(
                     {

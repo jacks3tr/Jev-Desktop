@@ -69,8 +69,9 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
 **Controls.**
 - Distinguish text typed into a navigation field from the page or selection that submitting it
   reaches.
-- For a dropdown, open it and choose an observed option. A label in `texts` does not prove the
-  dropdown contains that option.
+- For a dropdown, open it so its options are observed, then name the observed option. Jev
+  uses `SELECT` for a native-select option; do not ask it to click the popup option. A label
+  in `texts` does not prove the dropdown contains that option.
 - To open a context menu, focus or select the item and allow `shift+f10`; there is no
   right-click. A web or Electron menu appears in the observation. A native Windows popup menu
   does not, so choose its item with `down` and `enter`.
@@ -82,23 +83,29 @@ hold at most 16 values. List permitted keyboard chords in `hotkeys`.
 **Scope and budgets.** A task stays within the supplied windows and cannot launch
 applications. If its only window is not focused, Jev focuses it first. It never uses the
 window's own title-bar buttons; allow `alt+f4` if the goal is to close the window. Defaults
-are 20 actions, 40 model decisions, and 60 seconds; a call lasts at most 120 seconds. Set
+are 20 actions, 40 model decisions, and 60 seconds; `timeout_seconds` cannot exceed 120. Set
 `max_actions`, `max_model_decisions`, and `timeout_seconds` for the work. Resume a paused task
 with its `run_id` and `resume_token`; the goal, scope, and inputs cannot change, and total
-budgets do not reset.
+budgets do not reset. Resuming cannot recover exhausted action, decision, or total time budgets.
 
 Do not translate a routine goal into individual `desktop_act` calls or a test specification.
 
 ## 3. Read the result
 
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
+Task observations are summaries: they retain controls, window references, paths, values, and
+semantic state, but omit rectangles, default flags, and internal native IDs. Omitted element
+flags mean enabled and visible, but not editable, focusable, or focused. Inspect again for a
+full observation and authorization before a direct action. MCP returns JSON text and optional
+image content blocks without a duplicate `structuredContent` result.
 `completion: model_reported` means Jev chose DONE and a separate check of the final
 observation, made without the action history, confirmed the goal is visible. When that check
 says no, or is still unsure after Jev observes once more, the task pauses with
-`needs_visual_assistance` instead. A `low_confidence` entry in its detail holds the doubted
-answer: `selected` YES or NO from that check, or an `operation` when Jev doubted finishing. A
-`low_confidence` pause comes only after Jev observed again and was still unsure; its detail
-names the doubted `operation` and the numbers. Neither is an independent verification: check
+`needs_visual_assistance` instead. For uncertain completion, `detail.low_confidence` holds
+the check's `selected` YES or NO and confidence data, or the doubted finishing `operation`.
+A run paused with `reason: low_confidence` instead carries the doubted `operation` and
+confidence data directly in `detail`, after observing again. Neither is an independent
+verification: check
 the returned observation before reporting success, and never turn an uncertain or
 budget-limited result into a success claim.
 
@@ -122,7 +129,9 @@ so you can `FOCUS_WINDOW` and retry with the same `snapshot_id`.
 Explicit targets need no TypeSafe key; task handoffs and `target_description` require one.
 
 **Screenshots and coordinates.** Request a screenshot only when you need visual context; it
-adds nothing to Jev's decisions. Screenshots need a scoped window in the foreground, and
+adds nothing to Jev's decisions. Set `include_screenshot: false` on MCP inspections when you do
+not need one; screenshots default on and can make results large. Screenshots need a scoped
+window in the foreground, and
 inspection never focuses one, so use `FOCUS_WINDOW` first. For a screenshot-based click,
 toggle, or scroll, supply `point` instead of `element_id`: copy the evidence ID, crop, scale,
 image dimensions, and geometry epoch from the screenshot, and set `x` and `y` in image pixels.
@@ -145,8 +154,9 @@ or resolve the blocked state, then hand back the remaining goal.
 - **Broker or worker stopped:** `broker_unavailable` or `driver_error` means the call reached
   no broker or its native worker exited; the next call reaches a replacement on its own.
   References do not survive a replacement, and a task with an expired `app_ref` is refused as
-  `invalid_request`: inspect again. Check a run's status before assuming its input was or was
-  not sent.
+  `invalid_request`: inspect again. After a connection loss, never resend a mutating call:
+  it may have acted. CLI users can check `jev-desktop status --run-id … --resume-token …`;
+  MCP users should inspect the application state before deciding how to continue.
 - **Uncertain effect:** a direct action returns `uncertain_effect`. Never repeat the action. An acknowledged input is not proof that the
   application did what you intended; inspect its result.
 - **Low confidence:** check competing candidates before touching thresholds. Duplicate
@@ -155,8 +165,9 @@ or resolve the blocked state, then hand back the remaining goal.
 
 While Jev holds the desktop, a blue glow marks the screen edges. When the user clicks, scrolls,
 or types, Jev sends nothing, waits until they have been idle for 3 seconds, observes again, and
-continues, refocusing its window if needed; the wait does not use the task's time. If the user
-keeps working, the run pauses with `user_takeover` and `resumable: true`: ask before resuming.
+continues, refocusing its window if needed. Idle waiting extends the task deadline by at most
+300 seconds total and remains bounded by the current slice. At either bound, the run pauses
+with `user_takeover` and `resumable: true`: ask before resuming.
 Pressing Esc cancels the run (`Esc pressed`); do not restart it unless the user asks.
 
 `desktop_stop(emergency=true)` blocks further input independently of the broker's current work.
