@@ -14,6 +14,7 @@ import math
 import os
 import subprocess
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -87,12 +88,22 @@ def _element_signature(element: Mapping[str, Any]) -> str:
     return digest([element.get(key) for key in ("role", "name", "value", "text", "path")])[:16]
 
 
-def _control_key(element: Mapping[str, Any]) -> str:
-    """The same control across observations, whatever its state or element ID."""
+def _native_control_key(element: Mapping[str, Any]) -> str | None:
     control_id = (element.get("state") or {}).get("control_id")
     if isinstance(control_id, str) and control_id:
         return digest([element.get("window_ref"), control_id])[:16]
+    return None
+
+
+def _control_fallback_key(element: Mapping[str, Any]) -> str:
     return digest([element.get(key) for key in ("window_ref", "role", "name", "rect")])[:16]
+
+
+@dataclass(frozen=True)
+class _ToggledControl:
+    native_key: str | None
+    fallback_key: str
+    fallback_was_unique: bool
 
 
 def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str, Any]:
@@ -588,7 +599,7 @@ class Runtime:
         operations_without_target: set[Operation] = set()
         operations_checked_on = snapshot.snapshot_id
         # A toggle undoes itself, so the control just toggled is not offered for TOGGLE again.
-        last_toggled: str | None = None
+        last_toggled: _ToggledControl | None = None
         escalated = False
         auto_focused = False
         while True:
@@ -661,11 +672,26 @@ class Runtime:
             contexts = build_contexts(observation=observation, operations=[Operation.CLICK, Operation.TOGGLE])
             # Title-bar buttons close, resize, or move the approved window itself, never a routine step.
             caption = {element["element_id"] for element in observation["elements"] if "titlebar" in element["path"]}
-            toggled = {
-                element["element_id"]
-                for element in observation["elements"]
-                if last_toggled is not None and _control_key(element) == last_toggled
-            }
+            fallback_counts = Counter(_control_fallback_key(element) for element in observation["elements"])
+            prior_native_missing = last_toggled is not None and (
+                last_toggled.native_key is None
+                or all(_native_control_key(element) != last_toggled.native_key for element in observation["elements"])
+            )
+            toggled = set()
+            if last_toggled is not None:
+                for element in observation["elements"]:
+                    fallback_key = _control_fallback_key(element)
+                    same_native = (
+                        last_toggled.native_key is not None and _native_control_key(element) == last_toggled.native_key
+                    )
+                    unique_remount = (
+                        prior_native_missing
+                        and last_toggled.fallback_was_unique
+                        and fallback_key == last_toggled.fallback_key
+                        and fallback_counts[fallback_key] == 1
+                    )
+                    if same_native or unique_remount:
+                        toggled.add(element["element_id"])
             contexts = [
                 replace(
                     context,
@@ -1035,18 +1061,23 @@ class Runtime:
             )
             if isinstance(dispatched, RunResult):
                 return dispatched
-            last_toggled = (
-                next(
-                    (
-                        _control_key(element)
-                        for element in observation["elements"]
-                        if element["element_id"] == target.element_id
-                    ),
+            if decision.operation is Operation.TOGGLE:
+                toggled_element = next(
+                    (element for element in observation["elements"] if element["element_id"] == target.element_id),
                     None,
                 )
-                if decision.operation is Operation.TOGGLE
-                else None
-            )
+                if toggled_element is not None:
+                    fallback_key = _control_fallback_key(toggled_element)
+                    last_toggled = _ToggledControl(
+                        native_key=_native_control_key(toggled_element),
+                        fallback_key=fallback_key,
+                        fallback_was_unique=sum(
+                            _control_fallback_key(element) == fallback_key for element in observation["elements"]
+                        )
+                        == 1,
+                    )
+            else:
+                last_toggled = None
             snapshot = self._observe(state) if dispatched.snapshot_id == snapshot.snapshot_id else dispatched
             inputs_without_value.clear()
             doubt = None
