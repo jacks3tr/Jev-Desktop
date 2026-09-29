@@ -140,6 +140,21 @@ def test_center_popover_does_not_hide_the_active_document(browser):
     assert "Sleeping page" not in names
 
 
+def test_popover_with_host_hits_at_document_edges_keeps_the_exposed_page(browser):
+    popup_rect = Rect(30, 30, 70, 80)
+    popup = Node(20, 50026, "Popover", popup_rect, parent=browser.root)
+    Node(21, 50000, "Popover action", Rect(35, 35, 65, 55), parent=popup)
+
+    def hit(x, y):
+        # Browser borders/scrollbars can resolve to the host instead of the document.
+        if x < 3 or x >= 97 or y < 13 or y >= 97:
+            return browser.root
+        return popup if popup_rect.contains(x, y) else browser.active
+
+    browser.worker.element_at_point = hit
+    assert {"Device sign-in", "Continue", "Popover action"} <= {element.name for element in inspect(browser).elements}
+
+
 def test_dialog_inside_active_document_is_positive_visibility_evidence(browser):
     dialog = Node(20, 50026, "Sign-in dialog", Rect(0, 10, 100, 100), parent=browser.active)
     Node(21, 50000, "Dialog action", Rect(30, 30, 70, 60), parent=dialog)

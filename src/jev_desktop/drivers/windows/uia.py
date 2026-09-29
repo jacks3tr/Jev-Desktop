@@ -1247,14 +1247,20 @@ def _chromium_document_visible(
     rect = _rect_of(_cached(element, PROP_BOUNDS)).intersect(window_rect)
     visible = False
     if not _bool(_cached(element, PROP_OFFSCREEN)) and not rect.is_empty:
-        # A dialog or popover may cover the center. Sample the exposed edges as well;
-        # hits on a document's descendants (including its dialogs/iframes) prove it.
+        # A dialog or popover may cover the center. Sample the exposed corners as well,
+        # including inset points where borders/scrollbars hit the host rather than the
+        # page. Hits on descendants (including dialogs/iframes) prove the document.
+        inset_x, inset_y = rect.width // 10, rect.height // 10
         points = (
             rect.center(),
             (rect.left, rect.top),
             (rect.right - 1, rect.top),
             (rect.left, rect.bottom - 1),
             (rect.right - 1, rect.bottom - 1),
+            (rect.left + inset_x, rect.top + inset_y),
+            (rect.right - 1 - inset_x, rect.top + inset_y),
+            (rect.left + inset_x, rect.bottom - 1 - inset_y),
+            (rect.right - 1 - inset_x, rect.bottom - 1 - inset_y),
         )
         visible = any(point_hits_element(worker, element, x, y) for x, y in dict.fromkeys(points))
     if runtime_id:
