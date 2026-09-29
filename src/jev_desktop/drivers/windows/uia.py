@@ -766,6 +766,7 @@ def observe(
             observed_runtime_ids: dict[tuple[int, ...], str] = {}
             scroll_targets: set[tuple[int, ...]] = set()
             raw_scroll_cache: dict[tuple[int, ...], Any | None] = {}
+            document_visibility: dict[tuple[int, ...], bool] = {}
             try:
                 rect = win32.window_rect(hwnd)
             except DriverError:
@@ -773,6 +774,7 @@ def observe(
                 coverage = Coverage.PARTIAL
                 continue
             owner_hwnd = win32.owner_window(hwnd)
+            chromium_window = win32.window_class(hwnd).startswith("Chrome_WidgetWin_")
             window_infos.append(
                 WindowInfo(
                     window_ref=window_ref,
@@ -830,6 +832,10 @@ def observe(
                     observed_runtime_ids={},
                     scroll_targets=set(),
                     raw_scroll_cache={},
+                    window_rect=rect,
+                    chromium_window=chromium_window,
+                    document_visibility=document_visibility,
+                    check_document_ancestors=True,
                 )
                 focused_elements.extend(focused_chrome + focused_content)
             content_seen = _walk(
@@ -858,6 +864,9 @@ def observe(
                 observed_runtime_ids=observed_runtime_ids,
                 scroll_targets=scroll_targets,
                 raw_scroll_cache=raw_scroll_cache,
+                window_rect=rect,
+                chromium_window=chromium_window,
+                document_visibility=document_visibility,
             )
         if not window_infos:
             raise DriverError("every window in scope closed during observation")
@@ -993,9 +1002,18 @@ def _walk(
     observed_runtime_ids: dict[tuple[int, ...], str],
     scroll_targets: set[tuple[int, ...]],
     raw_scroll_cache: dict[tuple[int, ...], Any | None],
+    window_rect: Rect,
+    chromium_window: bool,
+    document_visibility: dict[tuple[int, ...], bool],
+    check_document_ancestors: bool = False,
 ) -> int:
-    stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
-    collections: list[tuple[Any, int, tuple[str, ...]]] = []
+    # The focused-element fast path starts below the window root. Check its document
+    # ancestors too, so it cannot reintroduce content excluded by the main tree walk.
+    ancestor_visible = not check_document_ancestors or _document_ancestors_visible(
+        worker, element, window_rect, chromium_window, document_visibility
+    )
+    stack: list[tuple[Any, int, tuple[str, ...], bool]] = [(iter((element,)), depth, (), ancestor_visible)]
+    collections: list[tuple[Any, int, tuple[str, ...], bool]] = []
     collection_phase = False
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
     while stack or collections:
@@ -1010,7 +1028,7 @@ def _walk(
             break
         if len(elements) >= max_elements:
             break
-        iterator, depth, path = stack[-1]
+        iterator, depth, path, document_visible = stack[-1]
         try:
             element = next(iterator)
         except StopIteration:
@@ -1034,8 +1052,18 @@ def _walk(
             continue
         name_value = _cached(element, PROP_NAME)
         name = name_value if isinstance(name_value, str) else ""
+        if role == "document" and (chromium_window or _cached(element, PROP_FRAMEWORK) == "Chrome"):
+            document_visible = document_visible and _chromium_document_visible(
+                worker, element, window_rect, document_visibility
+            )
+        if not document_visible and not include_invisible:
+            # Prune before scheduling children: stale controls must not spend the budget
+            # or become query matches just because they claim IsOffscreen=False.
+            skipped.append(1)
+            truncation.append("Chromium document subtree was not observed because rendered visibility was not proven")
+            continue
         if depth < max_depth:
-            children = (iter(worker.children(element)), depth + 1, (*path, name or role))
+            children = (iter(worker.children(element)), depth + 1, (*path, name or role), document_visible)
             if role in {"list", "tree", "datagrid", "table"}:
                 collections.append(children)
             else:
@@ -1068,7 +1096,7 @@ def _walk(
         editable = (available.get("value") and not readonly and role in TEXT_ENTRY_ROLES) or (
             role == "edit" and not readonly
         )
-        visible = (not offscreen) and not rect.is_empty
+        visible = document_visible and (not offscreen) and not rect.is_empty
         if not visible and not include_invisible:
             skipped.append(1)
             continue
@@ -1081,7 +1109,8 @@ def _walk(
             if scroll_runtime_id and scroll_runtime_id not in scroll_targets and len(elements) < max_elements:
                 scroll_rect = _rect_of(_cached(scroll_ancestor, PROP_BOUNDS))
                 scroll_offscreen = _bool(_cached(scroll_ancestor, PROP_OFFSCREEN), False)
-                if not scroll_rect.is_empty and (include_invisible or not scroll_offscreen):
+                scroll_visible = document_visible and not scroll_offscreen and not scroll_rect.is_empty
+                if not scroll_rect.is_empty and (include_invisible or scroll_visible):
                     scroll_id = new_id("el")
                     scroll_role = _control_type(scroll_ancestor)
                     scroll_name_value = _cached(scroll_ancestor, PROP_NAME)
@@ -1094,7 +1123,7 @@ def _walk(
                         name=scroll_name,
                         value=None,
                         enabled=scroll_enabled,
-                        visible=not scroll_offscreen,
+                        visible=scroll_visible,
                         editable=False,
                         focusable=_bool(_cached(scroll_ancestor, PROP_FOCUSABLE)),
                         focused=_bool(_cached(scroll_ancestor, PROP_FOCUSED)),
@@ -1117,7 +1146,7 @@ def _walk(
                         name=scroll_name,
                         rect=scroll_rect,
                         enabled=scroll_enabled,
-                        visible=not scroll_offscreen,
+                        visible=scroll_visible,
                         operations=(Operation.SCROLL.value,),
                         created_at=now(),
                     )
@@ -1203,6 +1232,60 @@ def _walk(
             texts.append({"element_id": element_id, "role": role, "name": name, "text": element_text})
 
     return content_seen
+
+
+def _chromium_document_visible(
+    worker: UiaWorker,
+    element: Any,
+    window_rect: Rect,
+    cache: dict[tuple[int, ...], bool],
+) -> bool:
+    """Require rendered hit ancestry, not stale background-tab bounds or offscreen flags."""
+    runtime_id = _runtime_id(element)
+    if runtime_id and runtime_id in cache:
+        return cache[runtime_id]
+    rect = _rect_of(_cached(element, PROP_BOUNDS)).intersect(window_rect)
+    visible = False
+    if not _bool(_cached(element, PROP_OFFSCREEN)) and not rect.is_empty:
+        # A dialog or popover may cover the center. Sample the exposed edges as well;
+        # hits on a document's descendants (including its dialogs/iframes) prove it.
+        points = (
+            rect.center(),
+            (rect.left, rect.top),
+            (rect.right - 1, rect.top),
+            (rect.left, rect.bottom - 1),
+            (rect.right - 1, rect.bottom - 1),
+        )
+        visible = any(point_hits_element(worker, element, x, y) for x, y in dict.fromkeys(points))
+    if runtime_id:
+        cache[runtime_id] = visible
+    return visible
+
+
+def _document_ancestors_visible(
+    worker: UiaWorker,
+    element: Any,
+    window_rect: Rect,
+    chromium_window: bool,
+    cache: dict[tuple[int, ...], bool],
+) -> bool:
+    if not chromium_window and _cached(element, PROP_FRAMEWORK) != "Chrome":
+        return True
+    try:
+        parent = worker.automation.RawViewWalker.GetParentElement(element)
+        for _ in range(64):
+            if not parent:
+                return True
+            if (
+                _control_type(parent) == "document"
+                and (chromium_window or _cached(parent, PROP_FRAMEWORK) == "Chrome")
+                and not _chromium_document_visible(worker, parent, window_rect, cache)
+            ):
+                return False
+            parent = worker.automation.RawViewWalker.GetParentElement(parent)
+    except Exception:
+        return False
+    return False
 
 
 def resolve_element(registry: Registry, element_id: str, snapshot_id: str | None, app_ref: str) -> ElementHandle:
