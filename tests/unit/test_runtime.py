@@ -454,12 +454,16 @@ def test_goal_task_runs_locally_and_never_replays_uncertain_input(tmp_path, unce
     journal.close()
 
 
-def test_task_bounds_waits_on_an_unchanged_observation(tmp_path):
+@pytest.mark.parametrize("purpose", ["task", "regression"])
+def test_bounds_waits_on_an_unchanged_observation(tmp_path, purpose):
     runtime, driver, _app, _clock, journal, ownership, session, created = build(
         tmp_path,
-        elements=[FakeElement("text", "Searching this workspace", operations=())],
-        steps=[],
-        purpose="task",
+        elements=[
+            FakeElement("text", "Searching this workspace", operations=()),
+            FakeElement("button", "Save", operations=("CLICK",)),
+        ],
+        steps=[] if purpose == "task" else [{"step_id": "save", "operation": "CLICK", "target_description": "Save"}],
+        purpose=purpose,
         script=[ScriptedDecision(Operation.WAIT)] * 40,
         limits={**Limits.defaults().to_json(), "max_model_decisions": 40, "no_progress_retries": 2},
     )
@@ -471,6 +475,25 @@ def test_task_bounds_waits_on_an_unchanged_observation(tmp_path):
     assert result.budgets["actions"] == 0
     assert result.observation["elements"][0]["name"] == "Searching this workspace"
     assert len(driver.executed) == 0
+    journal.close()
+
+
+def test_wait_progress_limit_survives_slice_boundaries(tmp_path):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("text", "Loading", operations=())],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.WAIT)] * 40,
+    )
+    result = slice_once(runtime, ownership, session, created, seconds=0.2)
+    assert result.reason == "budget_exhausted"
+    for _ in range(2):
+        ownership.acquire(session.session_id, created["run_id"])
+        result = slice_once(runtime, ownership, session, created, resume_token=result.resume_token, seconds=0.2)
+    assert result.reason == "step_unresolved"
+    assert result.budgets["decisions"] == 3
+    assert driver.executed == []
     journal.close()
 
 
