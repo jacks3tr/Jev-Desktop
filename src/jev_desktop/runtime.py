@@ -1238,6 +1238,8 @@ class Runtime:
             return None
         state.no_progress = state.no_progress + 1 if snapshot.fingerprint == before else 0
         state.last_fingerprint = snapshot.fingerprint
+        if state.spec.purpose is Purpose.TASK:
+            state.summary["task_observation"] = self._observation_summary(snapshot)
         if state.no_progress > state.spec.limits.no_progress_retries:
             return self._pause(
                 state,
