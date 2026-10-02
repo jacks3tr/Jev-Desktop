@@ -142,6 +142,16 @@ def test_cli_runs_the_same_engine_and_verdict(cli_env, tmp_path):
     assert code == 0 and fetched["written_to"] == str(out_file) and out_file.stat().st_size > 0
 
 
+@pytest.mark.parametrize("pretty", [False, True])
+def test_cli_inspection_preserves_unicode_on_legacy_stdout(cli_env, monkeypatch, pretty):
+    cli_env["driver"].app.title = "Jev A\u200bB \u8a9e \U0001f642"
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252:strict")
+    args = ["--pretty"] if pretty else []
+    code, result = run_cli(cli_env, *args, "inspect", "--no-screenshot")
+    assert code == 0, result
+    assert result["windows"][0]["title"] == "Jev A\u200bB \u8a9e \U0001f642"
+
+
 def test_cli_reports_a_paused_run_with_a_non_zero_status(cli_env, tmp_path):
     spec = spec_payload()
     spec["steps"][0] = {
