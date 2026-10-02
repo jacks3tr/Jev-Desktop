@@ -24,7 +24,7 @@ NON_PASS_EXIT = 2
 
 
 def _emit(payload: Mapping[str, Any], *, pretty: bool) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None, default=str))
+    print(json.dumps(payload, ensure_ascii=True, indent=2 if pretty else None, default=str))
 
 
 def _make_client(args: argparse.Namespace, *, name: str) -> BrokerClient:
