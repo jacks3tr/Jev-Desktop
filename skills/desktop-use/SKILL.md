@@ -102,6 +102,8 @@ Do not translate a routine goal into individual `desktop_act` calls or a test sp
 ## 3. Read the result
 
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
+Check each action's dispatch_state and rror; an uncertain attempt may have acted.
+The action metric counts acknowledged receipts, so zero does not prove that no input occurred.
 Task observations are summaries: they retain controls, window references, paths, values, and
 semantic state, but omit rectangles, default flags, and internal native IDs. Omitted element
 flags mean enabled and visible, but not editable, focusable, or focused. Inspect again for a
