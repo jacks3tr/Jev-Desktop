@@ -135,6 +135,66 @@ def _semantic_scroll(monkeypatch, scroll):
     return calls
 
 
+def _typing_reader_fixture(monkeypatch, *, password=False, text_pattern=None):
+    full = "x" * 5000
+    props = {
+        uia.PROP_PASSWORD: password,
+        uia.PROP_NATIVE_HANDLE: 2,
+        uia.PROP_PROCESS_ID: 42,
+        uia.PROP_VALUE: full[:4096],
+    }
+    element = NS(GetCurrentPropertyValue=props.get)
+    handle = NS(element=element, hwnd=1)
+    window = NS(hwnd=1, process_id=42)
+    worker = NS(submit=lambda fn, **_: fn(worker))
+    monkeypatch.setattr(native_input, "_pattern", lambda *_: text_pattern)
+    monkeypatch.setattr(native_input.win32.user32, "IsWindow", lambda _: True)
+    monkeypatch.setattr(native_input.win32, "root_window", lambda _: 1)
+    monkeypatch.setattr(native_input.win32, "window_process_id", lambda _: 42)
+    monkeypatch.setattr(native_input.win32, "window_class", lambda _: "WindowsForms10.EDIT.app.0.fixture")
+    return full, props, worker, handle, window
+
+
+def test_typing_reads_full_text_pattern_before_capped_value(monkeypatch):
+    pattern = NS(DocumentRange=NS(GetText=lambda count: "x" * 5000 if count == -1 else None))
+    full, _, worker, handle, window = _typing_reader_fixture(monkeypatch, text_pattern=pattern)
+    assert native_input._typing_value(worker, handle, window) == full
+
+
+@pytest.mark.parametrize("failure", [None, "stale", "root", "process", "class", "password", "timeout", "changed"])
+def test_typing_native_edit_readback_is_full_and_bound_to_approved_window(monkeypatch, failure):
+    full, props, worker, handle, window = _typing_reader_fixture(monkeypatch, password=failure == "password")
+    reads = []
+
+    def read(hwnd):
+        reads.append(hwnd)
+        if failure == "changed":
+            props[uia.PROP_NATIVE_HANDLE] = 3
+        return None if failure == "timeout" else full
+
+    monkeypatch.setattr(native_input.win32, "edit_text", read, raising=False)
+    if failure == "stale":
+        monkeypatch.setattr(native_input.win32.user32, "IsWindow", lambda _: False)
+    if failure == "root":
+        monkeypatch.setattr(native_input.win32, "root_window", lambda _: 3)
+    if failure == "process":
+        monkeypatch.setattr(native_input.win32, "window_process_id", lambda _: 43)
+    if failure == "class":
+        monkeypatch.setattr(native_input.win32, "window_class", lambda _: "UnknownEdit")
+    observed = native_input._typing_value(worker, handle, window)
+    assert observed == (full if failure is None else None if failure == "password" else full[:4096])
+    assert reads == ([2] if failure in {None, "timeout", "changed"} else [])
+
+
+def test_selection_keeps_value_readback_when_document_text_differs(monkeypatch):
+    full, props, worker, handle, _ = _typing_reader_fixture(monkeypatch)
+    props[uia.PROP_VALUE] = "Chosen"
+    native_input._verify_selection(
+        worker, handle, NS(option_label="Chosen", deadline_s=0), lambda: None, native_input.time.time(), NS()
+    )
+    assert native_input._live_value(worker, handle) == "Chosen"
+
+
 def test_semantic_scroll_follows_the_wheel_convention_and_magnitude(monkeypatch):
     assert _semantic_scroll(monkeypatch, {"notches": 3}) == [("-", "dec")] * 3
     assert _semantic_scroll(monkeypatch, {"notches": -2}) == [("-", "inc")] * 2

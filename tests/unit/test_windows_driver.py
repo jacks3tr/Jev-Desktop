@@ -94,6 +94,7 @@ def _stable_windows(monkeypatch, vanished):
     monkeypatch.setattr(win32, "is_top_level", lambda _hwnd: True)
     monkeypatch.setattr(win32, "is_owned_popup", lambda _hwnd: False)
     monkeypatch.setattr(win32, "is_cloaked", lambda _hwnd: False)
+    monkeypatch.setattr(win32, "window_class", lambda hwnd: "Shell_TrayWnd" if hwnd == tray else "Edge")
     monkeypatch.setattr(win32, "owner_window", lambda _hwnd: 0)
     monkeypatch.setattr(win32, "foreground_window", lambda: 0)
     monkeypatch.setattr(win32, "window_title", lambda _hwnd: "title")
@@ -360,8 +361,12 @@ def test_maximized_window_capture_ignores_invisible_resize_borders(monkeypatch, 
     monkeypatch.setattr(win32.user32, "IsWindowVisible", lambda _hwnd: True)
     scope = NS(app_ref="app:1")
     if overlap:
-        with pytest.raises(DriverError, match="covers the approved capture region"):
+        with pytest.raises(DriverError, match="covers the approved capture region") as refused:
             driver.capture(scope=scope, snapshot_id="snap:1", run_id="run:1")
+        assert "hwnd=2" in str(refused.value)
+        assert "class=Shell_TrayWnd" in str(refused.value)
+        assert f"rect={frames[tray].to_json()}" in str(refused.value)
+        assert f"intersection={frames[tray].intersect(frames[edge]).to_json()}" in str(refused.value)
     else:
         driver.capture(scope=scope, snapshot_id="snap:1", run_id="run:1")
         assert captured == [frames[edge]]
