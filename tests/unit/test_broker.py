@@ -19,7 +19,7 @@ from jev_desktop.broker import Broker, BrokerConfig, fit_frame
 from jev_desktop.client import BrokerClient, BrokerError
 from jev_desktop.contracts import ContractError, Envelope, Limits, Operation, new_id
 from jev_desktop.ipc import MAX_MESSAGE_BYTES, PipeClient, PipeServer, RequestNotSent
-from jev_desktop.journal import DispatchJournal
+from jev_desktop.journal import DispatchJournal, UncertainEffect
 from jev_desktop.policy import PolicyConfig
 
 from .fakes import FakeApp, FakeDriver, FakeElement, ScriptedDecision, ScriptedPolicy
@@ -136,6 +136,60 @@ def test_run_completes_and_returns_verdict_with_evidence(broker_env):
 
     evidence = client.call("evidence", {"evidence_id": payload["evidence"][0]["evidence_id"]})
     assert evidence["base64"], "evidence is fetchable by reference"
+
+
+def test_paused_wait_task_reports_the_latest_observation(broker_env):
+    broker = broker_env["broker"]
+    policy = ScriptedPolicy([ScriptedDecision(Operation.WAIT)] * 10)
+    broker.policy = broker.runtime.policy = policy
+    result = broker_env["make"]().call(
+        "run",
+        {
+            "task": {
+                "goal": "Wait for loading to finish",
+                "app_ref": APP_REF,
+                "window_refs": [broker_env["app"].window_ref],
+            }
+        },
+    )
+    assert result["reason"] == "step_unresolved"
+    assert result["observation"]["snapshot_id"] == broker_env["driver"]._snapshot.snapshot_id
+    assert result["metrics"]["decisions"] == 3
+
+
+def test_task_reports_uncertain_typing_without_replaying_it(broker_env, monkeypatch):
+    app = broker_env["app"]
+    app.elements.append(FakeElement("edit", "Draft", editable=True, operations=("TYPE_TEXT",)))
+    broker = broker_env["broker"]
+    policy = ScriptedPolicy([ScriptedDecision(Operation.TYPE_TEXT, "Draft")])
+    broker.policy = broker.runtime.policy = policy
+    driver = broker_env["driver"]
+    attempts = []
+
+    def type_then_lose_receipt(request, guard, snapshot):
+        guard()
+        attempts.append(request)
+        app.find("Draft").value = request.text
+        raise UncertainEffect("text was dispatched but readback was delayed")
+
+    monkeypatch.setattr(driver, "execute", type_then_lose_receipt)
+    client = broker_env["make"]()
+    task = {
+        "goal": "Type the supplied draft",
+        "app_ref": APP_REF,
+        "window_refs": [app.window_ref],
+        "texts": {"draft": "Jev harmless draft"},
+    }
+    result = client.call("run", {"task": task})
+    assert result["reason"] == "uncertain_effect"
+    assert [(action["operation"], action["dispatch_state"], action["error"]) for action in result["actions"]] == [
+        ("TYPE_TEXT", "uncertain", "uncertain_effect")
+    ]
+    assert result["metrics"]["actions"] == 0
+    assert app.find("Draft").value == "Jev harmless draft"
+    resumed = client.call("run", {"run_id": result["run_id"], "resume_token": result["resume_token"]})
+    assert resumed["reason"] == "uncertain_effect"
+    assert len(attempts) == 1
 
 
 def test_task_result_summary_keeps_window_attribution_for_identical_controls():

@@ -25,6 +25,8 @@ Jev receives structured accessibility data: control labels, values, focus, selec
 recent actions. It never sees screenshots. Read `coverage` and `truncation` before assuming a
 control or result is absent; raise `max_depth` and `max_elements` to observe more, and set the
 same values on the inspection and the task so both see the same controls.
+Coverage describes how much was observed, not whether it is still current. A fresh partial
+observation supports only the controls it contains; inspect again after an action or layout change.
 
 ## 2. Hand off the task
 
@@ -61,6 +63,13 @@ will send it", especially when the window shows controls that cannot be undone: 
 draft, `Delete` beside a list, `Save` over an original file, or `Buy`. Jev may choose any
 observed control, and the goal is its only record of what the user allowed.
 
+Immediately before typing or sending a message, confirm from the current observation that
+the intended conversation and recipient are selected. Application and window scope do not
+confirm the recipient; typing a name does not prove selection. If you cannot confirm it,
+stop before input.
+For navigation followed by messaging, first hand off only conversation selection. Inspect
+again to confirm the requested recipient, then make a separate typing or sending handoff.
+
 **Inputs.** Put exact strings in `texts`, named for their destination, such as
 `email_for_contact_field`, and state which value belongs in which field. Put passwords and
 other sensitive values in `secret_texts`: Jev sees only their names and lengths. Together they
@@ -93,6 +102,8 @@ Do not translate a routine goal into individual `desktop_act` calls or a test sp
 ## 3. Read the result
 
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
+Check each action's dispatch_state and rror; an uncertain attempt may have acted.
+The action metric counts acknowledged receipts, so zero does not prove that no input occurred.
 Task observations are summaries: they retain controls, window references, paths, values, and
 semantic state, but omit rectangles, default flags, and internal native IDs. Omitted element
 flags mean enabled and visible, but not editable, focusable, or focused. Inspect again for a
@@ -128,6 +139,10 @@ so you can `FOCUS_WINDOW` and retry with the same `snapshot_id`.
 
 Explicit targets need no TypeSafe key; task handoffs and `target_description` require one.
 
+Jev has no `HOVER`, `DRAG`, or `RESIZE` operation and accepts no supplied audio-file payload.
+If the task requires one, report the limitation. A click does not prove hover, maximizing
+does not prove exact window size, and typing a file path does not deliver its audio.
+
 **Screenshots and coordinates.** Request a screenshot only when you need visual context; it
 adds nothing to Jev's decisions. Set `include_screenshot: false` on MCP inspections when you do
 not need one; screenshots default on and can make results large. Screenshots need a scoped
@@ -135,14 +150,19 @@ window in the foreground, and
 inspection never focuses one, so use `FOCUS_WINDOW` first. For a screenshot-based click,
 toggle, or scroll, supply `point` instead of `element_id`: copy the evidence ID, crop, scale,
 image dimensions, and geometry epoch from the screenshot, and set `x` and `y` in image pixels.
-The action fails only when pixels near the point changed after the screenshot, so animation
-elsewhere in the window does not block it.
+Pixel freshness checks compare pixels near the point, so animation elsewhere does not by
+itself block the action. Scope, geometry, focus, and coverage guards still apply.
 
 ## 5. Handle interruptions
 
 When Jev returns control, read the reason and the final state before acting. Separate missing
 input, missing observations, provider errors, and uncertain judgments. Supply what is missing
 or resolve the blocked state, then hand back the remaining goal.
+
+If Jev repeats `WAIT` or `CLICK`, or makes no visible progress, inspect again.
+After a failed or paused task, use a bounded direct fallback for the remaining authorized
+work when the observed target is clear. Do not restart the whole goal, reset exhausted task
+budgets, or lower confidence floors to force progress. Report any remaining limitation.
 
 - **Stale observation:** inspect again. Tasks re-observe on their own when a control was
   rebuilt or covered for a moment.
@@ -151,14 +171,19 @@ or resolve the blocked state, then hand back the remaining goal.
 - **Another application kept the foreground:** `user_takeover` with `foreground_process` means
   Windows refused to bring the window forward and no input was sent. Ask the user to switch to
   the application, then resume or act again.
-- **Broker or worker stopped:** `broker_unavailable` or `driver_error` means the call reached
-  no broker or its native worker exited; the next call reaches a replacement on its own.
-  References do not survive a replacement, and a task with an expired `app_ref` is refused as
-  `invalid_request`: inspect again. After a connection loss, never resend a mutating call:
-  it may have acted. CLI users can check `jev-desktop status --run-id … --resume-token …`;
-  MCP users should inspect the application state before deciding how to continue.
-- **Uncertain effect:** a direct action returns `uncertain_effect`. Never repeat the action. An acknowledged input is not proof that the
-  application did what you intended; inspect its result.
+- **Connection or driver error:** `broker_unavailable` means the broker connection is
+  unavailable; it does not prove the request was undelivered.
+  `driver_error` alone does not prove the broker or worker exited. Preserve the error and
+  check health before assigning a cause. References do not survive a replacement, and a
+  task with an expired `app_ref` is refused as `invalid_request`: inspect again. After a
+  connection loss, never resend a mutating call: it may have acted. CLI users can check
+  `jev-desktop status --run-id … --resume-token …`; inspect the application state before continuing.
+- **Uncertain effect:** a direct action can return `uncertain_effect`. An empty action list,
+  missing action entry, or disconnected response does not prove no input occurred. Inspect
+  the recipient, full draft or field, and resulting state before recovery. Never replay an
+  uncertain action or blindly retype or resend. An acknowledged input does not prove the intended result.
+  Text replacement requires readable confirmation and never reads password contents. A long
+  UIA value may be truncated even when the field received all text; check the application result.
 - **Low confidence:** check competing candidates before touching thresholds. Duplicate
   controls, missing values, or ambiguous field relationships need corrected state or
   instructions. A threshold change needs outcomes that show which decisions were correct.

@@ -339,8 +339,17 @@ class NativeWindowsDriver:
                 rect = win32.frame_rect(candidate)
             except DriverError:  # closed since enumeration; it covers nothing
                 continue
-            if not rect.intersect(region).is_empty:
-                raise DriverError("another window covers the approved capture region")
+            intersection = rect.intersect(region)
+            if not intersection.is_empty:
+                try:
+                    class_name = win32.window_class(candidate)
+                except DriverError:
+                    class_name = "unavailable"
+                raise DriverError(
+                    "another window covers the approved capture region: "
+                    f"hwnd={candidate} class={class_name} rect={rect.to_json()} "
+                    f"intersection={intersection.to_json()}"
+                )
         raise DriverError("approved window is no longer visible")
 
     def resolve_point(self, request, snapshot: Snapshot) -> tuple[int, int]:

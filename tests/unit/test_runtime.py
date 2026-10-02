@@ -430,6 +430,10 @@ def test_goal_task_runs_locally_and_never_replays_uncertain_input(tmp_path, unce
     assert ownership.active_lease() is None
     if uncertain:
         assert result.reason == "uncertain_effect"
+        assert [(step.operation, step.dispatch_state, step.error) for step in result.steps] == [
+            (Operation.TYPE_TEXT, DispatchState.UNCERTAIN, "uncertain_effect")
+        ]
+        assert result.budgets["actions"] == 0
         assert len(driver.executed) == 1
         ownership.acquire(session.session_id, created["run_id"])
         resumed = slice_once(runtime, ownership, session, created, resume_token=result.resume_token)
@@ -447,6 +451,83 @@ def test_goal_task_runs_locally_and_never_replays_uncertain_input(tmp_path, unce
         calls = runtime.policy.calls
         assert calls[0]["state"]["supplied_text"] == {"name": "Ada"}
         assert not any(context.operation is Operation.TYPE_TEXT for context in calls[1]["contexts"])
+    journal.close()
+
+
+@pytest.mark.parametrize("purpose", ["task", "regression"])
+def test_bounds_waits_on_an_unchanged_observation(tmp_path, purpose):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("text", "Searching this workspace", operations=()),
+            FakeElement("button", "Save", operations=("CLICK",)),
+        ],
+        steps=[] if purpose == "task" else [{"step_id": "save", "operation": "CLICK", "target_description": "Save"}],
+        purpose=purpose,
+        script=[ScriptedDecision(Operation.WAIT)] * 40,
+        limits={**Limits.defaults().to_json(), "max_model_decisions": 40, "no_progress_retries": 2},
+    )
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.PAUSED
+    assert result.reason == "step_unresolved"
+    assert result.detail["detail"] == "no observable progress after bounded waits"
+    assert result.budgets["decisions"] == 3
+    assert result.budgets["actions"] == 0
+    assert result.observation["elements"][0]["name"] == "Searching this workspace"
+    assert len(driver.executed) == 0
+    journal.close()
+
+
+@pytest.mark.parametrize(
+    ("purpose", "seconds"),
+    [("task", 0.2), ("task", 0.25), ("regression", 1.5), ("regression", 1.75)],
+)
+def test_wait_progress_limit_survives_slice_boundaries(tmp_path, purpose, seconds):
+    runtime, driver, _app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("text", "Loading", operations=()), FakeElement("button", "Save", operations=("CLICK",))],
+        steps=[] if purpose == "task" else [{"step_id": "save", "operation": "CLICK", "target_description": "Save"}],
+        purpose=purpose,
+        script=[ScriptedDecision(Operation.WAIT)] * 40,
+    )
+    result = slice_once(runtime, ownership, session, created, seconds=seconds)
+    assert result.reason == "budget_exhausted"
+    for _ in range(3):
+        if result.reason == "step_unresolved":
+            break
+        ownership.acquire(session.session_id, created["run_id"])
+        result = slice_once(runtime, ownership, session, created, resume_token=result.resume_token, seconds=seconds)
+    assert result.reason == "step_unresolved"
+    assert result.budgets["decisions"] == 3
+    assert driver.executed == []
+    journal.close()
+
+
+def test_task_wait_streak_resets_when_the_observation_changes(tmp_path):
+    runtime, _driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("text", "Loading", operations=())],
+        steps=[],
+        purpose="task",
+        script=[ScriptedDecision(Operation.WAIT)] * 4 + [ScriptedDecision(Operation.DONE)],
+        limits={**Limits.defaults().to_json(), "no_progress_retries": 2},
+    )
+    decide = runtime.policy.decide
+    calls = 0
+
+    def loading(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            app.elements[0].name = "Loaded"
+        return decide(**kwargs)
+
+    runtime.policy.decide = loading
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    assert result.budgets["decisions"] == 5
+    assert result.observation["elements"][0]["name"] == "Loaded"
+    assert result.budgets["actions"] == 0
     journal.close()
 
 
