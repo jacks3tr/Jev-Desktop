@@ -1035,8 +1035,10 @@ class Runtime:
             if decision.operation is Operation.WAIT:
                 value_target = None
                 inputs_without_value.clear()
-                self.config.sleeper(min(0.2, max(0.0, state.slice_deadline - self.config.clock())))
-                snapshot = self._observe(state)
+                outcome = self._wait_for_progress(state, snapshot, 0.2)
+                if isinstance(outcome, RunResult):
+                    return outcome
+                snapshot = outcome
                 continue
             if decision.target is None:
                 return self._pause(state, Reason.NO_APPROPRIATE_TARGET.value, {})
@@ -1194,7 +1196,9 @@ class Runtime:
 
             if decision.operation is Operation.WAIT:
                 self.journal.append_trace(state.run_id, "decision", decision.to_json())
-                self.config.sleeper(min(1.5, max(0.2, state.slice_deadline - self.config.clock())))
+                outcome = self._wait_for_progress(state, snapshot, 1.5)
+                if isinstance(outcome, RunResult):
+                    return outcome
                 continue
             if decision.operation is Operation.ESCALATE:
                 return self._pause(
@@ -1213,6 +1217,22 @@ class Runtime:
             self._evaluate_due(state, outcome, checkpoint=step.step_id)
             if step.checkpoint and self.config.capture_checkpoints:
                 self._capture(state, outcome, checkpoint=step.step_id, description=f"checkpoint after {step.step_id}")
+
+    def _wait_for_progress(self, state: _RunState, snapshot: Snapshot, delay: float) -> Snapshot | RunResult:
+        if state.last_fingerprint != snapshot.fingerprint:
+            state.no_progress = 0
+        self.config.sleeper(min(delay, max(0.0, state.slice_deadline - self.config.clock())))
+        fresh = self._observe(state)
+        state.no_progress = state.no_progress + 1 if fresh.fingerprint == snapshot.fingerprint else 0
+        state.last_fingerprint = fresh.fingerprint
+        if state.no_progress > state.spec.limits.no_progress_retries:
+            return self._pause(
+                state,
+                Reason.STEP_UNRESOLVED.value,
+                {"detail": "no observable progress after bounded waits", "attempts": state.no_progress},
+                snapshot=fresh,
+            )
+        return fresh
 
     # ------------------------------------------------------------------------------
     # Observation, identity, decisions
@@ -1604,6 +1624,18 @@ class Runtime:
             return self._pause(state, pause.reason_value, pause.detail)
         except EmergencyStop as stop:
             return self._stopped(state, Reason.PERMISSION_BOUNDARY.value, str(stop))
+        except UncertainEffect:
+            self._record_step(
+                state,
+                request,
+                None,
+                step,
+                target.description if target else operation.value,
+                DispatchState.UNCERTAIN,
+                error=Reason.UNCERTAIN_EFFECT.value,
+            )
+            self._persist(state)
+            raise
 
         state.actions += 1
         state.supplied_visual.pop(step.step_id, None)

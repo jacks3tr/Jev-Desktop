@@ -19,8 +19,7 @@ from jev_desktop.broker import Broker, BrokerConfig, fit_frame
 from jev_desktop.client import BrokerClient, BrokerError
 from jev_desktop.contracts import ContractError, Envelope, Limits, Operation, new_id
 from jev_desktop.ipc import MAX_MESSAGE_BYTES, PipeClient, PipeServer, RequestNotSent
-from jev_desktop.journal import DispatchJournal
-from jev_desktop.journal import UncertainEffect
+from jev_desktop.journal import DispatchJournal, UncertainEffect
 from jev_desktop.policy import PolicyConfig
 
 from .fakes import FakeApp, FakeDriver, FakeElement, ScriptedDecision, ScriptedPolicy

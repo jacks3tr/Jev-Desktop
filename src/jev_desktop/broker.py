@@ -872,6 +872,8 @@ class Broker:
                         "operation": step.operation.value,
                         "target": step.target_description,
                         "changed": step.observation_changed,
+                        "dispatch_state": step.dispatch_state.value,
+                        "error": step.error,
                     }
                     for step in result.steps
                 ],
