@@ -614,8 +614,14 @@ def execute(
         type_notes = [f"chars={len(request.text)}"]
         # Multi-line Win32 edits read back CRLF for every typed "\n".
         expected = _newlines(request.text)
+        approved_window = registry.windows.get(handle.window_ref) if registry is not None else None
         try:
-            observed = _live_value(worker, handle)
+            observed = _typing_value(worker, handle, approved_window)
+            if observed is None and request.replace_existing:
+                raise UncertainEffect(
+                    "text was dispatched but the field has no readable confirmation; inspect before retrying",
+                    mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
+                )
             while request.replace_existing and observed is not None and _newlines(observed) != expected:
                 if time.time() - started >= request.deadline_s:
                     raise UncertainEffect(
@@ -624,7 +630,12 @@ def execute(
                     )
                 guard()
                 time.sleep(0.01)
-                observed = _live_value(worker, handle)
+                observed = _typing_value(worker, handle, approved_window)
+                if observed is None:
+                    raise UncertainEffect(
+                        "text was dispatched but readback became unavailable; inspect before retrying",
+                        mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
+                    )
         except UncertainEffect:
             raise
         except BaseException as exc:
@@ -833,6 +844,64 @@ def _verify_selection(
         guard()
         time.sleep(0.01)
         value = _live_value(worker, handle)
+
+
+def _typing_value(
+    worker: uia.UiaWorker, handle: uia.ElementHandle, approved_window: uia.WindowHandle | None
+) -> str | None:
+    def _read(_worker: uia.UiaWorker) -> str | None:
+        element = handle.element
+        # Never ask either a text pattern or the native control for password contents.
+        if element.GetCurrentPropertyValue(uia.PROP_PASSWORD) is not False:
+            return None
+        pattern = _pattern(element, "UIA_TextPatternId", 10014)
+        if pattern is not None:
+            try:
+                text = pattern.DocumentRange.GetText(-1)
+                if isinstance(text, str):
+                    return text
+            except Exception:
+                pass
+
+        def _native_target() -> int | None:
+            if approved_window is None or approved_window.hwnd != handle.hwnd:
+                return None
+            hwnd = element.GetCurrentPropertyValue(uia.PROP_NATIVE_HANDLE)
+            if not isinstance(hwnd, int) or not hwnd or not win32.user32.IsWindow(hwnd):
+                return None
+            if not win32.user32.IsWindow(approved_window.hwnd):
+                return None
+            if (
+                win32.root_window(hwnd) != approved_window.hwnd
+                or win32.root_window(approved_window.hwnd) != approved_window.hwnd
+            ):
+                return None
+            pid = approved_window.process_id
+            if (
+                element.GetCurrentPropertyValue(uia.PROP_PROCESS_ID) != pid
+                or win32.window_process_id(hwnd) != pid
+                or win32.window_process_id(approved_window.hwnd) != pid
+            ):
+                return None
+            name = win32.window_class(hwnd)
+            if name != "Edit" and not name.startswith("WindowsForms10.EDIT."):
+                return None
+            return hwnd
+
+        hwnd = _native_target()
+        if hwnd is not None:
+            text = win32.edit_text(hwnd)
+            if text is not None and _native_target() == hwnd:
+                return text
+        value = element.GetCurrentPropertyValue(uia.PROP_VALUE)
+        if not isinstance(value, str) or not value:
+            value = element.GetCurrentPropertyValue(uia.PROP_LEGACY_VALUE)
+        return value if isinstance(value, str) else None
+
+    try:
+        return worker.submit(_read, timeout=10.0)
+    except Exception:
+        return None
 
 
 def _live_value(worker: uia.UiaWorker, handle: uia.ElementHandle) -> str | None:

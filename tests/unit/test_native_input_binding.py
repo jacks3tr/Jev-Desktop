@@ -74,7 +74,7 @@ def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     monkeypatch.setattr(native_input, "live_state", lambda *_: state)
     monkeypatch.setattr(native_input, "require_user_path_ready", lambda *_: (10, 10))
     monkeypatch.setattr(native_input, "_hit_ok", lambda *_: True)
-    monkeypatch.setattr(native_input, "_live_value", lambda *_: "")
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: "")
     keys = []
     monkeypatch.setattr(native_input.win32, "cursor_position", lambda: (0, 0))
     monkeypatch.setattr(native_input.win32, "set_cursor_position", lambda *_: None)
@@ -106,22 +106,33 @@ def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     sent = []
     monkeypatch.setattr(native_input.win32, "type_unicode", lambda text: sent.append(text) or 18)
     values = iter(["", "ead-only", "Read-only"])
-    monkeypatch.setattr(native_input, "_live_value", lambda *_: next(values))
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: next(values))
     monkeypatch.setattr(native_input.time, "sleep", lambda _: None)
     native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert sent == ["Read-only"]
 
     request.deadline_s = 0
-    monkeypatch.setattr(native_input, "_live_value", lambda *_: "")
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: "")
     with pytest.raises(UncertainEffect):
         native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert sent == ["Read-only", "Read-only"]
 
     # Multi-line Win32 edits read typed "\n" back as CRLF.
     request.text = "first\nsecond\rthird"
-    monkeypatch.setattr(native_input, "_live_value", lambda *_: "first\r\nsecond\r\nthird")
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: "first\r\nsecond\r\nthird")
     receipt = native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert "observed value differs from dispatched text" not in receipt.notes
+
+    # A short input dispatch remains uncertain; a full-value reader never replays it.
+    def partial(text):
+        sent.append(text)
+        raise UncertainEffect("short SendInput count")
+
+    monkeypatch.setattr(native_input.win32, "type_unicode", partial)
+    before = len(sent)
+    with pytest.raises(UncertainEffect, match="short SendInput count"):
+        native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+    assert len(sent) == before + 1
 
 
 def _semantic_scroll(monkeypatch, scroll):
@@ -187,12 +198,30 @@ def test_typing_native_edit_readback_is_full_and_bound_to_approved_window(monkey
 
 
 def test_selection_keeps_value_readback_when_document_text_differs(monkeypatch):
-    full, props, worker, handle, _ = _typing_reader_fixture(monkeypatch)
+    _, props, worker, handle, _ = _typing_reader_fixture(monkeypatch)
     props[uia.PROP_VALUE] = "Chosen"
     native_input._verify_selection(
         worker, handle, NS(option_label="Chosen", deadline_s=0), lambda: None, native_input.time.time(), NS()
     )
     assert native_input._live_value(worker, handle) == "Chosen"
+
+
+@pytest.mark.parametrize("outcome", ["full", "timeout", "capacity"])
+def test_native_edit_text_query_is_bounded_read_only(monkeypatch, outcome):
+    import ctypes
+
+    def send(hwnd, message, capacity, pointer, flags, timeout, result):
+        assert (hwnd, message, flags, timeout) == (2, 0x000D, 2, 250)
+        assert capacity == 65537
+        if outcome == "timeout":
+            return 0
+        result._obj.value = 65536 if outcome == "capacity" else 5000
+        buffer = (ctypes.c_wchar * capacity).from_address(pointer)
+        buffer.value = "x" * result._obj.value
+        return 1
+
+    monkeypatch.setattr(native_input.win32.user32, "SendMessageTimeoutW", send)
+    assert native_input.win32.edit_text(2) == ("x" * 5000 if outcome == "full" else None)
 
 
 def test_semantic_scroll_follows_the_wheel_convention_and_magnitude(monkeypatch):

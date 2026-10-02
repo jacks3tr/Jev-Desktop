@@ -180,6 +180,8 @@ budgets, or lower confidence floors to force progress. Report any remaining limi
   missing action entry, or disconnected response does not prove no input occurred. Inspect
   the recipient, full draft or field, and resulting state before recovery. Never replay an
   uncertain action or blindly retype or resend. An acknowledged input does not prove the intended result.
+  Text replacement requires readable confirmation and never reads password contents. A long
+  UIA value may be truncated even when the field received all text; check the application result.
 - **Low confidence:** check competing candidates before touching thresholds. Duplicate
   controls, missing values, or ambiguous field relationships need corrected state or
   instructions. A threshold change needs outcomes that show which decisions were correct.

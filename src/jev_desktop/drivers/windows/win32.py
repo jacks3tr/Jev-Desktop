@@ -670,6 +670,21 @@ WM_NCHITTEST = 0x0084
 SMTO_ABORTIFHUNG = 0x0002
 
 
+def edit_text(hwnd: int, timeout_ms: int = 250) -> str | None:
+    """Bounded read-only WM_GETTEXT for an already validated native Edit target."""
+    capacity = 65537
+    buffer = ctypes.create_unicode_buffer(capacity)
+    result = ctypes.c_size_t(0)
+    if not user32.SendMessageTimeoutW(
+        hwnd, 0x000D, capacity, ctypes.addressof(buffer), SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result)
+    ):
+        return None
+    # A full buffer cannot establish that the control's whole value was read.
+    if result.value >= capacity - 1:
+        return None
+    return "".join(buffer[: result.value])
+
+
 def nc_hit_test(hwnd: int, x: int, y: int, timeout_ms: int = 200) -> int | None:
     """The window's own WM_NCHITTEST answer at a screen point (a query, not input)."""
     result = ctypes.c_size_t(0)
