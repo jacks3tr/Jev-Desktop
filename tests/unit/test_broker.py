@@ -138,6 +138,19 @@ def test_run_completes_and_returns_verdict_with_evidence(broker_env):
     assert evidence["base64"], "evidence is fetchable by reference"
 
 
+def test_paused_wait_task_reports_the_latest_observation(broker_env):
+    broker = broker_env["broker"]
+    policy = ScriptedPolicy([ScriptedDecision(Operation.WAIT)] * 10)
+    broker.policy = broker.runtime.policy = policy
+    result = broker_env["make"]().call(
+        "run", {"task": {"goal": "Wait for loading to finish", "app_ref": APP_REF,
+                         "window_refs": [broker_env["app"].window_ref]}}
+    )
+    assert result["reason"] == "step_unresolved"
+    assert result["observation"]["snapshot_id"] == broker_env["driver"]._snapshot.snapshot_id
+    assert result["metrics"]["decisions"] == 3
+
+
 def test_task_reports_uncertain_typing_without_replaying_it(broker_env, monkeypatch):
     app = broker_env["app"]
     app.elements.append(FakeElement("edit", "Draft", editable=True, operations=("TYPE_TEXT",)))
