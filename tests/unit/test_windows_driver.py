@@ -94,7 +94,6 @@ def _stable_windows(monkeypatch, vanished):
     monkeypatch.setattr(win32, "is_top_level", lambda _hwnd: True)
     monkeypatch.setattr(win32, "is_owned_popup", lambda _hwnd: False)
     monkeypatch.setattr(win32, "is_cloaked", lambda _hwnd: False)
-    monkeypatch.setattr(win32, "window_class", lambda hwnd: "Shell_TrayWnd" if hwnd == tray else "Edge")
     monkeypatch.setattr(win32, "owner_window", lambda _hwnd: 0)
     monkeypatch.setattr(win32, "foreground_window", lambda: 0)
     monkeypatch.setattr(win32, "window_title", lambda _hwnd: "title")
@@ -357,6 +356,7 @@ def test_maximized_window_capture_ignores_invisible_resize_borders(monkeypatch, 
     monkeypatch.setattr(win32, "window_rect", lambda hwnd: maximized if hwnd == edge else frames[tray])
     monkeypatch.setattr(win32, "frame_rect", frames.__getitem__, raising=False)
     monkeypatch.setattr(win32, "enum_top_level_windows", lambda: [tray, edge])  # the taskbar is topmost
+    monkeypatch.setattr(win32, "window_class", lambda hwnd: "Shell_TrayWnd" if hwnd == tray else "Edge")
     monkeypatch.setattr(win32, "is_cloaked", lambda _hwnd: False)
     monkeypatch.setattr(win32.user32, "IsWindowVisible", lambda _hwnd: True)
     scope = NS(app_ref="app:1")
@@ -715,7 +715,7 @@ def test_combobox_types_while_focus_reports_its_active_option(monkeypatch, deskt
     # Chromium reports UIA focus on a combobox's aria-activedescendant option, while DOM focus,
     # and the keys, stay in the input.
     dialog = _Uia("Command palette")
-    field = _Uia("Command palette search", dialog, rect=Rect(700, 200, 1200, 240))
+    field = _Uia("Command palette search", dialog, rect=Rect(700, 200, 1200, 240), props={uia.PROP_PASSWORD: False})
     results = _Uia("Commands and search results", dialog)
     option = _Uia("New agent", results, rect=Rect(700, 260, 1200, 290))
     controlled = [results] if controls_list else []
