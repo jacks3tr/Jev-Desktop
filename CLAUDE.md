@@ -136,6 +136,12 @@ full field-level contract:
 - `skills/desktop-use/SKILL.md` is the agent-facing operating skill bundled into the
   `.codex-plugin/` and `.claude-plugin/` plugin manifests alongside `.mcp.json` — this repo is
   itself distributed as a Codex/Claude Code plugin (see README's "Install the plugin" section).
+- When a release changes the skill or its referenced files, refresh the installed copies
+  actually used by the local development clients. Use the supported plugin update/install
+  flow, preserve unrelated local customizations, and compare the installed files with the
+  released revision. Record the resolved paths and comparison result before calling the
+  release complete. Updating the Python package or checkout alone does not update installed
+  skills. Start a new agent session when required to load the refreshed instructions.
 - `examples/*.json` and `docs/reference.md` document the full predefined-run spec schema
   (steps, assertions, evaluators, comparators, limits, resume inputs) — read `docs/reference.md`
   before changing anything under the spec/assertion path.
