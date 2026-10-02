@@ -864,10 +864,10 @@ def _typing_value(
                 pass
 
         def _native_target() -> int | None:
-            if approved_window is None or approved_window.hwnd != handle.hwnd:
+            if approved_window is None:
                 return None
             hwnd = element.GetCurrentPropertyValue(uia.PROP_NATIVE_HANDLE)
-            if not isinstance(hwnd, int) or not hwnd or not win32.user32.IsWindow(hwnd):
+            if not isinstance(hwnd, int) or not hwnd or hwnd != handle.hwnd or not win32.user32.IsWindow(hwnd):
                 return None
             if not win32.user32.IsWindow(approved_window.hwnd):
                 return None
