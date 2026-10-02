@@ -155,7 +155,8 @@ def _typing_reader_fixture(monkeypatch, *, password=False, text_pattern=None):
         uia.PROP_VALUE: full[:4096],
     }
     element = NS(GetCurrentPropertyValue=props.get)
-    handle = NS(element=element, hwnd=1)
+    # Observation records the native child HWND on this element, not its approved root.
+    handle = NS(element=element, hwnd=2)
     window = NS(hwnd=1, process_id=42)
     worker = NS(submit=lambda fn, **_: fn(worker))
     monkeypatch.setattr(native_input, "_pattern", lambda *_: text_pattern)
@@ -172,7 +173,9 @@ def test_typing_reads_full_text_pattern_before_capped_value(monkeypatch):
     assert native_input._typing_value(worker, handle, window) == full
 
 
-@pytest.mark.parametrize("failure", [None, "stale", "root", "process", "class", "password", "timeout", "changed"])
+@pytest.mark.parametrize(
+    "failure", [None, "stale", "root", "process", "class", "password", "timeout", "changed", "cached"]
+)
 def test_typing_native_edit_readback_is_full_and_bound_to_approved_window(monkeypatch, failure):
     full, props, worker, handle, window = _typing_reader_fixture(monkeypatch, password=failure == "password")
     reads = []
@@ -192,6 +195,8 @@ def test_typing_native_edit_readback_is_full_and_bound_to_approved_window(monkey
         monkeypatch.setattr(native_input.win32, "window_process_id", lambda _: 43)
     if failure == "class":
         monkeypatch.setattr(native_input.win32, "window_class", lambda _: "UnknownEdit")
+    if failure == "cached":
+        handle.hwnd = 3
     observed = native_input._typing_value(worker, handle, window)
     assert observed == (full if failure is None else None if failure == "password" else full[:4096])
     assert reads == ([2] if failure in {None, "timeout", "changed"} else [])
