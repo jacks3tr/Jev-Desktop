@@ -590,6 +590,9 @@ class Runtime:
         if state.summary.get("restore_binding"):
             raise ContractError("inspect again and start a new task after restarting the broker")
         snapshot = self._observe(state)
+        waiting = self._settle_wait(state, snapshot)
+        if waiting is not None:
+            return waiting
         completion_probe = False
         # The first low-confidence refusal since the last dispatch; a second one reports it.
         doubt: Pause | None = None
@@ -1135,6 +1138,9 @@ class Runtime:
             self._restore_binding(state)
 
             snapshot = self._observe(state)
+            waiting = self._settle_wait(state, snapshot)
+            if waiting is not None:
+                return waiting
             self._check_identity(state, snapshot)
             if state.identity_checked and not state.identity_verified:
                 return self._blocked(
@@ -1221,18 +1227,25 @@ class Runtime:
     def _wait_for_progress(self, state: _RunState, snapshot: Snapshot, delay: float) -> Snapshot | RunResult:
         if state.last_fingerprint != snapshot.fingerprint:
             state.no_progress = 0
+        state.summary["pending_wait_fingerprint"] = snapshot.fingerprint
         self.config.sleeper(min(delay, max(0.0, state.slice_deadline - self.config.clock())))
         fresh = self._observe(state)
-        state.no_progress = state.no_progress + 1 if fresh.fingerprint == snapshot.fingerprint else 0
-        state.last_fingerprint = fresh.fingerprint
+        return self._settle_wait(state, fresh) or fresh
+
+    def _settle_wait(self, state: _RunState, snapshot: Snapshot) -> RunResult | None:
+        before = state.summary.pop("pending_wait_fingerprint", None)
+        if before is None:
+            return None
+        state.no_progress = state.no_progress + 1 if snapshot.fingerprint == before else 0
+        state.last_fingerprint = snapshot.fingerprint
         if state.no_progress > state.spec.limits.no_progress_retries:
             return self._pause(
                 state,
                 Reason.STEP_UNRESOLVED.value,
                 {"detail": "no observable progress after bounded waits", "attempts": state.no_progress},
-                snapshot=fresh,
+                snapshot=snapshot,
             )
-        return fresh
+        return None
 
     # ------------------------------------------------------------------------------
     # Observation, identity, decisions

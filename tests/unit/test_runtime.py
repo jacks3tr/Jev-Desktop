@@ -479,10 +479,10 @@ def test_bounds_waits_on_an_unchanged_observation(tmp_path, purpose):
 
 
 @pytest.mark.parametrize(
-    ("purpose", "seconds", "resumes", "decisions"),
-    [("task", 0.2, 3, 3), ("task", 0.25, 2, 5), ("regression", 1.5, 3, 3), ("regression", 1.75, 2, 5)],
+    ("purpose", "seconds"),
+    [("task", 0.2), ("task", 0.25), ("regression", 1.5), ("regression", 1.75)],
 )
-def test_wait_progress_limit_survives_slice_boundaries(tmp_path, purpose, seconds, resumes, decisions):
+def test_wait_progress_limit_survives_slice_boundaries(tmp_path, purpose, seconds):
     runtime, driver, _app, _clock, journal, ownership, session, created = build(
         tmp_path,
         elements=[FakeElement("text", "Loading", operations=()), FakeElement("button", "Save", operations=("CLICK",))],
@@ -492,11 +492,13 @@ def test_wait_progress_limit_survives_slice_boundaries(tmp_path, purpose, second
     )
     result = slice_once(runtime, ownership, session, created, seconds=seconds)
     assert result.reason == "budget_exhausted"
-    for _ in range(resumes):
+    for _ in range(3):
+        if result.reason == "step_unresolved":
+            break
         ownership.acquire(session.session_id, created["run_id"])
         result = slice_once(runtime, ownership, session, created, resume_token=result.resume_token, seconds=seconds)
     assert result.reason == "step_unresolved"
-    assert result.budgets["decisions"] == decisions
+    assert result.budgets["decisions"] == 3
     assert driver.executed == []
     journal.close()
 
