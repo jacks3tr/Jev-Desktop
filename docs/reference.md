@@ -76,7 +76,8 @@ path contains it. The search walks up to 10,000 nodes or 8 seconds and keeps up 
 the truncation notes `traversal node budget reached` and `query search time limit reached` mean
 it was incomplete, so an empty result does not prove absence. A query result holds only the
 matches, so inspect without `query` to act on controls around them. Returned observations omit rows
-with no name, value, text, operation, or focus, and context texts already shown by an element;
+with no name, value, text, operation, or focus, and context texts already shown by an element
+or belonging to an element that is not returned;
 Jev still receives them. Call `desktop_act` with the returned `snapshot_id`, `access_token`, `window_ref`,
 operation, and control reference or screenshot point. Alternatively, use `target_description`
 for Jev to choose a compatible control. That option requires a TypeSafe key. Supply `text`, `option_label`, `hotkey`,

@@ -177,3 +177,13 @@ def test_broker_inspect_query_returns_an_actionable_match_behind_offscreen_nodes
     assert [element["name"] for element in observed["elements"]] == ["Deny"]
     deny_id = observed["elements"][0]["element_id"]
     assert uia.resolve_element(driver.registry, deny_id, observed["snapshot_id"], APP_REF).name == "Deny"
+
+
+def test_query_context_texts_stay_within_the_returned_elements(monkeypatch):
+    # The report: offscreen messages that mention the query filled context.texts past max_elements.
+    messages = [("text", f"message {i} mentions Provider " + "x" * 3000) for i in range(5)]
+    worker, _ = _fake_window(monkeypatch, {ROOT: [("button", "Provider"), *messages]})
+    snapshot = _observe(worker, uia.Registry(), query="Provider")
+    view = caller_view(snapshot, limit=1, query="Provider")
+    assert [element["name"] for element in view["elements"]] == ["Provider"]
+    assert view["context"]["texts"] == []
