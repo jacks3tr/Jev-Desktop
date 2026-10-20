@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from jev_desktop.contracts import Geometry, Rect
 from jev_desktop.drivers.windows import uia
 
@@ -100,6 +102,7 @@ def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements):
         }.get(prop),
     )
     monkeypatch.setattr(uia, "_runtime_id", lambda node: (hash(node),))
+    monkeypatch.setattr(uia, "point_hits_element", lambda *_: False)
 
     def children(node):
         for child in tree.get(node, []):
@@ -124,7 +127,8 @@ def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements):
     return {element.name for element in snapshot.elements}, visited
 
 
-def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_controls(monkeypatch):
+@pytest.mark.parametrize("card_role", ["group", "listitem"])
+def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_controls(monkeypatch, card_role):
     # Board fixture shape: offscreen cards precede an onscreen right rail; one offscreen row
     # holds a position:fixed child that Chromium reports onscreen.
     tree = {
@@ -135,6 +139,7 @@ def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_contro
         "Details": ["View All"],
     }
     roles = {"root": "pane", "Board": "group", "Details": "group", "Fixed button": "button", "View All": "button"}
+    roles.update({f"Card {i}": card_role for i in range(30)})
     onscreen = {"root", "Board", "Details", "Fixed button", "View All"}
     names, visited = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=60)
     assert {"View All", "Fixed button"} <= names
