@@ -75,7 +75,7 @@ def test_wide_observation_releases_discarded_handles_and_tracks_focus(monkeypatc
     assert any(e.name == "1" and e.visible for e in second.elements)
 
 
-def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements):
+def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements, hit_tests=None):
     visited = []
     for name, value in {
         "owner_window": 0,
@@ -102,7 +102,8 @@ def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements):
         }.get(prop),
     )
     monkeypatch.setattr(uia, "_runtime_id", lambda node: (hash(node),))
-    monkeypatch.setattr(uia, "point_hits_element", lambda *_: False)
+    hit_tests = [] if hit_tests is None else hit_tests
+    monkeypatch.setattr(uia, "point_hits_element", lambda *_: hit_tests.append(1) or False)
 
     def children(node):
         for child in tree.get(node, []):
@@ -230,6 +231,15 @@ def test_a_fixed_child_of_a_late_offscreen_row_is_observed(monkeypatch):
     roles = {"root": "pane", "List": "list", "Fixed button": "button", **dict.fromkeys(rows, "listitem")}
     names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "List", "Fixed button"}, max_elements=10)
     assert "Fixed button" in names
+
+
+def test_row_hit_tests_stay_within_the_row_budget(monkeypatch):
+    rows = [f"Row {i}" for i in range(500)]
+    tree = {"root": ["List"], "List": rows}
+    roles = {"root": "pane", "List": "list", **dict.fromkeys(rows, "listitem")}
+    hit_tests: list[int] = []
+    _observe_tree(monkeypatch, tree, roles, {"root", "List"}, max_elements=10, hit_tests=hit_tests)
+    assert len(hit_tests) <= 10
 
 
 def test_scope_bounds_have_local_ceilings():
