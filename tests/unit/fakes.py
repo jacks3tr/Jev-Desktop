@@ -81,6 +81,7 @@ class FakeApp:
     modal: bool = False
     focused: bool = True
     focusable: bool = True
+    content_needs_focus: bool = False
 
     def fingerprint(self) -> str:
         payload = "|".join(
@@ -166,7 +167,8 @@ class FakeDriver:
             raise DriverError("observation failed (injected)")
         self.observations += 1
         elements: list[ElementInfo] = []
-        for index, element in enumerate(self.app.elements[: scope.max_elements], start=1):
+        exposed = [] if self.app.content_needs_focus and not self.app.focused else self.app.elements
+        for index, element in enumerate(exposed[: scope.max_elements], start=1):
             value = element.value
             if element.role == "edit" and element.value is None:
                 value = ""

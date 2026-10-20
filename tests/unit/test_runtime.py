@@ -780,6 +780,160 @@ def test_task_completion_check_sees_what_appeared_since_the_task_began(tmp_path)
     journal.close()
 
 
+def test_task_start_baseline_waits_for_the_window_to_expose_its_content(tmp_path):
+    runtime, _driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"},
+    )
+    app.focused, app.content_needs_focus = False, True
+    transport = TurnTransport(
+        {"operation": ("CLICK", 0.9), "CLICK_target": ("Save", 0.9)},
+        {"operation": ("DONE", 0.9)},
+        {"done": ("YES", 0.9)},
+    )
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    new = transport.sent[2]["state"]["new_since_task_start"]
+    assert any('name="Saved" value="yes"' in item for item in new), new
+    assert not any('name="Save"' in item or 'value="no"' in item for item in new), new
+    journal.close()
+
+
+@pytest.mark.parametrize("confidence", [0.9, 0.34], ids=["confident", "rechecked"])
+def test_a_wait_only_task_sees_its_result_as_new(tmp_path, confidence):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("text", "Status", value="working", text="working", operations=())],
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"},
+    )
+    app.focused = False  # the broker's automatic focus is an action, so a doubtful decision is rechecked
+    observe = driver.observe
+
+    def finish_download(scope, query=""):
+        if transport.sent and not any(e.name == "Download complete" for e in app.elements):
+            app.elements.append(FakeElement("text", "Download complete", operations=()))
+        return observe(scope, query)
+
+    driver.observe = finish_download
+
+    class Waiting(TurnTransport):
+        def post_json(self, url, *, headers, payload, timeout_s):
+            questions = payload["questions"]
+            if "done" in questions:
+                self.turns.insert(0, {"done": ("YES", 0.9)})
+            elif not self.turns:
+                self.turns.insert(0, {"operation": ("DONE", 0.9)})
+            return super().post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
+
+    transport = Waiting({"operation": ("WAIT", confidence)})
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    new = transport.sent[-1]["state"]["new_since_task_start"]
+    assert any('name="Download complete"' in item for item in new), new
+    assert not any('name="Status"' in item for item in new), new
+    journal.close()
+
+
+def test_a_window_jev_focuses_itself_still_adds_its_content_to_the_baseline(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"},
+    )
+    app.focused, app.content_needs_focus, app.focusable = False, True, False
+    apply = driver._apply
+
+    def refuse_the_automatic_focus(request, snapshot):
+        apply(request, snapshot)
+        app.focusable = True
+
+    driver._apply = refuse_the_automatic_focus
+
+    class Scripted(TurnTransport):
+        def post_json(self, url, *, headers, payload, timeout_s):
+            questions = payload["questions"]
+            turn = {"done": ("YES", 0.9)} if "done" in questions else {"operation": (self.turns.pop(0), 0.9)}
+            if "CLICK_target" in questions:
+                turn["CLICK_target"] = ("Save", 0.9)
+            if "FOCUS_WINDOW_target" in questions:
+                turn["FOCUS_WINDOW_target"] = (next(iter(questions["FOCUS_WINDOW_target"]["criteria"])), 0.9)
+            self.turns.insert(0, turn)
+            return super().post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
+
+    transport = Scripted("FOCUS_WINDOW", "CLICK", "DONE")
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    new = transport.sent[-1]["state"]["new_since_task_start"]
+    assert any('name="Saved" value="yes"' in item for item in new), new
+    assert not any('name="Save"' in item or 'value="no"' in item for item in new), new
+    journal.close()
+
+
+def test_a_pause_before_any_decision_keeps_the_baseline_open(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"},
+    )
+    app.focused, app.content_needs_focus, app.focusable = False, True, False
+    apply = driver._apply
+
+    def refuse_the_automatic_focus(request, snapshot):
+        apply(request, snapshot)
+        app.focusable = True
+
+    driver._apply = refuse_the_automatic_focus
+
+    class Scripted(TurnTransport):
+        def post_json(self, url, *, headers, payload, timeout_s):
+            if not self.sent:
+                self.sent.append(payload)
+                return 200, []
+            questions = payload["questions"]
+            if "operation" in questions and self.turns[0] not in questions["operation"]["criteria"]:
+                self.turns.pop(0)
+            turn = {"done": ("YES", 0.9)} if "done" in questions else {"operation": (self.turns.pop(0), 0.9)}
+            if "CLICK_target" in questions:
+                turn["CLICK_target"] = ("Save", 0.9)
+            if "FOCUS_WINDOW_target" in questions:
+                turn["FOCUS_WINDOW_target"] = (next(iter(questions["FOCUS_WINDOW_target"]["criteria"])), 0.9)
+            self.turns.insert(0, turn)
+            return super().post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
+
+    transport = Scripted("FOCUS_WINDOW", "CLICK", "DONE")
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    first = slice_once(runtime, ownership, session, created)
+    assert first.reason == Reason.INVALID_MODEL_RESPONSE.value, first
+    ownership.acquire(session.session_id, created["run_id"])
+    result = slice_once(runtime, ownership, session, created, resume_token=first.resume_token)
+    assert result.execution is Execution.COMPLETED, result
+    new = transport.sent[-1]["state"]["new_since_task_start"]
+    assert any('name="Saved" value="yes"' in item for item in new), new
+    assert not any('name="Save"' in item or 'value="no"' in item for item in new), new
+    journal.close()
+
+
 SIDEBAR_ELEMENTS = [
     FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
     FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),

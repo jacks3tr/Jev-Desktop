@@ -626,9 +626,14 @@ class Runtime:
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
-            if "task_start_elements" not in state.summary:
+            # Until Jev first decides anything but a window focus, everything observed was already there:
+            # an unfocused Chromium window can expose only its frame, so content focus reveals is baseline.
+            if not state.summary.get("task_start_frozen"):
                 state.summary["task_start_elements"] = sorted(
-                    {_element_signature(element) for element in observation["elements"]}
+                    {
+                        *state.summary.get("task_start_elements", ()),
+                        *(_element_signature(element) for element in observation["elements"]),
+                    }
                 )
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             elements_by_id = {element["element_id"]: element for element in observation["elements"]}
@@ -908,6 +913,8 @@ class Runtime:
                     ),
                 )
             except Pause as pause:
+                if pause.detail.get("operation") not in {None, Operation.FOCUS_WINDOW.value}:
+                    state.summary["task_start_frozen"] = True
                 if pause.reason is Reason.NO_APPROPRIATE_TARGET and value_target is not None:
                     inputs_without_value.add(value_target.element_id)
                     value_target = None
@@ -939,6 +946,8 @@ class Runtime:
                 session_id=lease.session_id,
             )
             state.model_versions.append(decision.model)
+            if decision.operation is not Operation.FOCUS_WINDOW:
+                state.summary["task_start_frozen"] = True
             if not isinstance(self.policy, JevPolicy):
                 metrics = state.summary.setdefault(
                     "task_metrics",
