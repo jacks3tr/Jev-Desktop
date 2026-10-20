@@ -1519,6 +1519,38 @@ def test_act_evaluates_run_start_assertions_before_input(tmp_path):
     journal.close()
 
 
+def test_a_directed_long_typing_step_gets_the_text_scaled_deadline(tmp_path):
+    text = "x" * 400
+    runtime, driver, app, _clock, journal, _ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("edit", "Name", value="", editable=True, operations=("TYPE_TEXT",))],
+        steps=[
+            {"step_id": "name", "operation": "TYPE_TEXT", "target_description": "Name", "fixture_reference": "name"}
+        ],
+        fixtures={"name": text},
+    )
+    snapshot = driver.observe(runtime._scope(runtime._state[created["run_id"]]))
+    runtime.act(
+        run_id=created["run_id"],
+        session_id=session.session_id,
+        resume_token=created["resume_token"],
+        request=ActionRequest(
+            action_id=new_id("act"),
+            run_id=created["run_id"],
+            operation=Operation.TYPE_TEXT,
+            mode=InputMode.USER_PATH,
+            element_id=snapshot.elements[0].element_id,
+            snapshot_id=snapshot.snapshot_id,
+            window_ref=app.window_ref,
+            lease_generation=0,
+            step_id="name",
+            text=text,
+        ),
+    )
+    assert driver.executed[0].deadline_s == 35.0
+    journal.close()
+
+
 def test_stale_retries_reset_after_progress(tmp_path):
     elements = [FakeElement("edit", "Name", value="", editable=True, operations=("TYPE_TEXT",)), *fresh_save_elements()]
     runtime, driver, app, _clock, journal, ownership, session, created = build(

@@ -53,6 +53,7 @@ from .contracts import (
     Verdict,
     digest,
     keyed_fingerprint,
+    native_deadline,
     new_id,
     now,
     validate_id,
@@ -540,7 +541,9 @@ class Runtime:
             request.point.resolve(reference, run_id, request.snapshot_id)
         if not state.steps:
             self._evaluate_due(state, snapshot, checkpoint="run_start")
-        guarded = replace(request, run_id=run_id, lease_generation=lease.generation)
+        # The caller's deadline_s, usually the 10 s default, would cut a long typing step short.
+        deadline_s = min(native_deadline(request.operation, request.text), max(3.0, state.spec.limits.slice_seconds))
+        guarded = replace(request, run_id=run_id, lease_generation=lease.generation, deadline_s=deadline_s)
         guarded = replace(guarded, request_hash=self._request_hash(state, guarded))
         epoch = self._human_epoch()
 
@@ -1583,7 +1586,7 @@ class Runtime:
             option_label=option_label,
             hotkey=hotkey,
             scroll=scroll,
-            deadline_s=min(15.0, max(3.0, state.spec.limits.slice_seconds)),
+            deadline_s=min(native_deadline(operation, text), max(3.0, state.spec.limits.slice_seconds)),
         )
         request = replace(request, request_hash=self._request_hash(state, request))
 

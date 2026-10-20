@@ -117,6 +117,29 @@ def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
         native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert sent == ["Read-only", "Read-only"]
 
+    real_time, clock = native_input.time, [0.0]
+
+    def tick(_seconds):
+        clock[0] += 1.0
+
+    monkeypatch.setattr(
+        native_input,
+        "time",
+        NS(time=lambda: clock[0], monotonic=lambda: clock[0], perf_counter=lambda: clock[0], sleep=tick),
+    )
+    request.deadline_s = 60
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: "Read-onIy")
+    with pytest.raises(UncertainEffect):
+        native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+    assert 60.0 <= clock[0] <= 61.0, "a field that never confirms is waited on until the deadline"
+    clock[0] = 0.0
+    # A renderer busy taking in keystrokes does not update its accessibility value until it catches up.
+    stale = iter([""] * 25 + ["Read-only"])
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: next(stale))
+    native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
+    assert clock[0] >= 20.0, "a field still taking in text keeps the action waiting"
+    monkeypatch.setattr(native_input, "time", real_time)
+
     # Multi-line Win32 edits read typed "\n" back as CRLF.
     request.text = "first\nsecond\rthird"
     monkeypatch.setattr(native_input, "_typing_value", lambda *_: "first\r\nsecond\r\nthird")
