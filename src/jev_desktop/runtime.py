@@ -910,7 +910,7 @@ class Runtime:
                     ),
                 )
             except Pause as pause:
-                if pause.detail.get("operation") != Operation.FOCUS_WINDOW.value:
+                if pause.detail.get("operation") not in {None, Operation.FOCUS_WINDOW.value}:
                     state.summary["task_start_frozen"] = True
                 if pause.reason is Reason.NO_APPROPRIATE_TARGET and value_target is not None:
                     inputs_without_value.add(value_target.element_id)
