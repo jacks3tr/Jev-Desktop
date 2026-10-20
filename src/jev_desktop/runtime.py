@@ -88,21 +88,6 @@ def _element_signature(element: Mapping[str, Any]) -> str:
     return digest([element.get(key) for key in ("role", "name", "value", "text", "path")])[:16]
 
 
-def _extend_task_baseline(
-    summary: dict[str, Any], steps: Sequence[StepRecord], elements: Sequence[Mapping[str, Any]]
-) -> None:
-    # Until the task first acts on the application, everything observed was already there: an
-    # unfocused Chromium window can expose only its frame, so content that focus reveals is baseline.
-    if any(
-        step.operation is not Operation.FOCUS_WINDOW and step.dispatch_state is not DispatchState.NOT_DISPATCHED
-        for step in steps
-    ):
-        return
-    baseline = set(summary.get("task_start_elements", ()))
-    baseline.update(_element_signature(element) for element in elements)
-    summary["task_start_elements"] = sorted(baseline)
-
-
 def _native_control_key(element: Mapping[str, Any]) -> str | None:
     control_id = (element.get("state") or {}).get("control_id")
     if isinstance(control_id, str) and control_id:
@@ -638,7 +623,15 @@ class Runtime:
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
-            _extend_task_baseline(state.summary, state.steps, observation["elements"])
+            # Until Jev's first decision everything observed was already there: an unfocused Chromium
+            # window can expose only its frame, so content its automatic focus reveals is baseline.
+            if not state.decisions:
+                state.summary["task_start_elements"] = sorted(
+                    {
+                        *state.summary.get("task_start_elements", ()),
+                        *(_element_signature(element) for element in observation["elements"]),
+                    }
+                )
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             elements_by_id = {element["element_id"]: element for element in observation["elements"]}
             select_candidates: list[TargetCandidate] = []
