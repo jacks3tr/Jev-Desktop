@@ -51,7 +51,7 @@ from the final window's accessibility text and which elements appeared since the
 name an end state that text shows, such as "stop when the message appears in the conversation
 transcript", not an event such as "once it is sent". A control that appears while the
 application keeps working, such as a `Stop` button after sending, also works as an end state;
-name it and say not to use it. Resolve missing information before
+name it and tell Jev not to click it. Resolve missing information before
 starting; Jev selects supplied values and never generates text.
 
 Name controls by the exact labels `desktop_inspect` returned, not by position, icon, or
