@@ -261,10 +261,15 @@ def test_native_action_runs_to_its_own_deadline_not_the_generic_call_limit(monke
     driver = WindowsDriver()
     driver._process = process
     driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
-    assert driver._call("execute", SimpleNamespace(deadline_s=40.0)) == "receipt"
+    assert driver._call("execute", SimpleNamespace(deadline_s=40.0, text="x" * 600)) == "receipt"
     clock[0] = 0.0
     with pytest.raises(Pause):
-        driver._call("execute", SimpleNamespace(deadline_s=20.0))
+        driver._call("execute", SimpleNamespace(deadline_s=20.0, text="x" * 600))
+    clock[0], alive[0] = 0.0, True
+    driver._process = process
+    driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
+    with pytest.raises(Pause):
+        driver._call("execute", SimpleNamespace(deadline_s=1e6, text=""))
 
 
 def test_emergency_stop_survives_its_event_dying_with_the_last_process(tmp_path, monkeypatch):
