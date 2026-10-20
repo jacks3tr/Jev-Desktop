@@ -244,6 +244,29 @@ def test_returned_uncertain_action_allows_fresh_observation():
         driver.close()
 
 
+def test_native_action_runs_to_its_own_deadline_not_the_generic_call_limit(monkeypatch):
+    from jev_desktop.drivers import windows
+
+    clock = [0.0]
+    monkeypatch.setattr(windows, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    alive = [True]
+    process = SimpleNamespace(
+        is_alive=lambda: alive[0], pid=1, terminate=lambda: alive.__setitem__(0, False), join=lambda _t: None
+    )
+
+    def poll(_timeout):
+        clock[0] += 1.0
+        return clock[0] >= 35.0
+
+    driver = WindowsDriver()
+    driver._process = process
+    driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
+    assert driver._call("execute", SimpleNamespace(deadline_s=40.0)) == "receipt"
+    clock[0] = 0.0
+    with pytest.raises(Pause):
+        driver._call("execute", SimpleNamespace(deadline_s=20.0))
+
+
 def test_emergency_stop_survives_its_event_dying_with_the_last_process(tmp_path, monkeypatch):
     from jev_desktop import ownership
 

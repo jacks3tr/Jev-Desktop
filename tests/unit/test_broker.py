@@ -192,6 +192,55 @@ def test_task_reports_uncertain_typing_without_replaying_it(broker_env, monkeypa
     assert len(attempts) == 1
 
 
+@pytest.mark.parametrize("path", ["act", "task"])
+def test_long_typing_gets_time_for_a_slow_field_to_confirm_it(broker_env, monkeypatch, path):
+    app = broker_env["app"]
+    app.elements.append(FakeElement("edit", "Draft", editable=True, operations=("TYPE_TEXT",)))
+    broker, driver = broker_env["broker"], broker_env["driver"]
+    broker.policy = broker.runtime.policy = ScriptedPolicy(
+        [ScriptedDecision(Operation.TYPE_TEXT, "Draft"), ScriptedDecision(Operation.DONE)]
+    )
+    boundaries: list[float] = []
+    monkeypatch.setattr(
+        driver, "set_boundary", lambda _guard, timeout=float("inf"): boundaries.append(timeout), raising=False
+    )
+    execute = driver.execute
+
+    def slow_field(request, guard, snapshot):
+        # Measured live: a composer spending 40 ms per keystroke confirms 425 characters after ~17 s.
+        confirmed_after = 1.0 + 0.04 * len(request.text or "")
+        if min(request.deadline_s, boundaries[-1]) < confirmed_after:
+            guard()
+            raise UncertainEffect("text was dispatched but the field has not confirmed it")
+        return execute(request, guard, snapshot)
+
+    monkeypatch.setattr(driver, "execute", slow_field)
+    client = broker_env["make"]()
+    text = "Please review the attached quarterly summary. " * 9
+    if path == "act":
+        observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+        action = {
+            "operation": "TYPE_TEXT",
+            "snapshot_id": observed["snapshot_id"],
+            "window_ref": app.window_ref,
+            "element_id": next(e["element_id"] for e in observed["elements"] if e["name"] == "Draft"),
+            "text": text,
+        }
+        receipt = client.call("act", {"action": action, "access_token": observed["access_token"]})["receipt"]
+        assert receipt["dispatch_state"] == "dispatched"
+    else:
+        task = {
+            "goal": "Type the supplied draft",
+            "app_ref": APP_REF,
+            "window_refs": [app.window_ref],
+            "texts": {"draft": text},
+        }
+        result = client.call("run", {"task": task})
+        assert [(a["operation"], a["dispatch_state"]) for a in result["actions"]] == [("TYPE_TEXT", "dispatched")]
+    assert app.find("Draft").value == text
+    assert driver.executed[-1].deadline_s <= 45.0
+
+
 def test_task_result_summary_keeps_window_attribution_for_identical_controls():
     task_result_view = getattr(broker_module, "task_result_view", None)
     assert callable(task_result_view), "goal-task results need a compact, non-actionable observation summary"
