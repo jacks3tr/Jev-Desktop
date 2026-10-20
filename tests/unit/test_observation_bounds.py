@@ -194,7 +194,7 @@ def test_offscreen_list_content_does_not_starve_a_later_fixed_control(monkeypatc
     assert "Fixed button" in names
 
 
-def test_the_offscreen_row_cap_keeps_later_siblings_outside_a_list(monkeypatch):
+def test_offscreen_rows_keep_later_siblings_outside_a_list(monkeypatch):
     rows = [f"Card {i}" for i in range(11)]
     tree = {"root": ["Board"], "Board": [*rows, "Fixed button"]}
     roles = {"root": "pane", "Fixed button": "button", **dict.fromkeys(rows, "listitem")}
@@ -221,6 +221,14 @@ def test_deferred_subtrees_take_turns_with_the_extra_budget(monkeypatch):
     tree = {"root": ["Board", "Rail"], "Board": [f"Hidden {i}" for i in range(100)], "Rail": ["Fixed button"]}
     roles = {"root": "pane", "Fixed button": "button"}
     names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "Fixed button"}, max_elements=10)
+    assert "Fixed button" in names
+
+
+def test_a_fixed_child_of_a_late_offscreen_row_is_observed(monkeypatch):
+    rows = [f"Card {i}" for i in range(11)]
+    tree = {"root": ["List"], "List": rows, "Card 10": ["Fixed button"]}
+    roles = {"root": "pane", "List": "list", "Fixed button": "button", **dict.fromkeys(rows, "listitem")}
+    names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "List", "Fixed button"}, max_elements=10)
     assert "Fixed button" in names
 
 
