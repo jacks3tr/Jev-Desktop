@@ -1039,18 +1039,6 @@ def _walk(
             continue
         name_value = _cached(element, PROP_NAME)
         name = name_value if isinstance(name_value, str) else ""
-        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
-        if depth < max_depth:
-            children = (iter(worker.children(element)), depth + 1, (*path, name or role))
-            if role in {"list", "tree", "datagrid", "table"}:
-                collections.append(children)
-            elif offscreen and not include_invisible and role not in ROW_ROLES:
-                # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
-                offscreen_subtrees.append(children)
-            else:
-                stack.append(children)
-        else:
-            truncation.append(f"depth cap reached ({max_depth})")
         # A query bounds rows by matches (the content cap below), not by rows walked.
         if role in ROW_ROLES and not query:
             content_seen += 1
@@ -1059,15 +1047,25 @@ def _walk(
                 if collection_phase:
                     stack.clear()
                     truncation.append("remaining collection content was not observed (collection row budget)")
-                elif depth < max_depth:
-                    stack.pop()
                 continue
-        password = _bool(_cached(element, PROP_PASSWORD))
-        value = _value_of(element, password)
-        enabled = _bool(_cached(element, PROP_ENABLED), True)
+        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
         rect = _rect_of(_cached(element, PROP_BOUNDS))
         if offscreen and role in ROW_ROLES and not rect.is_empty:
             offscreen = not point_hits_element(worker, element, *rect.center())
+        if depth < max_depth:
+            children = (iter(worker.children(element)), depth + 1, (*path, name or role))
+            if role in {"list", "tree", "datagrid", "table"}:
+                collections.append(children)
+            elif offscreen and not include_invisible:
+                # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
+                offscreen_subtrees.append(children)
+            else:
+                stack.append(children)
+        else:
+            truncation.append(f"depth cap reached ({max_depth})")
+        password = _bool(_cached(element, PROP_PASSWORD))
+        value = _value_of(element, password)
+        enabled = _bool(_cached(element, PROP_ENABLED), True)
         focusable = _bool(_cached(element, PROP_FOCUSABLE))
         focused = _bool(_cached(element, PROP_FOCUSED))
         available = _available_patterns(element)
