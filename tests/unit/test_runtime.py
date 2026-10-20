@@ -806,24 +806,40 @@ def test_task_start_baseline_waits_for_the_window_to_expose_its_content(tmp_path
     journal.close()
 
 
-def test_task_start_baseline_absorbs_observations_until_the_task_first_acts():
-    from types import SimpleNamespace
+def test_a_wait_only_task_sees_its_result_as_new(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[FakeElement("text", "Status", value="working", text="working", operations=())],
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"},
+    )
+    observe = driver.observe
 
-    from jev_desktop.runtime import _element_signature, _extend_task_baseline
+    def finish_download(scope, query=""):
+        if driver.observations >= 2 and not any(e.name == "Download complete" for e in app.elements):
+            app.elements.append(FakeElement("text", "Download complete", operations=()))
+        return observe(scope, query)
 
-    ok = {"role": "button", "name": "OK"}
-    saved_no = {"role": "text", "name": "Saved", "value": "no"}
-    saved_yes = {"role": "text", "name": "Saved", "value": "yes"}
-    page = {"role": "button", "name": "Send"}
-    focus = SimpleNamespace(operation=Operation.FOCUS_WINDOW, dispatch_state=DispatchState.DISPATCHED)
-    refused = SimpleNamespace(operation=Operation.CLICK, dispatch_state=DispatchState.NOT_DISPATCHED)
-    click = SimpleNamespace(operation=Operation.CLICK, dispatch_state=DispatchState.DISPATCHED)
-    summary: dict = {}
+    driver.observe = finish_download
 
-    _extend_task_baseline(summary, [], [ok, saved_no])  # an unfocused browser exposes only its frame
-    _extend_task_baseline(summary, [focus, refused], [ok, saved_no, page])
-    _extend_task_baseline(summary, [focus, refused, click], [saved_yes, page])
-    assert set(summary["task_start_elements"]) == {_element_signature(e) for e in (ok, saved_no, page)}
+    class Waiting(TurnTransport):
+        def post_json(self, url, *, headers, payload, timeout_s):
+            questions = payload["questions"]
+            if "done" in questions:
+                self.turns.insert(0, {"done": ("YES", 0.9)})
+            elif not self.turns:
+                self.turns.insert(0, {"operation": ("DONE", 0.9)})
+            return super().post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
+
+    transport = Waiting({"operation": ("WAIT", 0.9)})
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    new = transport.sent[-1]["state"]["new_since_task_start"]
+    assert any('name="Download complete"' in item for item in new), new
+    assert not any('name="Status"' in item for item in new), new
+    journal.close()
 
 
 SIDEBAR_ELEMENTS = [
