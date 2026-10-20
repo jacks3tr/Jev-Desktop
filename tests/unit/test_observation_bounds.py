@@ -73,18 +73,7 @@ def test_wide_observation_releases_discarded_handles_and_tracks_focus(monkeypatc
     assert any(e.name == "1" and e.visible for e in second.elements)
 
 
-def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_controls(monkeypatch):
-    # Board fixture shape: offscreen cards precede an onscreen right rail; one offscreen row
-    # holds a position:fixed child that Chromium reports onscreen.
-    tree = {
-        "root": ["Board", "Details"],
-        "Board": ["Row with fixed child", *(f"Card {i}" for i in range(30))],
-        "Row with fixed child": ["Fixed button"],
-        **{f"Card {i}": [f"Card {i} line {j}" for j in range(10)] for i in range(30)},
-        "Details": ["View All"],
-    }
-    roles = {"root": "pane", "Board": "group", "Details": "group", "Fixed button": "button", "View All": "button"}
-    onscreen = {"root", "Board", "Details", "Fixed button", "View All"}
+def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements):
     visited = []
     for name, value in {
         "owner_window": 0,
@@ -126,15 +115,44 @@ def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_contro
         app_ref="app",
         process_id=1,
         scope_windows=[("window", 1)],
-        max_elements=60,
+        max_elements=max_elements,
         max_depth=12,
         text_limit=80,
         include_invisible=False,
         geometry=Geometry(1, 0, 0, 100, 100, 96, 1),
     )
-    names = {element.name for element in snapshot.elements}
+    return {element.name for element in snapshot.elements}, visited
+
+
+def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_controls(monkeypatch):
+    # Board fixture shape: offscreen cards precede an onscreen right rail; one offscreen row
+    # holds a position:fixed child that Chromium reports onscreen.
+    tree = {
+        "root": ["Board", "Details"],
+        "Board": ["Row with fixed child", *(f"Card {i}" for i in range(30))],
+        "Row with fixed child": ["Fixed button"],
+        **{f"Card {i}": [f"Card {i} line {j}" for j in range(10)] for i in range(30)},
+        "Details": ["View All"],
+    }
+    roles = {"root": "pane", "Board": "group", "Details": "group", "Fixed button": "button", "View All": "button"}
+    onscreen = {"root", "Board", "Details", "Fixed button", "View All"}
+    names, visited = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=60)
     assert {"View All", "Fixed button"} <= names
     assert len(visited) <= max(64, 60 * 4)
+
+
+def test_a_spent_row_budget_does_not_drop_the_rest_of_an_offscreen_subtree(monkeypatch):
+    tree = {
+        "root": ["List", "Board"],
+        "List": [f"Item {i}" for i in range(11)],
+        "Board": ["Offscreen row", "Fixed button"],
+    }
+    roles = {"root": "pane", "List": "list", "Offscreen row": "listitem", "Fixed button": "button"}
+    roles.update({f"Item {i}": "listitem" for i in range(11)})
+    onscreen = {"root", "List", "Fixed button", *(f"Item {i}" for i in range(11))}
+    names, _ = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=10)
+    assert "Item 10" not in names
+    assert "Fixed button" in names
 
 
 def test_scope_bounds_have_local_ceilings():
