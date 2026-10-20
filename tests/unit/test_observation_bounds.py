@@ -73,6 +73,70 @@ def test_wide_observation_releases_discarded_handles_and_tracks_focus(monkeypatc
     assert any(e.name == "1" and e.visible for e in second.elements)
 
 
+def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_controls(monkeypatch):
+    # Board fixture shape: offscreen cards precede an onscreen right rail; one offscreen row
+    # holds a position:fixed child that Chromium reports onscreen.
+    tree = {
+        "root": ["Board", "Details"],
+        "Board": ["Row with fixed child", *(f"Card {i}" for i in range(30))],
+        "Row with fixed child": ["Fixed button"],
+        **{f"Card {i}": [f"Card {i} line {j}" for j in range(10)] for i in range(30)},
+        "Details": ["View All"],
+    }
+    roles = {"root": "pane", "Board": "group", "Details": "group", "Fixed button": "button", "View All": "button"}
+    onscreen = {"root", "Board", "Details", "Fixed button", "View All"}
+    visited = []
+    for name, value in {
+        "owner_window": 0,
+        "window_process_id": 1,
+        "window_title": "window",
+        "window_class": "window",
+        "dpi_for_window": 96,
+        "foreground_window": 1,
+    }.items():
+        monkeypatch.setattr(uia.win32, name, lambda *_, value=value: value)
+    monkeypatch.setattr(uia.win32, "window_rect", lambda _: Rect(0, 0, 100, 100))
+    monkeypatch.setattr(
+        uia.win32, "user32", SimpleNamespace(IsWindowEnabled=lambda _: True, IsWindowVisible=lambda _: True)
+    )
+    monkeypatch.setattr(uia, "_control_type", lambda node: roles.get(node, "group" if "line" not in node else "text"))
+    monkeypatch.setattr(
+        uia,
+        "_cached",
+        lambda node, prop: {
+            uia.PROP_NAME: node,
+            uia.PROP_ENABLED: True,
+            uia.PROP_OFFSCREEN: node not in onscreen,
+            uia.PROP_BOUNDS: (0, 0, 20, 20),
+        }.get(prop),
+    )
+    monkeypatch.setattr(uia, "_runtime_id", lambda node: (hash(node),))
+
+    def children(node):
+        for child in tree.get(node, []):
+            visited.append(child)
+            yield child
+
+    worker = SimpleNamespace(
+        submit=lambda fn: fn(worker), element_from_handle=lambda _: "root", children=children, has_cached_walker=True
+    )
+    snapshot = uia.observe(
+        worker,
+        uia.Registry(),
+        app_ref="app",
+        process_id=1,
+        scope_windows=[("window", 1)],
+        max_elements=60,
+        max_depth=12,
+        text_limit=80,
+        include_invisible=False,
+        geometry=Geometry(1, 0, 0, 100, 100, 96, 1),
+    )
+    names = {element.name for element in snapshot.elements}
+    assert {"View All", "Fixed button"} <= names
+    assert len(visited) <= max(64, 60 * 4)
+
+
 def test_scope_bounds_have_local_ceilings():
     import pytest
 
