@@ -227,6 +227,8 @@ CONTAINER_ROLES = {"pane", "group", "custom", "table", "tree", "list", "datagrid
 # A query search reads past the unfiltered budgets but must finish well inside the 30 s worker
 # call, which can run two observations; a read-only walk costs about 1.3 ms per node.
 QUERY_NODE_BUDGET = 10_000
+# Nodes a deferred offscreen subtree walks before the next queued one gets a turn.
+DEFERRED_TURN = 32
 QUERY_SECONDS = 8.0
 
 
@@ -1000,10 +1002,12 @@ def _walk(
     # A frame is a children iterator, its depth and path, and whether those children are a collection's.
     stack: list[tuple[Any, int, tuple[str, ...], bool]] = [(iter((element,)), depth, (), False)]
     collections: list[tuple[Any, int, tuple[str, ...], bool]] = []
-    offscreen_subtrees: list[tuple[Any, int, tuple[str, ...], bool]] = []
+    # Each deferred subtree keeps its own stack, so it can be set aside when its turn ends.
+    offscreen_subtrees: list[list[tuple[Any, int, tuple[str, ...], bool]]] = []
     # Onscreen content first, then collections, then offscreen subtrees and whatever they contain.
     phase = "onscreen"
     unseen_rows = 0
+    turn_started = 0
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
     # Offscreen subtrees walk last on a quarter more than the budget, so earlier phases cannot starve them.
     deferred_budget = node_budget + node_budget // 4
@@ -1014,13 +1018,18 @@ def _walk(
                 break
             stack.clear()
             collections.clear()
+        if phase == "offscreen" and stack and offscreen_subtrees and traversal[0] - turn_started >= DEFERRED_TURN:
+            # Deferred subtrees take turns, so one cannot spend the allowance meant for all of them.
+            offscreen_subtrees.append(stack)
+            stack = []
         if not stack:
             if collections:
                 stack.append(collections.pop(0))
                 phase = "collections"
             else:
-                stack.append(offscreen_subtrees.pop(0))
+                stack = offscreen_subtrees.pop(0)
                 phase = "offscreen"
+                turn_started = traversal[0]
         if traversal[0] >= deferred_budget:
             truncation.append("traversal node budget reached")
             break
@@ -1084,7 +1093,7 @@ def _walk(
                 collections.append(children)
             elif collection or hidden:
                 # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
-                offscreen_subtrees.append(children)
+                offscreen_subtrees.append([children])
             else:
                 stack.append(children)
         else:
