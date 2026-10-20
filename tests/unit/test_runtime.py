@@ -842,6 +842,47 @@ def test_a_wait_only_task_sees_its_result_as_new(tmp_path):
     journal.close()
 
 
+def test_a_window_jev_focuses_itself_still_adds_its_content_to_the_baseline(tmp_path):
+    runtime, driver, app, _clock, journal, ownership, session, created = build(
+        tmp_path,
+        elements=[
+            FakeElement("button", "Save", operations=("CLICK",)),
+            FakeElement("text", "Saved", value="no", text="no", operations=()),
+        ],
+        steps=[],
+        purpose="task",
+        fixtures={"text:query": "UI Navigator"},
+    )
+    app.focused, app.content_needs_focus, app.focusable = False, True, False
+    apply = driver._apply
+
+    def refuse_the_automatic_focus(request, snapshot):
+        apply(request, snapshot)
+        app.focusable = True
+
+    driver._apply = refuse_the_automatic_focus
+
+    class Scripted(TurnTransport):
+        def post_json(self, url, *, headers, payload, timeout_s):
+            questions = payload["questions"]
+            turn = {"done": ("YES", 0.9)} if "done" in questions else {"operation": (self.turns.pop(0), 0.9)}
+            if "CLICK_target" in questions:
+                turn["CLICK_target"] = ("Save", 0.9)
+            if "FOCUS_WINDOW_target" in questions:
+                turn["FOCUS_WINDOW_target"] = (next(iter(questions["FOCUS_WINDOW_target"]["criteria"])), 0.9)
+            self.turns.insert(0, turn)
+            return super().post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
+
+    transport = Scripted("FOCUS_WINDOW", "CLICK", "DONE")
+    runtime.policy = JevPolicy(transport=transport, api_key="test-key")
+    result = slice_once(runtime, ownership, session, created)
+    assert result.execution is Execution.COMPLETED
+    new = transport.sent[-1]["state"]["new_since_task_start"]
+    assert any('name="Saved" value="yes"' in item for item in new), new
+    assert not any('name="Save"' in item or 'value="no"' in item for item in new), new
+    journal.close()
+
+
 SIDEBAR_ELEMENTS = [
     FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
     FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),
