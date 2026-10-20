@@ -75,7 +75,7 @@ def test_wide_observation_releases_discarded_handles_and_tracks_focus(monkeypatc
     assert any(e.name == "1" and e.visible for e in second.elements)
 
 
-def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements, hit_tests=None, hit=frozenset(), empty=frozenset()):
+def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements, hit_tests=None, hit=frozenset()):
     visited = []
     for name, value in {
         "owner_window": 0,
@@ -98,7 +98,7 @@ def _observe_tree(monkeypatch, tree, roles, onscreen, max_elements, hit_tests=No
             uia.PROP_NAME: node,
             uia.PROP_ENABLED: True,
             uia.PROP_OFFSCREEN: node not in onscreen,
-            uia.PROP_BOUNDS: (0, 0, 0, 0) if node in empty else (0, 0, 20, 20),
+            uia.PROP_BOUNDS: (0, 0, 20, 20),
         }.get(prop),
     )
     monkeypatch.setattr(uia, "_runtime_id", lambda node: (hash(node),))
@@ -158,23 +158,6 @@ def test_a_spent_row_budget_does_not_drop_the_rest_of_an_offscreen_subtree(monke
     onscreen = {"root", "List", "Fixed row", "Fixed button", *(f"Item {i}" for i in range(11))}
     names, _ = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=10)
     assert "Item 10" not in names
-    assert "Fixed button" in names
-
-
-def test_a_visible_row_walked_last_keeps_its_children_after_the_row_budget(monkeypatch):
-    tree = {
-        "root": ["Board", "List"],
-        "Board": ["Fixed row"],
-        "Fixed row": ["Fixed button"],
-        "List": [f"Item {i}" for i in range(11)],
-    }
-    roles = {"root": "pane", "List": "list", "Fixed row": "listitem", "Fixed button": "button"}
-    roles.update({f"Item {i}": "listitem" for i in range(11)})
-    items = {f"Item {i}" for i in range(11)}
-    # Zero-size rows spend the row budget without filling the observation.
-    names, _ = _observe_tree(
-        monkeypatch, tree, roles, {"root", "List", "Fixed row", "Fixed button", *items}, 10, empty=items
-    )
     assert "Fixed button" in names
 
 

@@ -1076,10 +1076,8 @@ def _walk(
             # Each hit test is a cross-process point query and parent walk; past the row budget the flag stands.
             hit_tests += 1
             offscreen = not point_hits_element(worker, element, *rect.center())
-        # Only observed rows spend the row budget, which keeps rows from crowding out what is walked
-        # after them; nothing follows offscreen subtrees, which share theirs in turns. A query
-        # bounds rows by matches (the content cap below).
-        if role in ROW_ROLES and not query and phase != "offscreen" and (include_invisible or not offscreen):
+        # Only observed rows spend the row budget; a query bounds rows by matches (the content cap below).
+        if role in ROW_ROLES and not query and (include_invisible or not offscreen):
             content_seen += 1
             if content_seen > content_cap:
                 rows_dropped.append(1)
