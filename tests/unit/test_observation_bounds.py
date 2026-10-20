@@ -143,7 +143,7 @@ def test_offscreen_subtrees_do_not_spend_the_budget_before_later_onscreen_contro
     onscreen = {"root", "Board", "Details", "Fixed button", "View All"}
     names, visited = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=60)
     assert {"View All", "Fixed button"} <= names
-    assert len(visited) <= max(64, 60 * 4)
+    assert len(visited) <= 240 + 240 // 4  # the node budget plus the deferred subtrees' extra quarter
 
 
 def test_a_spent_row_budget_does_not_drop_the_rest_of_an_offscreen_subtree(monkeypatch):

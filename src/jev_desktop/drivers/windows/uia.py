@@ -1005,11 +1005,13 @@ def _walk(
     phase = "onscreen"
     unseen_rows = 0
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
-    # Once offscreen subtrees are queued, earlier phases leave them a quarter of the node budget.
-    early_budget = node_budget - node_budget // 4
+    # Offscreen subtrees walk last on a quarter more than the budget, so earlier phases cannot starve them.
+    deferred_budget = node_budget + node_budget // 4
     while stack or collections or offscreen_subtrees:
-        if phase != "offscreen" and offscreen_subtrees and traversal[0] >= early_budget:
+        if phase != "offscreen" and traversal[0] >= node_budget:
             truncation.append("traversal node budget reached")
+            if not offscreen_subtrees:
+                break
             stack.clear()
             collections.clear()
         if not stack:
@@ -1019,7 +1021,7 @@ def _walk(
             else:
                 stack.append(offscreen_subtrees.pop(0))
                 phase = "offscreen"
-        if traversal[0] >= node_budget:
+        if traversal[0] >= deferred_budget:
             truncation.append("traversal node budget reached")
             break
         if time.perf_counter() >= deadline:
