@@ -49,7 +49,9 @@ Call `desktop_run` once with a `task` holding the goal, `app_ref`, and explicit 
 **Goal.** Describe the desired result and how to recognize completion. Jev judges completion
 from the final window's accessibility text and which elements appeared since the task began, so
 name an end state that text shows, such as "stop when the message appears in the conversation
-transcript", not an event such as "once it is sent". Resolve missing information before
+transcript", not an event such as "once it is sent". A control that appears while the
+application keeps working, such as a `Stop` button after sending, also works as an end state;
+name it and say not to use it. Resolve missing information before
 starting; Jev selects supplied values and never generates text.
 
 Name controls by the exact labels `desktop_inspect` returned, not by position, icon, or
