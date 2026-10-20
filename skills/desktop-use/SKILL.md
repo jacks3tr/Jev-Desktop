@@ -47,12 +47,13 @@ Call `desktop_run` once with a `task` holding the goal, `app_ref`, and explicit 
 ```
 
 **Goal.** Describe the desired result and how to recognize completion. Jev judges completion
-from the final window's accessibility text and which elements appeared since the task began, so
-name an end state that text shows, such as "stop when the message appears in the conversation
-transcript", not an event such as "once it is sent". A control that appears while the
-application keeps working, such as a `Stop` button after sending, also works as an end state
-when it is not on screen before the task acts; name it and tell Jev not to click it. Resolve
-missing information before starting; Jev selects supplied values and never generates text.
+from the final window's accessibility text and which elements appeared since the task first
+acted, so name an end state that text shows, such as "stop when the message appears in the
+conversation transcript", not an event such as "once it is sent". A control that appears while
+the application keeps working, such as a `Stop` button after sending, also works as an end
+state when it is not on screen before the task acts; name it and tell Jev not to click it.
+Resolve missing information before starting; Jev selects supplied values and never generates
+text.
 
 Name controls by the exact labels `desktop_inspect` returned, not by position, icon, or
 appearance. Jev never sees the screen and reads the goal literally, so "the hamburger menu in
@@ -104,7 +105,7 @@ Do not translate a routine goal into individual `desktop_act` calls or a test sp
 ## 3. Read the result
 
 The result holds the final observation, the actions taken, timing, and reported Jev tokens.
-Check each action's dispatch_state and rror; an uncertain attempt may have acted.
+Check each action's `dispatch_state` and `error`; an uncertain attempt may have acted.
 The action metric counts acknowledged receipts, so zero does not prove that no input occurred.
 Task observations are summaries: they retain controls, window references, paths, values, and
 semantic state, but omit rectangles, default flags, and internal native IDs. Omitted element
@@ -184,7 +185,9 @@ budgets, or lower confidence floors to force progress. Report any remaining limi
   missing action entry, or disconnected response does not prove no input occurred. Inspect
   the recipient, full draft or field, and resulting state before recovery. Never replay an
   uncertain action or blindly retype or resend. An acknowledged input does not prove the intended result.
-  Text replacement requires readable confirmation and never reads password contents. A long
+  Text replacement requires readable confirmation and never reads password contents. Typing
+  waits for it up to 15 seconds plus 50 ms per character, so a field slower than that reports
+  `uncertain_effect` while it may still be taking the text in. A long
   UIA value may be truncated even when the field received all text; check the application result.
 - **Low confidence:** check competing candidates before touching thresholds. Duplicate
   controls, missing values, or ambiguous field relationships need corrected state or
