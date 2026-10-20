@@ -806,7 +806,8 @@ def test_task_start_baseline_waits_for_the_window_to_expose_its_content(tmp_path
     journal.close()
 
 
-def test_a_wait_only_task_sees_its_result_as_new(tmp_path):
+@pytest.mark.parametrize("confidence", [0.9, 0.34], ids=["confident", "rechecked"])
+def test_a_wait_only_task_sees_its_result_as_new(tmp_path, confidence):
     runtime, driver, app, _clock, journal, ownership, session, created = build(
         tmp_path,
         elements=[FakeElement("text", "Status", value="working", text="working", operations=())],
@@ -814,10 +815,11 @@ def test_a_wait_only_task_sees_its_result_as_new(tmp_path):
         purpose="task",
         fixtures={"text:query": "UI Navigator"},
     )
+    app.focused = False  # the broker's automatic focus is an action, so a doubtful decision is rechecked
     observe = driver.observe
 
     def finish_download(scope, query=""):
-        if driver.observations >= 2 and not any(e.name == "Download complete" for e in app.elements):
+        if transport.sent and not any(e.name == "Download complete" for e in app.elements):
             app.elements.append(FakeElement("text", "Download complete", operations=()))
         return observe(scope, query)
 
@@ -832,7 +834,7 @@ def test_a_wait_only_task_sees_its_result_as_new(tmp_path):
                 self.turns.insert(0, {"operation": ("DONE", 0.9)})
             return super().post_json(url, headers=headers, payload=payload, timeout_s=timeout_s)
 
-    transport = Waiting({"operation": ("WAIT", 0.9)})
+    transport = Waiting({"operation": ("WAIT", confidence)})
     runtime.policy = JevPolicy(transport=transport, api_key="test-key")
     result = slice_once(runtime, ownership, session, created)
     assert result.execution is Execution.COMPLETED
