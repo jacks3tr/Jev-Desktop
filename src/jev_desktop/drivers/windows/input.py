@@ -20,7 +20,6 @@ from typing import Any
 import comtypes
 
 from ...contracts import (
-    NATIVE_ACTION_SECONDS,
     ActionRequest,
     DispatchMechanism,
     DispatchState,
@@ -35,8 +34,6 @@ from ...contracts import (
     UncertainEffect,
 )
 from . import uia, win32
-
-READBACK_STALL_SECONDS = 3.0
 
 # --------------------------------------------------------------------------------------
 # Key chords: only combinations the driver implements and validates
@@ -625,26 +622,20 @@ def execute(
                     "text was dispatched but the field has no readable confirmation; inspect before retrying",
                     mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
                 )
-            changed_at = time.time()
             while request.replace_existing and observed is not None and _newlines(observed) != expected:
-                elapsed = time.time() - started
-                stalled = time.time() - changed_at >= READBACK_STALL_SECONDS
-                if elapsed >= request.deadline_s or (elapsed >= NATIVE_ACTION_SECONDS and stalled):
+                if time.time() - started >= request.deadline_s:
                     raise UncertainEffect(
                         "text was dispatched but the field has not confirmed it; inspect before retrying",
                         mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
                     )
                 guard()
                 time.sleep(0.01)
-                latest = _typing_value(worker, handle, approved_window)
-                if latest is None:
+                observed = _typing_value(worker, handle, approved_window)
+                if observed is None:
                     raise UncertainEffect(
                         "text was dispatched but readback became unavailable; inspect before retrying",
                         mechanism=DispatchMechanism.SEND_INPUT_KEYBOARD,
                     )
-                if latest != observed:
-                    changed_at = time.time()
-                observed = latest
         except UncertainEffect:
             raise
         except BaseException as exc:

@@ -131,10 +131,11 @@ def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     monkeypatch.setattr(native_input, "_typing_value", lambda *_: "Read-onIy")
     with pytest.raises(UncertainEffect):
         native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
-    assert clock[0] <= 19.0, "a field that stopped changing is not waited on until the deadline"
+    assert 60.0 <= clock[0] <= 61.0, "a field that never confirms is waited on until the deadline"
     clock[0] = 0.0
-    progress = iter([f"R{'e' * n}" for n in range(25)] + ["Read-only"])
-    monkeypatch.setattr(native_input, "_typing_value", lambda *_: next(progress))
+    # A renderer busy taking in keystrokes does not update its accessibility value until it catches up.
+    stale = iter([""] * 25 + ["Read-only"])
+    monkeypatch.setattr(native_input, "_typing_value", lambda *_: next(stale))
     native_input.execute(driver, request, lambda: None, NS(app_ref="app"))
     assert clock[0] >= 20.0, "a field still taking in text keeps the action waiting"
     monkeypatch.setattr(native_input, "time", real_time)
