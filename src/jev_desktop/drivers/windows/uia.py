@@ -997,14 +997,21 @@ def _walk(
     scroll_targets: set[tuple[int, ...]],
     raw_scroll_cache: dict[tuple[int, ...], Any | None],
 ) -> int:
-    stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
-    collections: list[tuple[Any, int, tuple[str, ...]]] = []
-    offscreen_subtrees: list[tuple[Any, int, tuple[str, ...]]] = []
+    # A frame is a children iterator, its depth and path, and whether those children are a collection's.
+    stack: list[tuple[Any, int, tuple[str, ...], bool]] = [(iter((element,)), depth, (), False)]
+    collections: list[tuple[Any, int, tuple[str, ...], bool]] = []
+    offscreen_subtrees: list[tuple[Any, int, tuple[str, ...], bool]] = []
     # Onscreen content first, then collections, then offscreen subtrees and whatever they contain.
     phase = "onscreen"
     unseen_rows = 0
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
+    # Once offscreen subtrees are queued, earlier phases leave them a quarter of the node budget.
+    early_budget = node_budget - node_budget // 4
     while stack or collections or offscreen_subtrees:
+        if phase != "offscreen" and offscreen_subtrees and traversal[0] >= early_budget:
+            truncation.append("traversal node budget reached")
+            stack.clear()
+            collections.clear()
         if not stack:
             if collections:
                 stack.append(collections.pop(0))
@@ -1020,7 +1027,7 @@ def _walk(
             break
         if len(elements) >= max_elements:
             break
-        iterator, depth, path = stack[-1]
+        iterator, depth, path, collection_rows = stack[-1]
         try:
             element = next(iterator)
         except StopIteration:
@@ -1062,13 +1069,14 @@ def _walk(
             else:
                 unseen_rows += 1
                 if unseen_rows > content_cap:
-                    # Leave the rest of this container so offscreen rows cannot run the walk to its node budget.
                     skipped.append(1)
-                    stack.pop()
+                    if collection_rows:
+                        # Leave the rest of this list so offscreen rows cannot run the walk to its node budget.
+                        stack.pop()
                     continue
         if depth < max_depth:
-            children = (iter(worker.children(element)), depth + 1, (*path, name or role))
             collection = role in {"list", "tree", "datagrid", "table"}
+            children = (iter(worker.children(element)), depth + 1, (*path, name or role), collection)
             hidden = offscreen and not include_invisible
             if collection and not hidden and phase != "offscreen":
                 collections.append(children)
