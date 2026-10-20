@@ -15,6 +15,7 @@ from jev_desktop.contracts import (
     ContractError,
     EvidenceRef,
     Geometry,
+    Operation,
     Pause,
     Rect,
     ScreenshotPoint,
@@ -237,7 +238,7 @@ def test_returned_uncertain_action_allows_fresh_observation():
         process.start()
         child.close()
         with pytest.raises(UncertainEffect, match="input outcome unknown"):
-            driver._call("execute", SimpleNamespace(deadline_s=5, text=None))
+            driver._call("execute", SimpleNamespace(deadline_s=5, operation=Operation.TYPE_TEXT, text=None))
         assert driver._call("observe") == "fresh observation"
         process.join(5)
     finally:
@@ -261,15 +262,22 @@ def test_native_action_runs_to_its_own_deadline_not_the_generic_call_limit(monke
     driver = WindowsDriver()
     driver._process = process
     driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
-    assert driver._call("execute", SimpleNamespace(deadline_s=40.0, text="x" * 600)) == "receipt"
-    clock[0] = 0.0
-    with pytest.raises(Pause):
-        driver._call("execute", SimpleNamespace(deadline_s=20.0, text="x" * 600))
-    clock[0], alive[0] = 0.0, True
-    driver._process = process
-    driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
-    with pytest.raises(Pause):
-        driver._call("execute", SimpleNamespace(deadline_s=1e6, text=""))
+    def call(deadline_s, operation, text):
+        clock[0], alive[0] = 0.0, True
+        driver._process = process
+        driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
+        return driver._call("execute", SimpleNamespace(deadline_s=deadline_s, operation=operation, text=text))
+
+    assert call(40.0, Operation.TYPE_TEXT, "x" * 600) == "receipt"
+    # Each emoji is injected as two UTF-16 units, and the field consumes each one.
+    assert call(1e6, Operation.TYPE_TEXT, "😀" * 300) == "receipt"
+    for deadline_s, operation, text in (
+        (20.0, Operation.TYPE_TEXT, "x" * 600),
+        (1e6, Operation.TYPE_TEXT, ""),
+        (1e6, Operation.CLICK, "x" * 600),
+    ):
+        with pytest.raises(Pause):
+            call(deadline_s, operation, text)
 
 
 def test_emergency_stop_survives_its_event_dying_with_the_last_process(tmp_path, monkeypatch):

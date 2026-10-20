@@ -241,6 +241,20 @@ def test_long_typing_gets_time_for_a_slow_field_to_confirm_it(broker_env, monkey
     assert driver.executed[-1].deadline_s <= 45.0
 
 
+def test_text_on_a_non_typing_action_does_not_extend_its_deadline(broker_env):
+    client = broker_env["make"]()
+    observed = client.call("inspect", {"app_ref": APP_REF, "screenshot": False})
+    action = {
+        "operation": "CLICK",
+        "snapshot_id": observed["snapshot_id"],
+        "window_ref": broker_env["app"].window_ref,
+        "element_id": next(e["element_id"] for e in observed["elements"] if e["name"] == "Save"),
+        "text": "x" * 600,
+    }
+    client.call("act", {"action": action, "access_token": observed["access_token"]})
+    assert broker_env["driver"].executed[-1].deadline_s <= 15.0
+
+
 def test_task_result_summary_keeps_window_attribution_for_identical_controls():
     task_result_view = getattr(broker_module, "task_result_view", None)
     assert callable(task_result_view), "goal-task results need a compact, non-actionable observation summary"
