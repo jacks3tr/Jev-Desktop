@@ -996,12 +996,16 @@ def _walk(
 ) -> int:
     stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
     collections: list[tuple[Any, int, tuple[str, ...]]] = []
+    offscreen_subtrees: list[tuple[Any, int, tuple[str, ...]]] = []
     collection_phase = False
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
-    while stack or collections:
+    while stack or collections or offscreen_subtrees:
         if not stack:
-            stack.append(collections.pop(0))
-            collection_phase = True
+            if collections:
+                stack.append(collections.pop(0))
+                collection_phase = True
+            else:
+                stack.append(offscreen_subtrees.pop(0))
         if traversal[0] >= node_budget:
             truncation.append("traversal node budget reached")
             break
@@ -1034,10 +1038,14 @@ def _walk(
             continue
         name_value = _cached(element, PROP_NAME)
         name = name_value if isinstance(name_value, str) else ""
+        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
         if depth < max_depth:
             children = (iter(worker.children(element)), depth + 1, (*path, name or role))
             if role in {"list", "tree", "datagrid", "table"}:
                 collections.append(children)
+            elif offscreen and not include_invisible and role not in ROW_ROLES:
+                # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
+                offscreen_subtrees.append(children)
             else:
                 stack.append(children)
         else:
@@ -1056,7 +1064,6 @@ def _walk(
         password = _bool(_cached(element, PROP_PASSWORD))
         value = _value_of(element, password)
         enabled = _bool(_cached(element, PROP_ENABLED), True)
-        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
         rect = _rect_of(_cached(element, PROP_BOUNDS))
         if offscreen and role in ROW_ROLES and not rect.is_empty:
             offscreen = not point_hits_element(worker, element, *rect.center())
