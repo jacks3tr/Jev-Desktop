@@ -817,6 +817,7 @@ def observe(
                     depth=0,
                     max_depth=0,
                     max_elements=max_elements,
+                    window_rect=rect,
                     include_invisible=include_invisible,
                     text_limit=text_limit,
                     truncation=[],
@@ -845,6 +846,7 @@ def observe(
                 depth=0,
                 max_depth=max_depth,
                 max_elements=max_elements,
+                window_rect=rect,
                 include_invisible=include_invisible,
                 text_limit=text_limit,
                 truncation=truncation,
@@ -980,6 +982,7 @@ def _walk(
     depth: int,
     max_depth: int,
     max_elements: int,
+    window_rect: Rect,
     include_invisible: bool,
     text_limit: int,
     truncation: list[str],
@@ -997,16 +1000,17 @@ def _walk(
     stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
     collections: list[tuple[Any, int, tuple[str, ...]]] = []
     offscreen_subtrees: list[tuple[Any, int, tuple[str, ...]]] = []
-    collection_phase = False
+    # Onscreen content first, then collections, then offscreen subtrees and whatever they contain.
+    phase = "onscreen"
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
     while stack or collections or offscreen_subtrees:
         if not stack:
             if collections:
                 stack.append(collections.pop(0))
-                collection_phase = True
+                phase = "collections"
             else:
                 stack.append(offscreen_subtrees.pop(0))
-                collection_phase = False
+                phase = "offscreen"
         if traversal[0] >= node_budget:
             truncation.append("traversal node budget reached")
             break
@@ -1039,24 +1043,25 @@ def _walk(
             continue
         name_value = _cached(element, PROP_NAME)
         name = name_value if isinstance(name_value, str) else ""
-        # A query bounds rows by matches (the content cap below), not by rows walked.
-        if role in ROW_ROLES and not query:
+        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
+        rect = _rect_of(_cached(element, PROP_BOUNDS))
+        if offscreen and role in ROW_ROLES and not rect.is_empty and window_rect.contains(*rect.center()):
+            offscreen = not point_hits_element(worker, element, *rect.center())
+        # Only observed rows spend the row budget; a query bounds rows by matches (the content cap below).
+        if role in ROW_ROLES and not query and (include_invisible or not offscreen):
             content_seen += 1
             if content_seen > content_cap:
                 rows_dropped.append(1)
-                if collection_phase:
+                if phase == "collections":
                     stack.clear()
                     truncation.append("remaining collection content was not observed (collection row budget)")
                 continue
-        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
-        rect = _rect_of(_cached(element, PROP_BOUNDS))
-        if offscreen and role in ROW_ROLES and not rect.is_empty:
-            offscreen = not point_hits_element(worker, element, *rect.center())
         if depth < max_depth:
             children = (iter(worker.children(element)), depth + 1, (*path, name or role))
-            if role in {"list", "tree", "datagrid", "table"}:
+            collection = role in {"list", "tree", "datagrid", "table"}
+            if collection and phase != "offscreen":
                 collections.append(children)
-            elif offscreen and not include_invisible:
+            elif collection or (offscreen and not include_invisible):
                 # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
                 offscreen_subtrees.append(children)
             else:
