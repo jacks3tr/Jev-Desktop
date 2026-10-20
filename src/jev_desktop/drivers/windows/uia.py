@@ -1027,6 +1027,8 @@ def _walk(
                 stack.append(collections.pop(0))
                 phase = "collections"
             else:
+                if phase != "offscreen":
+                    hit_tests = 0  # content walked last gets its own hit tests
                 stack = offscreen_subtrees.pop(0)
                 phase = "offscreen"
                 turn_started = traversal[0]
