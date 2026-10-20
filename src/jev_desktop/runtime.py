@@ -89,21 +89,18 @@ def _element_signature(element: Mapping[str, Any]) -> str:
 
 
 def _extend_task_baseline(
-    summary: dict[str, Any], windows: Sequence[Any], elements: Sequence[Mapping[str, Any]]
+    summary: dict[str, Any], steps: Sequence[StepRecord], elements: Sequence[Mapping[str, Any]]
 ) -> None:
-    # An unfocused Chromium window can expose only its frame; its baseline is its first focused view.
-    # A window that opens after the task starts has no baseline: all of it is new.
-    started = summary.setdefault("task_start_scope", sorted(window.window_ref for window in windows))
-    sealed = set(summary.get("task_start_windows", ()))
-    open_refs = {window.window_ref for window in windows if window.window_ref in started} - sealed
-    if not open_refs:
+    # Until the task first acts on the application, everything observed was already there: an
+    # unfocused Chromium window can expose only its frame, so content that focus reveals is baseline.
+    if any(
+        step.operation is not Operation.FOCUS_WINDOW and step.dispatch_state is not DispatchState.NOT_DISPATCHED
+        for step in steps
+    ):
         return
     baseline = set(summary.get("task_start_elements", ()))
-    baseline.update(_element_signature(element) for element in elements if element.get("window_ref") in open_refs)
+    baseline.update(_element_signature(element) for element in elements)
     summary["task_start_elements"] = sorted(baseline)
-    summary["task_start_windows"] = sorted(
-        sealed | {window.window_ref for window in windows if window.window_ref in open_refs and window.focused}
-    )
 
 
 def _native_control_key(element: Mapping[str, Any]) -> str | None:
@@ -641,7 +638,7 @@ class Runtime:
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
-            _extend_task_baseline(state.summary, snapshot.windows, observation["elements"])
+            _extend_task_baseline(state.summary, state.steps, observation["elements"])
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             elements_by_id = {element["element_id"]: element for element in observation["elements"]}
             select_candidates: list[TargetCandidate] = []
