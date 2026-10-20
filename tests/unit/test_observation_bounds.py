@@ -184,6 +184,16 @@ def test_offscreen_rows_do_not_spend_the_row_budget_of_a_visible_row(monkeypatch
     assert "Fixed row" in names
 
 
+@pytest.mark.parametrize("list_onscreen", [False, True], ids=["offscreen-list", "offscreen-rows"])
+def test_offscreen_list_content_does_not_starve_a_later_fixed_control(monkeypatch, list_onscreen):
+    tree = {"root": ["Archive", "Rail"], "Archive": [f"Card {i}" for i in range(80)], "Rail": ["Fixed button"]}
+    roles = {"root": "pane", "Archive": "list", "Fixed button": "button"}
+    roles.update({f"Card {i}": "listitem" for i in range(80)})
+    onscreen = {"root", "Fixed button", *(["Archive"] if list_onscreen else [])}
+    names, _ = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=10)
+    assert "Fixed button" in names
+
+
 def test_scope_bounds_have_local_ceilings():
     import pytest
 
