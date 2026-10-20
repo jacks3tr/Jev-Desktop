@@ -725,7 +725,7 @@ class Broker:
             guard()
             if request.element_id and snapshot.element(request.element_id).window_ref != request.window_ref:
                 raise ContractError("action element and window do not match")
-            budget = min(native_deadline(request.text), deadline - time.monotonic())
+            budget = min(native_deadline(request.operation, request.text), deadline - time.monotonic())
             if hasattr(self.driver, "set_boundary"):
                 self.driver.set_boundary(guard, budget)
             request = replace(request, lease_generation=lease.generation, deadline_s=budget)

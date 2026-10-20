@@ -1004,9 +1004,11 @@ class ActionRequest:
 NATIVE_ACTION_SECONDS = 15.0
 
 
-def native_deadline(text: str | None) -> float:
+def native_deadline(operation: Operation, text: str | None) -> float:
     """Seconds one native action may take: the application consumes typed text at its own pace."""
-    return NATIVE_ACTION_SECONDS + 0.05 * len(text or "")
+    if operation is not Operation.TYPE_TEXT or not text:
+        return NATIVE_ACTION_SECONDS
+    return NATIVE_ACTION_SECONDS + 0.05 * (len(text.encode("utf-16-le")) // 2)
 
 
 @dataclass(frozen=True)

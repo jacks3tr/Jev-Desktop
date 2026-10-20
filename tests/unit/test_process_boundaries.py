@@ -262,6 +262,7 @@ def test_native_action_runs_to_its_own_deadline_not_the_generic_call_limit(monke
     driver = WindowsDriver()
     driver._process = process
     driver._connection = SimpleNamespace(send=lambda _m: None, poll=poll, recv=lambda: ("result", "receipt"))
+
     def call(deadline_s, operation, text):
         clock[0], alive[0] = 0.0, True
         driver._process = process
