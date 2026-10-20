@@ -623,9 +623,9 @@ class Runtime:
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
-            # Until Jev's first decision everything observed was already there: an unfocused Chromium
-            # window can expose only its frame, so content its automatic focus reveals is baseline.
-            if not state.decisions:
+            # Until Jev first decides anything but a window focus, everything observed was already there:
+            # an unfocused Chromium window can expose only its frame, so content focus reveals is baseline.
+            if not state.summary.get("task_start_frozen"):
                 state.summary["task_start_elements"] = sorted(
                     {
                         *state.summary.get("task_start_elements", ()),
@@ -941,6 +941,8 @@ class Runtime:
                 session_id=lease.session_id,
             )
             state.model_versions.append(decision.model)
+            if decision.operation is not Operation.FOCUS_WINDOW:
+                state.summary["task_start_frozen"] = True
             if not isinstance(self.policy, JevPolicy):
                 metrics = state.summary.setdefault(
                     "task_metrics",
