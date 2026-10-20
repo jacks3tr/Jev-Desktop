@@ -92,8 +92,10 @@ def _extend_task_baseline(
     summary: dict[str, Any], windows: Sequence[Any], elements: Sequence[Mapping[str, Any]]
 ) -> None:
     # An unfocused Chromium window can expose only its frame; its baseline is its first focused view.
+    # A window that opens after the task starts has no baseline: all of it is new.
+    started = summary.setdefault("task_start_scope", sorted(window.window_ref for window in windows))
     sealed = set(summary.get("task_start_windows", ()))
-    open_refs = {window.window_ref for window in windows if window.window_ref not in sealed}
+    open_refs = {window.window_ref for window in windows if window.window_ref in started} - sealed
     if not open_refs:
         return
     baseline = set(summary.get("task_start_elements", ()))
