@@ -194,6 +194,21 @@ def test_offscreen_list_content_does_not_starve_a_later_fixed_control(monkeypatc
     assert "Fixed button" in names
 
 
+def test_the_offscreen_row_cap_keeps_later_siblings_outside_a_list(monkeypatch):
+    rows = [f"Card {i}" for i in range(11)]
+    tree = {"root": ["Board"], "Board": [*rows, "Fixed button"]}
+    roles = {"root": "pane", "Fixed button": "button", **{row: "listitem" for row in rows}}
+    names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "Fixed button"}, max_elements=10)
+    assert "Fixed button" in names
+
+
+def test_deferred_offscreen_content_keeps_a_share_of_the_node_budget(monkeypatch):
+    tree = {"root": ["Board", "List"], "Board": ["Fixed button"], "List": [f"Card {i}" for i in range(80)]}
+    roles = {"root": "pane", "List": "list", "Fixed button": "button"}
+    names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "List", "Fixed button"}, max_elements=10)
+    assert "Fixed button" in names
+
+
 def test_scope_bounds_have_local_ceilings():
     import pytest
 
