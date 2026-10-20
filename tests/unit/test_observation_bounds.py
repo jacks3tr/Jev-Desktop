@@ -209,6 +209,14 @@ def test_deferred_offscreen_content_keeps_a_share_of_the_node_budget(monkeypatch
     assert "Fixed button" in names
 
 
+def test_queued_offscreen_content_does_not_cut_short_the_onscreen_walk(monkeypatch):
+    leaves = [f"Hidden {i}" for i in range(50)]
+    tree = {"root": [*leaves, "Button"]}
+    roles = {"root": "pane", "Button": "button"}
+    names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "Button"}, max_elements=10)
+    assert "Button" in names
+
+
 def test_scope_bounds_have_local_ceilings():
     import pytest
 
