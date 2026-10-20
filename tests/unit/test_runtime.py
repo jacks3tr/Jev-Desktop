@@ -806,27 +806,24 @@ def test_task_start_baseline_waits_for_the_window_to_expose_its_content(tmp_path
     journal.close()
 
 
-def test_each_starting_window_joins_the_task_start_baseline_once_it_has_been_focused():
+def test_task_start_baseline_absorbs_observations_until_the_task_first_acts():
     from types import SimpleNamespace
 
     from jev_desktop.runtime import _element_signature, _extend_task_baseline
 
-    editor, browser, dialog = ("win:" + str(i) * 24 for i in range(1, 4))
-    save = {"window_ref": editor, "role": "button", "name": "Save"}
-    ok = {"window_ref": dialog, "role": "button", "name": "OK"}
-    stop = {"window_ref": browser, "role": "button", "name": "Stop"}
-    sent = {"window_ref": browser, "role": "text", "name": "Sent"}
+    ok = {"role": "button", "name": "OK"}
+    saved_no = {"role": "text", "name": "Saved", "value": "no"}
+    saved_yes = {"role": "text", "name": "Saved", "value": "yes"}
+    page = {"role": "button", "name": "Send"}
+    focus = SimpleNamespace(operation=Operation.FOCUS_WINDOW, dispatch_state=DispatchState.DISPATCHED)
+    refused = SimpleNamespace(operation=Operation.CLICK, dispatch_state=DispatchState.NOT_DISPATCHED)
+    click = SimpleNamespace(operation=Operation.CLICK, dispatch_state=DispatchState.DISPATCHED)
     summary: dict = {}
 
-    def observe(focused, elements, refs=(editor, browser)):
-        windows = [SimpleNamespace(window_ref=ref, focused=ref == focused) for ref in refs]
-        _extend_task_baseline(summary, windows, elements)
-
-    observe(editor, [save])  # the unfocused browser exposes only its frame
-    observe(dialog, [save, ok], refs=(editor, browser, dialog))
-    observe(browser, [save, stop])
-    observe(browser, [save, stop, sent])
-    assert set(summary["task_start_elements"]) == {_element_signature(save), _element_signature(stop)}
+    _extend_task_baseline(summary, [], [ok, saved_no])  # an unfocused browser exposes only its frame
+    _extend_task_baseline(summary, [focus, refused], [ok, saved_no, page])
+    _extend_task_baseline(summary, [focus, refused, click], [saved_yes, page])
+    assert set(summary["task_start_elements"]) == {_element_signature(e) for e in (ok, saved_no, page)}
 
 
 SIDEBAR_ELEMENTS = [
