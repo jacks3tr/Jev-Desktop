@@ -806,6 +806,27 @@ def test_task_start_baseline_waits_for_the_window_to_expose_its_content(tmp_path
     journal.close()
 
 
+def test_each_window_joins_the_task_start_baseline_once_it_has_been_focused():
+    from types import SimpleNamespace
+
+    from jev_desktop.runtime import _element_signature, _extend_task_baseline
+
+    editor, browser = "win:" + "1" * 24, "win:" + "2" * 24
+    save = {"window_ref": editor, "role": "button", "name": "Save"}
+    stop = {"window_ref": browser, "role": "button", "name": "Stop"}
+    sent = {"window_ref": browser, "role": "text", "name": "Sent"}
+    summary: dict = {}
+
+    def observe(focused, elements):
+        windows = [SimpleNamespace(window_ref=ref, focused=ref == focused) for ref in (editor, browser)]
+        _extend_task_baseline(summary, windows, elements)
+
+    observe(editor, [save])  # the unfocused browser exposes only its frame
+    observe(browser, [save, stop])
+    observe(browser, [save, stop, sent])
+    assert set(summary["task_start_elements"]) == {_element_signature(save), _element_signature(stop)}
+
+
 SIDEBAR_ELEMENTS = [
     FakeElement("button", "PSTACK Development Team 7", operations=("CLICK",), state={"expanded": "expanded"}),
     FakeElement("button", "Dispatch", operations=("CLICK", "TOGGLE"), state={"checked": "off"}),
