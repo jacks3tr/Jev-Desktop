@@ -150,14 +150,38 @@ def test_a_spent_row_budget_does_not_drop_the_rest_of_an_offscreen_subtree(monke
     tree = {
         "root": ["List", "Board"],
         "List": [f"Item {i}" for i in range(11)],
-        "Board": ["Offscreen row", "Fixed button"],
+        "Board": ["Fixed row", "Fixed button"],
     }
-    roles = {"root": "pane", "List": "list", "Offscreen row": "listitem", "Fixed button": "button"}
+    roles = {"root": "pane", "List": "list", "Fixed row": "listitem", "Fixed button": "button"}
     roles.update({f"Item {i}": "listitem" for i in range(11)})
-    onscreen = {"root", "List", "Fixed button", *(f"Item {i}" for i in range(11))}
+    onscreen = {"root", "List", "Fixed row", "Fixed button", *(f"Item {i}" for i in range(11))}
     names, _ = _observe_tree(monkeypatch, tree, roles, onscreen, max_elements=10)
     assert "Item 10" not in names
     assert "Fixed button" in names
+
+
+def test_a_collection_inside_offscreen_content_waits_behind_later_offscreen_siblings(monkeypatch):
+    tree = {
+        "root": ["Board", "Rail"],
+        "Board": ["Archive"],
+        "Archive": [f"Card {i}" for i in range(80)],
+        "Rail": ["Fixed button"],
+    }
+    roles = {"root": "pane", "Archive": "list", "Fixed button": "button"}
+    names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "Fixed button"}, max_elements=10)
+    assert "Fixed button" in names
+
+
+def test_offscreen_rows_do_not_spend_the_row_budget_of_a_visible_row(monkeypatch):
+    tree = {
+        "root": ["Panel", "List"],
+        "Panel": ["Fixed row"],
+        "List": [f"Item {i}" for i in range(11)],
+    }
+    roles = {"root": "pane", "List": "list", "Fixed row": "listitem"}
+    roles.update({f"Item {i}": "listitem" for i in range(11)})
+    names, _ = _observe_tree(monkeypatch, tree, roles, {"root", "List", "Fixed row"}, max_elements=10)
+    assert "Fixed row" in names
 
 
 def test_scope_bounds_have_local_ceilings():
