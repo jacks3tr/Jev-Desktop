@@ -225,7 +225,8 @@ CHROME_ROLES = {
 ROW_ROLES = {"listitem", "treeitem", "dataitem"}
 CONTAINER_ROLES = {"pane", "group", "custom", "table", "tree", "list", "datagrid"}
 # A query search reads past the unfiltered budgets but must finish well inside the 30 s worker
-# call, which can run two observations; a read-only walk costs about 1.3 ms per node.
+# call, which can run two observations; a read-only walk costs about 1.3 ms per node. Deferred
+# offscreen subtrees may walk a quarter more, and QUERY_SECONDS bounds the whole search.
 QUERY_NODE_BUDGET = 10_000
 # Nodes a deferred offscreen subtree walks before the next queued one gets a turn.
 DEFERRED_TURN = 32
@@ -1006,6 +1007,7 @@ def _walk(
     # Onscreen content first, then collections, then offscreen subtrees and whatever they contain.
     phase = "onscreen"
     turn_started = 0
+    hit_tests = 0
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
     # Offscreen subtrees walk last on a quarter more than the budget, so earlier phases cannot starve them.
     deferred_budget = node_budget + node_budget // 4
@@ -1062,7 +1064,15 @@ def _walk(
         name = name_value if isinstance(name_value, str) else ""
         offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
         rect = _rect_of(_cached(element, PROP_BOUNDS))
-        if offscreen and role in ROW_ROLES and not rect.is_empty and window_rect.contains(*rect.center()):
+        if (
+            offscreen
+            and role in ROW_ROLES
+            and hit_tests < content_cap
+            and not rect.is_empty
+            and window_rect.contains(*rect.center())
+        ):
+            # Each hit test is a cross-process point query and parent walk; past the row budget the flag stands.
+            hit_tests += 1
             offscreen = not point_hits_element(worker, element, *rect.center())
         # Only observed rows spend the row budget; a query bounds rows by matches (the content cap below).
         if role in ROW_ROLES and not query and (include_invisible or not offscreen):
