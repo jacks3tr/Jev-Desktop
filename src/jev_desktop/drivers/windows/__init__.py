@@ -167,9 +167,8 @@ class WindowsDriver:
     def _call(self, method: str, *args: Any, guard: Callable[[], None] | None = None, **kwargs: Any) -> Any:
         with self._lock:
             boundary = guard or self._guard
-            deadline = min(self._deadline, time.monotonic() + 30.0)
-            if method == "execute":
-                deadline = min(deadline, time.monotonic() + args[0].deadline_s)
+            limit = args[0].deadline_s if method == "execute" else 30.0
+            deadline = min(self._deadline, time.monotonic() + limit)
             if boundary:
                 boundary()
             if method != "start":

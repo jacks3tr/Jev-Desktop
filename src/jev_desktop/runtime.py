@@ -53,6 +53,7 @@ from .contracts import (
     Verdict,
     digest,
     keyed_fingerprint,
+    native_deadline,
     new_id,
     now,
     validate_id,
@@ -1583,7 +1584,7 @@ class Runtime:
             option_label=option_label,
             hotkey=hotkey,
             scroll=scroll,
-            deadline_s=min(15.0, max(3.0, state.spec.limits.slice_seconds)),
+            deadline_s=min(native_deadline(text), max(3.0, state.spec.limits.slice_seconds)),
         )
         request = replace(request, request_hash=self._request_hash(state, request))
 

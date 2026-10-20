@@ -43,6 +43,7 @@ from .contracts import (
     UncertainEffect,
     canonical_json,
     keyed_fingerprint,
+    native_deadline,
     new_id,
 )
 from .drivers.windows import WindowsDriver
@@ -724,9 +725,10 @@ class Broker:
             guard()
             if request.element_id and snapshot.element(request.element_id).window_ref != request.window_ref:
                 raise ContractError("action element and window do not match")
+            budget = min(native_deadline(request.text), deadline - time.monotonic())
             if hasattr(self.driver, "set_boundary"):
-                self.driver.set_boundary(guard, min(15.0, deadline - time.monotonic()))
-            request = replace(request, lease_generation=lease.generation, deadline_s=15.0)
+                self.driver.set_boundary(guard, budget)
+            request = replace(request, lease_generation=lease.generation, deadline_s=budget)
             request = replace(
                 request,
                 request_hash=keyed_fingerprint(self.journal.fingerprint_key(), canonical_json(request.to_json())),
