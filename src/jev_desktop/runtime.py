@@ -623,10 +623,12 @@ class Runtime:
             if state.decisions >= state.spec.limits.max_model_decisions:
                 return self._pause(state, Reason.BUDGET_EXHAUSTED.value, {"budget": "max_model_decisions"})
             observation = self._observation_for_policy(state, snapshot)
-            if "task_start_elements" not in state.summary:
+            # An unfocused Chromium window can expose only its frame; the baseline is the first focused view.
+            if not state.summary.get("task_start_focused"):
                 state.summary["task_start_elements"] = sorted(
                     {_element_signature(element) for element in observation["elements"]}
                 )
+                state.summary["task_start_focused"] = any(window.focused for window in snapshot.windows)
             bindings: dict[str, tuple[TargetCandidate, str | None, dict[str, Any]]] = {}
             elements_by_id = {element["element_id"]: element for element in observation["elements"]}
             select_candidates: list[TargetCandidate] = []
