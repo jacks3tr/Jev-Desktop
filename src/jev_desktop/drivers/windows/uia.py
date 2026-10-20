@@ -225,8 +225,11 @@ CHROME_ROLES = {
 ROW_ROLES = {"listitem", "treeitem", "dataitem"}
 CONTAINER_ROLES = {"pane", "group", "custom", "table", "tree", "list", "datagrid"}
 # A query search reads past the unfiltered budgets but must finish well inside the 30 s worker
-# call, which can run two observations; a read-only walk costs about 1.3 ms per node.
+# call, which can run two observations; a read-only walk costs about 1.3 ms per node. Deferred
+# offscreen subtrees may walk a quarter more, and QUERY_SECONDS bounds the whole search.
 QUERY_NODE_BUDGET = 10_000
+# Nodes a deferred offscreen subtree walks before the next queued one gets a turn.
+DEFERRED_TURN = 32
 QUERY_SECONDS = 8.0
 
 
@@ -817,6 +820,7 @@ def observe(
                     depth=0,
                     max_depth=0,
                     max_elements=max_elements,
+                    window_rect=rect,
                     include_invisible=include_invisible,
                     text_limit=text_limit,
                     truncation=[],
@@ -845,6 +849,7 @@ def observe(
                 depth=0,
                 max_depth=max_depth,
                 max_elements=max_elements,
+                window_rect=rect,
                 include_invisible=include_invisible,
                 text_limit=text_limit,
                 truncation=truncation,
@@ -980,6 +985,7 @@ def _walk(
     depth: int,
     max_depth: int,
     max_elements: int,
+    window_rect: Rect,
     include_invisible: bool,
     text_limit: int,
     truncation: list[str],
@@ -996,13 +1002,37 @@ def _walk(
 ) -> int:
     stack: list[tuple[Any, int, tuple[str, ...]]] = [(iter((element,)), depth, ())]
     collections: list[tuple[Any, int, tuple[str, ...]]] = []
-    collection_phase = False
+    # Each deferred subtree keeps its own stack, so it can be set aside when its turn ends.
+    offscreen_subtrees: list[list[tuple[Any, int, tuple[str, ...]]]] = []
+    # Onscreen content first, then collections, then offscreen subtrees and whatever they contain.
+    phase = "onscreen"
+    turn_started = 0
+    hit_tests = 0
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
-    while stack or collections:
+    # Offscreen subtrees walk last on a quarter more than the budget, so earlier phases cannot starve them.
+    deferred_budget = node_budget + node_budget // 4
+    while stack or collections or offscreen_subtrees:
+        if phase != "offscreen" and traversal[0] >= node_budget:
+            truncation.append("traversal node budget reached")
+            if not offscreen_subtrees:
+                break
+            stack.clear()
+            collections.clear()
+        if phase == "offscreen" and stack and offscreen_subtrees and traversal[0] - turn_started >= DEFERRED_TURN:
+            # Deferred subtrees take turns, so one cannot spend the allowance meant for all of them.
+            offscreen_subtrees.append(stack)
+            stack = []
         if not stack:
-            stack.append(collections.pop(0))
-            collection_phase = True
-        if traversal[0] >= node_budget:
+            if collections:
+                stack.append(collections.pop(0))
+                phase = "collections"
+            else:
+                if phase != "offscreen":
+                    hit_tests = 0  # content walked last gets its own hit tests
+                stack = offscreen_subtrees.pop(0)
+                phase = "offscreen"
+                turn_started = traversal[0]
+        if traversal[0] >= deferred_budget:
             truncation.append("traversal node budget reached")
             break
         if time.perf_counter() >= deadline:
@@ -1034,32 +1064,43 @@ def _walk(
             continue
         name_value = _cached(element, PROP_NAME)
         name = name_value if isinstance(name_value, str) else ""
+        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
+        rect = _rect_of(_cached(element, PROP_BOUNDS))
+        if (
+            offscreen
+            and role in ROW_ROLES
+            and hit_tests < content_cap
+            and not rect.is_empty
+            and window_rect.contains(*rect.center())
+        ):
+            # Each hit test is a cross-process point query and parent walk; past the row budget the flag stands.
+            hit_tests += 1
+            offscreen = not point_hits_element(worker, element, *rect.center())
+        # Only observed rows spend the row budget; a query bounds rows by matches (the content cap below).
+        if role in ROW_ROLES and not query and (include_invisible or not offscreen):
+            content_seen += 1
+            if content_seen > content_cap:
+                rows_dropped.append(1)
+                if phase == "collections":
+                    stack.clear()
+                    truncation.append("remaining collection content was not observed (collection row budget)")
+                continue
         if depth < max_depth:
+            collection = role in {"list", "tree", "datagrid", "table"}
             children = (iter(worker.children(element)), depth + 1, (*path, name or role))
-            if role in {"list", "tree", "datagrid", "table"}:
+            hidden = offscreen and not include_invisible
+            if collection and not hidden and phase != "offscreen":
                 collections.append(children)
+            elif collection or hidden:
+                # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
+                offscreen_subtrees.append([children])
             else:
                 stack.append(children)
         else:
             truncation.append(f"depth cap reached ({max_depth})")
-        # A query bounds rows by matches (the content cap below), not by rows walked.
-        if role in ROW_ROLES and not query:
-            content_seen += 1
-            if content_seen > content_cap:
-                rows_dropped.append(1)
-                if collection_phase:
-                    stack.clear()
-                    truncation.append("remaining collection content was not observed (collection row budget)")
-                elif depth < max_depth:
-                    stack.pop()
-                continue
         password = _bool(_cached(element, PROP_PASSWORD))
         value = _value_of(element, password)
         enabled = _bool(_cached(element, PROP_ENABLED), True)
-        offscreen = _bool(_cached(element, PROP_OFFSCREEN), False)
-        rect = _rect_of(_cached(element, PROP_BOUNDS))
-        if offscreen and role in ROW_ROLES and not rect.is_empty:
-            offscreen = not point_hits_element(worker, element, *rect.center())
         focusable = _bool(_cached(element, PROP_FOCUSABLE))
         focused = _bool(_cached(element, PROP_FOCUSED))
         available = _available_patterns(element)
