@@ -1006,6 +1006,7 @@ def _walk(
                 collection_phase = True
             else:
                 stack.append(offscreen_subtrees.pop(0))
+                collection_phase = False
         if traversal[0] >= node_budget:
             truncation.append("traversal node budget reached")
             break
