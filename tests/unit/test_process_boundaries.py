@@ -237,7 +237,7 @@ def test_returned_uncertain_action_allows_fresh_observation():
         process.start()
         child.close()
         with pytest.raises(UncertainEffect, match="input outcome unknown"):
-            driver._call("execute", SimpleNamespace(deadline_s=5))
+            driver._call("execute", SimpleNamespace(deadline_s=5, text=None))
         assert driver._call("observe") == "fresh observation"
         process.join(5)
     finally:

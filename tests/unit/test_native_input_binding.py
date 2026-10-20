@@ -122,7 +122,11 @@ def test_text_replacement_waits_for_readback_without_retyping(monkeypatch):
     def tick(_seconds):
         clock[0] += 1.0
 
-    monkeypatch.setattr(native_input, "time", NS(time=lambda: clock[0], monotonic=lambda: clock[0], perf_counter=lambda: clock[0], sleep=tick))
+    monkeypatch.setattr(
+        native_input,
+        "time",
+        NS(time=lambda: clock[0], monotonic=lambda: clock[0], perf_counter=lambda: clock[0], sleep=tick),
+    )
     request.deadline_s = 60
     monkeypatch.setattr(native_input, "_typing_value", lambda *_: "Read-onIy")
     with pytest.raises(UncertainEffect):

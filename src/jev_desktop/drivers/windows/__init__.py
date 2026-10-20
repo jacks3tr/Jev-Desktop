@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ...contracts import ContractError, DriverError, EmergencyStop, Pause, Reason, UncertainEffect
+from ...contracts import ContractError, DriverError, EmergencyStop, Pause, Reason, UncertainEffect, native_deadline
 from .presence import DesktopPresence
 from .worker import serve
 
@@ -167,7 +167,7 @@ class WindowsDriver:
     def _call(self, method: str, *args: Any, guard: Callable[[], None] | None = None, **kwargs: Any) -> Any:
         with self._lock:
             boundary = guard or self._guard
-            limit = args[0].deadline_s if method == "execute" else 30.0
+            limit = min(args[0].deadline_s, native_deadline(args[0].text)) if method == "execute" else 30.0
             deadline = min(self._deadline, time.monotonic() + limit)
             if boundary:
                 boundary()

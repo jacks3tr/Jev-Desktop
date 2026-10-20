@@ -1001,9 +1001,12 @@ class ActionRequest:
         }
 
 
+NATIVE_ACTION_SECONDS = 15.0
+
+
 def native_deadline(text: str | None) -> float:
     """Seconds one native action may take: the application consumes typed text at its own pace."""
-    return 15.0 + 0.05 * len(text or "")
+    return NATIVE_ACTION_SECONDS + 0.05 * len(text or "")
 
 
 @dataclass(frozen=True)
