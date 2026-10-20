@@ -1002,6 +1002,7 @@ def _walk(
     offscreen_subtrees: list[tuple[Any, int, tuple[str, ...]]] = []
     # Onscreen content first, then collections, then offscreen subtrees and whatever they contain.
     phase = "onscreen"
+    unseen_rows = 0
     node_budget = QUERY_NODE_BUDGET if query else max(64, max_elements * 4)
     while stack or collections or offscreen_subtrees:
         if not stack:
@@ -1047,21 +1048,31 @@ def _walk(
         rect = _rect_of(_cached(element, PROP_BOUNDS))
         if offscreen and role in ROW_ROLES and not rect.is_empty and window_rect.contains(*rect.center()):
             offscreen = not point_hits_element(worker, element, *rect.center())
-        # Only observed rows spend the row budget; a query bounds rows by matches (the content cap below).
-        if role in ROW_ROLES and not query and (include_invisible or not offscreen):
-            content_seen += 1
-            if content_seen > content_cap:
-                rows_dropped.append(1)
-                if phase == "collections":
-                    stack.clear()
-                    truncation.append("remaining collection content was not observed (collection row budget)")
-                continue
+        # Offscreen rows have their own budget, so they neither crowd out a visible row nor run a long
+        # list to the node budget; a query bounds rows by matches (the content cap below).
+        if role in ROW_ROLES and not query:
+            if include_invisible or not offscreen:
+                content_seen += 1
+                if content_seen > content_cap:
+                    rows_dropped.append(1)
+                    if phase == "collections":
+                        stack.clear()
+                        truncation.append("remaining collection content was not observed (collection row budget)")
+                    continue
+            else:
+                unseen_rows += 1
+                if unseen_rows > content_cap:
+                    # Leave the rest of this container so offscreen rows cannot run the walk to its node budget.
+                    skipped.append(1)
+                    stack.pop()
+                    continue
         if depth < max_depth:
             children = (iter(worker.children(element)), depth + 1, (*path, name or role))
             collection = role in {"list", "tree", "datagrid", "table"}
-            if collection and phase != "offscreen":
+            hidden = offscreen and not include_invisible
+            if collection and not hidden and phase != "offscreen":
                 collections.append(children)
-            elif collection or (offscreen and not include_invisible):
+            elif collection or hidden:
                 # Walked last, not pruned: a fixed-position child of an offscreen container is onscreen.
                 offscreen_subtrees.append(children)
             else:
