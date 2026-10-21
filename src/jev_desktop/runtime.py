@@ -111,7 +111,8 @@ def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str,
     """Elements, context, and truncation as callers see them; the model and verification read the snapshot.
 
     Rows without a name, value, text, operation, or focus are layout structure: bulk, not meaning.
-    Context texts already carried by a returned element are dropped for the same reason.
+    Context texts already carried by a returned element are dropped for the same reason, and texts of
+    elements past the limit or outside the query are dropped with their elements.
     """
     elements = [e for e in snapshot.elements if e.name or e.value or e.text or e.operations or e.focused]
     truncation = list(snapshot.truncation)
@@ -122,8 +123,13 @@ def caller_view(snapshot: Snapshot, *, limit: int, query: str = "") -> dict[str,
     shown = elements[:limit]
     context = dict(snapshot.context)
     if "texts" in context:
+        shown_ids = {e.element_id for e in shown}
         represented = {part for e in shown for part in (e.name, e.value, e.text) if part}
-        context["texts"] = [item for item in context["texts"] or [] if item.get("text") not in represented]
+        context["texts"] = [
+            item
+            for item in context["texts"] or []
+            if item.get("element_id") in shown_ids and item.get("text") not in represented
+        ]
     return {"elements": [e.to_json() for e in shown], "context": context, "truncation": truncation}
 
 
