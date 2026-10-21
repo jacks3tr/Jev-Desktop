@@ -73,11 +73,11 @@ lease, native guards, cancellation, and no-replay journal without requiring a te
 Call `desktop_inspect` to discover an application, then inspect its `app_ref` and explicit
 `window_refs`. Without `app_ref`, `query` filters applications by executable path or window
 title. With `app_ref`, `query` returns up to `max_elements` elements whose name, value, text, or
-path contains it. The search walks up to 10,000 nodes, a quarter more for content outside the
-window, or 8 seconds and keeps up to 500 matches; the truncation notes `traversal node budget
-reached` and `query search time limit reached` mean it was incomplete, so an empty result does
-not prove absence. A query result holds only the
-matches, so inspect without `query` to act on controls around them. Returned observations omit rows
+path contains it. The search walks up to 10,000 nodes, a quarter more for off-screen content
+within the window, or 8 seconds and keeps up to 500 matches; the truncation notes `traversal
+node budget reached` and `query search time limit reached` mean it was incomplete, so an empty
+result does not prove absence. A query result holds only the matches, so inspect without `query`
+to act on controls around them. Returned observations omit rows
 with no name, value, text, operation, or focus, and context texts already shown by an element;
 Jev still receives them. Call `desktop_act` with the returned `snapshot_id`, `access_token`, `window_ref`,
 operation, and control reference or screenshot point. Alternatively, use `target_description`
