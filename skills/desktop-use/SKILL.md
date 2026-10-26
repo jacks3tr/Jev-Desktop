@@ -76,7 +76,7 @@ again to confirm the requested recipient, then make a separate typing or sending
 **Inputs.** Put exact strings in `texts`, named for their destination, such as
 `email_for_contact_field`, and state which value belongs in which field. Put passwords and
 other sensitive values in `secret_texts`: Jev sees only their names and lengths. Together they
-hold at most 16 values. List permitted keyboard chords in `hotkeys`.
+hold at most 16 values. List permitted keyboard chords in `hotkeys` (at most 8).
 
 **Controls.**
 - Distinguish text typed into a navigation field from the page or selection that submitting it
