@@ -100,7 +100,8 @@ def _call(method: str, params: Mapping[str, Any], *, timeout_s: float) -> dict[s
     description=(
         "Discover observable applications and windows, or inspect one application and return a "
         "structured observation with an opaque app_ref, window refs, indexed elements, coverage "
-        "limitations, and an optional scoped screenshot. Observation is authorized like input."
+        "limitations, and an optional scoped screenshot. Observation is authorized like input. "
+        "Limits: max_elements <= 500, max_depth <= 32."
     ),
 )
 def desktop_inspect(
@@ -132,10 +133,12 @@ def desktop_inspect(
     structured_output=False,
     description=(
         "Preferred for routine desktop use: supply task with goal, app_ref, window_refs, optional "
-        "texts (named exact strings), secret_texts (named strings Jev never sees), hotkeys (chords), "
+        "texts (named exact strings) and secret_texts (named strings Jev never sees), at most 16 "
+        "values together, hotkeys (at most 8 chords), "
         "max_actions (default 20), max_model_decisions "
-        "(default 40), max_elements (default 180), max_depth (default 12), and timeout_seconds "
-        "(default 60). Jev observes and acts locally until done or blocked. Returns final observation "
+        "(default 40), max_elements (default 180, at most 500), max_depth (default 12, at most 32), "
+        "and timeout_seconds (default 60, at most 120). "
+        "Jev observes and acts locally until done or blocked. Returns final observation "
         "and action/timing/token metrics without requiring a caller turn per action. "
         "Alternatively, a predefined workflow or automated test takes a specification "
         "(application identity, required steps, assertions, fixtures, limits) and returns execution "

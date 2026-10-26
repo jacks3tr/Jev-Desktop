@@ -317,3 +317,14 @@ def test_mcp_reports_a_lost_broker_connection_as_a_structured_error(monkeypatch)
     payload = json.loads(mcp_stdio.desktop_run(task={"goal": "x"})[0].text)
     assert payload["ok"] is False
     assert payload["error"]["code"] == "broker_unavailable"
+
+
+def test_mcp_tool_descriptions_state_request_limits():
+    from jev_desktop.transports import mcp_stdio
+
+    tools = {tool.name: tool.description for tool in asyncio.run(mcp_stdio.server.list_tools())}
+    assert "max_elements <= 500" in tools["desktop_inspect"]
+    assert "max_depth <= 32" in tools["desktop_inspect"]
+    assert "at most 8 chords" in tools["desktop_run"]
+    assert "at most 500" in tools["desktop_run"]
+    assert "at most 32" in tools["desktop_run"]
